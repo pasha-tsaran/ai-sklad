@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+ai-support-deploy.tar.gz
+.venv/
+.tools/
+__pycache__/
+*.pyc
+.pytest_cache/
+pytest-cache-files-*/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
