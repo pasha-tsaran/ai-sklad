@@ -1,0 +1,62 @@
+x-app: &app
+  build: .
+  environment: &environment
+    DATABASE_URL: postgresql+psycopg://support:${POSTGRES_PASSWORD:-local-demo-db}@db:5432/support
+    API_TOKEN: ${API_TOKEN:-local-demo-token}
+    LLM_BACKEND: ${LLM_BACKEND:-mock}
+    OPENWEBUI_BASE_URL: ${OPENWEBUI_BASE_URL:-http://host.docker.internal:3000}
+    OPENWEBUI_API_KEY: ${OPENWEBUI_API_KEY:-}
+    OPENWEBUI_MODEL: ${OPENWEBUI_MODEL:-}
+    LLM_TIMEOUT_SECONDS: ${LLM_TIMEOUT_SECONDS:-60}
+    SEED_DEMO_KNOWLEDGE: ${SEED_DEMO_KNOWLEDGE:-true}
+    SUPPORT_EMAIL: ${SUPPORT_EMAIL:-support@example.invalid}
+  extra_hosts:
+    - host.docker.internal:host-gateway
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: support
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-local-demo-db}
+      POSTGRES_DB: support
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U support -d support"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  migrate:
+    <<: *app
+    command: [python, -m, app.bootstrap]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  api:
+    <<: *app
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/ready')"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  worker:
+    <<: *app
+    command: [python, -m, app.workers.main]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
