@@ -21,7 +21,8 @@ def test_real_adapter_http_contract():
         payload = json.loads(request.content)
         assert payload["model"] == "local-qwen"
         assert payload["stream"] is False
-        assert "tools" not in payload and "tool_ids" not in payload
+        assert "tools" not in payload and payload["tool_ids"] == []
+        assert payload["features"]["web_search"] is False
         return httpx.Response(
             200,
             json={

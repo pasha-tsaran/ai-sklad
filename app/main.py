@@ -2,13 +2,15 @@ from fastapi import FastAPI, Request
 from sqlalchemy import text
 
 from app.api.routes import router
+from app.api.talk import router as talk_router
 from app.core.config import get_settings
 from app.core.logging import configure_logging, event
 from app.db import get_engine
 
 configure_logging()
-app = FastAPI(title="ai-support", version="0.1.0", description="Local MVP: mock Nextcloud/mail")
+app = FastAPI(title="ai-support", version="0.2.0", description="Open WebUI knowledge, Talk bot and SMTP")
 app.include_router(router)
+app.include_router(talk_router)
 
 
 @app.middleware("http")
@@ -38,8 +40,11 @@ def ready():
     return {
         "status": "ok",
         "llm": settings.llm_backend,
-        "nextcloud": "mock",
-        "mail": "mock",
-        "rag": "demo-lexical",
+        "nextcloud": settings.nextcloud_backend,
+        "mail": settings.mail_backend,
+        "rag": settings.knowledge_backend,
+        "knowledge_configured": bool(settings.openwebui_knowledge_ids)
+        if settings.knowledge_backend == "openwebui"
+        else True,
         "demo_knowledge": settings.seed_demo_knowledge,
     }

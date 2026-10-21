@@ -19,9 +19,9 @@ from app.models import (
 from app.services.chat.audit import audit
 from app.services.chat.messages import append_message
 from app.services.chat.policies import FORM_ACTION, FORM_TEXT, MAX_ATTEMPTS, TERMINAL_STATES, direct_intent
-from app.services.nextcloud.mock import MockNextcloud
+from app.services.nextcloud.delivery import RoutedMessenger
 
-messenger = MockNextcloud()
+messenger = RoutedMessenger()
 
 
 def get_owned(session, incident_id, user_id, lock=False):
@@ -87,6 +87,13 @@ def ask_escalation(session, incident, reason):
         "NO_MORE_SOLUTIONS": "Других подходящих утверждённых решений нет.",
     }.get(reason, "Перейдём к оформлению обращения в поддержку.")
     messenger.send(session, incident.id, prefix + "\n\n" + FORM_TEXT)
+    conversation = session.get(Conversation, incident.conversation_id)
+    if conversation.channel == "nextcloud_talk":
+        messenger.send(
+            session,
+            incident.id,
+            "Отправьте одним сообщением:\nФИО: ...\nЛогин: ...\nКомпьютер: ...\nТема: ...\nОписание: ...",
+        )
     audit(session, incident.id, "incident.form_requested", reason=reason)
 
 
@@ -250,6 +257,7 @@ def incident_view(session, incident):
             "status": escalation.status,
             "reason": escalation.reason,
             "mock_email": escalation.email,
+            "email": escalation.email,
         }
         if escalation
         else None,

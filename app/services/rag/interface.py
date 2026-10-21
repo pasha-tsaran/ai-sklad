@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 
@@ -11,6 +11,7 @@ class Candidate:
     content: str
     steps: list[str]
     score: float
+    source: dict = field(default_factory=dict)
 
 
 class Retriever(Protocol):

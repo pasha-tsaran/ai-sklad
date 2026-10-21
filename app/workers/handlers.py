@@ -17,6 +17,9 @@ from app.services.chat.service import ask_escalation, messenger
 from app.services.mail.mock import MockMail
 from app.services.rag.embeddings import tokens
 from app.services.rag.retrieval import LocalRetriever
+from app.services.rag.openwebui import OpenWebUIKnowledge, save_snapshot
+from app.services.mail.smtp import SMTPMail
+from app.models import Conversation
 
 
 def advance(factory, job_id, llm, settings):
@@ -45,19 +48,28 @@ def advance(factory, job_id, llm, settings):
         result = "NEED_MORE_INFO"
     else:
         analysis = AnalysisResult.model_validate(llm.analyze(description))
-        with factory() as session:
-            retriever = LocalRetriever(session, settings.rag_min_score)
-            candidates = retriever.search(analysis.search_query, excluded)
-            # For this lexical baseline a reformulation must also be grounded in the
-            # original user text, rather than inventing a completely different issue.
-            grounded = {c.solution_id for c in retriever.search(description, excluded)}
-            candidates = [c for c in candidates if c.solution_id in grounded]
+        if settings.knowledge_backend == "openwebui":
+            candidates = OpenWebUIKnowledge(settings).search(description, excluded)
+        else:
+            with factory() as session:
+                retriever = LocalRetriever(session, settings.rag_min_score)
+                candidates = retriever.search(analysis.search_query, excluded)
+                grounded = {c.solution_id for c in retriever.search(description, excluded)}
+                candidates = [c for c in candidates if c.solution_id in grounded]
         if not candidates:
             reason = "NO_MORE_SOLUTIONS" if excluded else "NO_KNOWLEDGE"
         else:
             candidate = candidates[0]
             try:
-                answer = AnswerResult.model_validate(llm.compose(candidate))
+                answer = (
+                    AnswerResult(
+                        result="ANSWER",
+                        solution_id=candidate.solution_id,
+                        source_chunk_ids=[candidate.chunk_id],
+                    )
+                    if settings.knowledge_backend == "openwebui"
+                    else AnswerResult.model_validate(llm.compose(candidate))
+                )
                 valid = (
                     answer.result == "ANSWER"
                     and answer.solution_id == candidate.solution_id
@@ -81,6 +93,8 @@ def advance(factory, job_id, llm, settings):
             incident.problem_type = analysis.problem_type
             incident.equipment_model = analysis.equipment_model
         if candidate:
+            if settings.knowledge_backend == "openwebui":
+                save_snapshot(session, candidate)
             current = session.execute(
                 select(Solution, KnowledgeDocument)
                 .join(KnowledgeChunk, Solution.chunk_id == KnowledgeChunk.id)
@@ -113,8 +127,17 @@ def advance(factory, job_id, llm, settings):
                 + "\n\n"
                 + candidate.title
                 + "\n"
-                + "\n".join(f"{i}. {step}" for i, step in enumerate(candidate.steps, 1))
-                + f"\n\nИсточник: {candidate.chunk_id}, версия {candidate.version}.\nПомогло решение?"
+                + (
+                    candidate.content
+                    if candidate.source
+                    else "\n".join(f"{i}. {step}" for i, step in enumerate(candidate.steps, 1))
+                )
+                + (
+                    f"\n\nИсточник: {candidate.title}."
+                    if candidate.source
+                    else f"\n\nИсточник: {candidate.chunk_id}, версия {candidate.version}."
+                )
+                + "\nПомогло решение?"
             )
             incident.state = "SOLUTION_PROPOSED"
             audit(session, incident_id, "incident.state_changed", state=incident.state)
@@ -131,11 +154,18 @@ def advance(factory, job_id, llm, settings):
                     "content": candidate.content,
                     "steps": candidate.steps,
                     "prompt_version": "v1",
+                    "source": candidate.source,
                 },
                 retrieval_score=candidate.score,
                 llm_backend=llm.name,
             )
             session.add(attempt)
+            session.flush()
+            conversation = session.get(Conversation, incident.conversation_id)
+            if conversation.channel == "nextcloud_talk":
+                message.content += (
+                    f"\n\nДля оценки отправьте:\nПомогло {attempt.id}\nили\nНе помогло {attempt.id}"
+                )
             incident.state = "WAITING_FEEDBACK"
             incident.pending_action = None
             incident.result = "ANSWER"
@@ -155,9 +185,10 @@ def send_mail(factory, job_id, llm, settings):
     with factory() as session:
         job = session.get(Job, job_id)
         escalation = session.scalar(select(Escalation).where(Escalation.incident_id == job.incident_id))
-        if escalation.status == "SENT_MOCK":
+        if escalation.status != "QUEUED":
             return
-        escalation_id, body = escalation.id, escalation.email["body"]
+        escalation_id = escalation.id
+        body = escalation.email.get("original_body", escalation.email["body"])
     try:
         summary = SummaryResult.model_validate(llm.summarize(body[-16000:])).summary
     except Exception:
@@ -166,15 +197,41 @@ def send_mail(factory, job_id, llm, settings):
         escalation = session.scalar(
             select(Escalation).where(Escalation.id == escalation_id).with_for_update()
         )
-        if escalation.status == "SENT_MOCK":
+        if escalation.status != "QUEUED":
             return
-        email = {**escalation.email, "summary": summary}
+        email = {**escalation.email, "summary": summary, "original_body": body}
         # Preserve the full transcript. Summary is explicitly a non-authoritative addition.
         email["body"] = "Краткое описание (LLM, справочно):\n" + summary + "\n\n" + body
         escalation.email = email
-        escalation.status = MockMail().send(email)
-        escalation.sent_at = now()
-        audit(session, escalation.incident_id, "mail.sent_mock", escalation_id=escalation.id)
+        escalation.status = "SENDING"
+    # Commit intent before contacting SMTP. Ambiguous delivery must never be retried automatically.
+    try:
+        status = (SMTPMail(settings) if settings.mail_backend == "smtp" else MockMail()).send(email)
+        error_code = None
+    except Exception as exc:
+        status, error_code = "UNKNOWN", type(exc).__name__
+    with factory() as session, session.begin():
+        escalation = session.get(Escalation, escalation_id)
+        escalation.status = status
+        if status in {"SENT", "SENT_MOCK"}:
+            escalation.sent_at = now()
+        audit(
+            session,
+            escalation.incident_id,
+            "mail." + status.lower(),
+            escalation_id=escalation.id,
+            error_code=error_code,
+        )
+        if status == "SENT":
+            messenger.send(
+                session, escalation.incident_id, "Письмо с заявкой принято почтовым сервером поддержки."
+            )
+        elif status == "UNKNOWN":
+            messenger.send(
+                session,
+                escalation.incident_id,
+                "Заявка сохранена, но отправку письма подтвердить не удалось. Требуется проверка администратором.",
+            )
 
 
 def run_one(factory, llm, settings):

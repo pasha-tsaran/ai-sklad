@@ -76,6 +76,8 @@ def operation(operation_id: str, user_id=Depends(current_user), session=Depends(
 def search(
     q: str = Query(min_length=1, max_length=1000), user_id=Depends(current_user), session=Depends(get_session)
 ):
+    if get_settings().knowledge_backend != "demo":
+        raise HTTPException(409, "Knowledge is managed in Open WebUI; local search is disabled")
     return {
         "backend": "demo-hash-v1/lexical",
         "results": [

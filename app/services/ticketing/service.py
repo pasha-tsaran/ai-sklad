@@ -67,6 +67,15 @@ def collect_details(session, user_id, incident_id, details, settings):
     incident.closed_at = now()
     incident.version += 1
     job = enqueue(session, incident, "SEND_MAIL")
-    messenger.send(session, incident.id, "Заявка сохранена. Подготовлено тестовое письмо (mock).")
+    messenger.send(
+        session,
+        incident.id,
+        "Заявка сохранена. "
+        + (
+            "Письмо поставлено в очередь отправки в поддержку."
+            if settings.mail_backend == "smtp"
+            else "Подготовлено тестовое письмо (mock), реальной отправки не будет."
+        ),
+    )
     audit(session, incident.id, "escalation.queued", escalation_id=escalation.id)
     return {"incident_id": incident.id, "escalation_id": escalation.id, "operation_id": job.id}

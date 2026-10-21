@@ -18,6 +18,10 @@ from app.workers.handlers import run_one
 def env(tmp_path, monkeypatch):
     monkeypatch.setenv("API_TOKEN", "test-token")
     monkeypatch.setenv("LLM_BACKEND", "mock")
+    monkeypatch.setenv("KNOWLEDGE_BACKEND", "demo")
+    monkeypatch.setenv("SEED_DEMO_KNOWLEDGE", "true")
+    monkeypatch.setenv("NEXTCLOUD_BACKEND", "mock")
+    monkeypatch.setenv("MAIL_BACKEND", "mock")
     get_settings.cache_clear()
     engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}", connect_args={"check_same_thread": False})
 

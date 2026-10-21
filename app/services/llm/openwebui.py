@@ -30,6 +30,8 @@ class OpenWebUILLM:
                 json={
                     "model": self.settings.openwebui_model,
                     "stream": False,
+                    "tool_ids": [],
+                    "features": {"web_search": False},
                     "temperature": 0,
                     "max_tokens": 1200,
                     "response_format": {"type": "json_object"},

@@ -46,6 +46,7 @@ class Conversation(Entity, Base):
     __tablename__ = "conversations"
     user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), unique=True)
     channel: Mapped[str] = mapped_column(String(32), default="mock_nextcloud")
+    room_token: Mapped[str | None] = mapped_column(String(255))
 
 
 class Incident(Entity, Base):
@@ -180,3 +181,15 @@ class AuditEvent(Entity, Base):
     incident_id: Mapped[str | None] = mapped_column(ForeignKey("incidents.id"), index=True)
     event: Mapped[str] = mapped_column(String(100))
     details: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class Delivery(Entity, Base):
+    """Durable Talk outbox; SENDING is never automatically retried after a crash."""
+
+    __tablename__ = "deliveries"
+    message_id: Mapped[str] = mapped_column(ForeignKey("messages.id"), unique=True)
+    room_token: Mapped[str] = mapped_column(String(255))
+    status: Mapped[str] = mapped_column(String(32), default="PENDING", index=True)
+    tries: Mapped[int] = mapped_column(Integer, default=0)
+    error_code: Mapped[str | None] = mapped_column(String(100))
+    remote_id: Mapped[str | None] = mapped_column(String(100))
