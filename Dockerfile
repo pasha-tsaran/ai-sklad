@@ -12,5 +12,9 @@ COPY migrations ./migrations
 COPY sample_knowledge ./sample_knowledge
 COPY tests ./tests
 COPY scripts ./scripts
+# Git checkout permissions can be restrictive (for example after umask 077).
+# Keep sources root-owned, but readable by the unprivileged runtime user.
+RUN chmod -R a+rX app migrations sample_knowledge tests scripts && chmod a+r alembic.ini pyproject.toml uv.lock
 USER support
+RUN python -c "from app.core.config import Settings; from app.models import Base"
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
