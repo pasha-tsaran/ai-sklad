@@ -18,6 +18,8 @@ from app.models import (
     now,
 )
 from app.services.chat.audit import audit
+from app.core.config import get_settings
+from app.services.chat.memory import remember_resolution
 from app.services.chat.messages import append_message
 from app.services.chat.policies import FORM_ACTION, FORM_TEXT, MAX_ATTEMPTS, TERMINAL_STATES, direct_intent
 from app.services.nextcloud.delivery import RoutedMessenger
@@ -84,7 +86,11 @@ def ask_escalation(session, incident, reason):
     incident.escalation_reason = reason
     prefix = {
         "ATTEMPTS_EXHAUSTED": "Пять решений не помогли. Новые решения больше не предлагаются.",
-        "NO_KNOWLEDGE": "В утверждённой базе нет достаточных сведений для технических инструкций.",
+        "NO_KNOWLEDGE": (
+            "В базе знаний нет ответа на этот вопрос. "
+            "Для этой проблемы у меня пока нет утверждённой инструкции. "
+            "Требуется помощь специалиста технической поддержки."
+        ),
         "NO_MORE_SOLUTIONS": "Других подходящих утверждённых решений нет.",
     }.get(reason, "Перейдём к оформлению обращения в поддержку.")
     messenger.send(session, incident.id, prefix + "\n\n" + FORM_TEXT)
@@ -124,8 +130,7 @@ def accept_chat(session, user_id, request):
         raise HTTPException(409, "Передайте attempt_id и helped через endpoint feedback")
     if incident and incident.pending_action == FORM_ACTION:
         raise HTTPException(409, "Заполните escalation-details")
-    if incident and incident.state == "WAITING_FEEDBACK" and intent != "HUMAN":
-        raise HTTPException(409, "Сначала оцените текущее решение через endpoint feedback")
+    followup = bool(incident and incident.state == "WAITING_FEEDBACK")
     if not incident:
         incident = Incident(
             conversation_id=conversation.id, subject=request.message[:200], description=request.message
@@ -149,10 +154,11 @@ def accept_chat(session, user_id, request):
         ask_escalation(session, incident, "USER_REQUEST")
         operation_id = None
     else:
-        incident.state = "DIAGNOSING"
+        if not followup:
+            incident.state = "DIAGNOSING"
         incident.pending_action = "PROCESSING"
         incident.result = None
-        operation_id = enqueue(session, incident, "ADVANCE").id
+        operation_id = enqueue(session, incident, "CLARIFY" if followup else "ADVANCE").id
     audit(session, incident.id, "message.accepted", message_id=message.id)
     return {"incident_id": incident.id, "message_id": message.id, "operation_id": operation_id}
 
@@ -172,7 +178,11 @@ def accept_feedback(session, user_id, incident_id, request):
         if existing.helped != request.helped or existing.comment != request.comment:
             raise HTTPException(409, "Результат попытки уже зафиксирован")
         return {"incident_id": incident.id, "feedback_id": existing.id, "duplicate": True}
-    if incident.state != "WAITING_FEEDBACK" or attempt.status != "WAITING_FEEDBACK":
+    if (
+        incident.pending_action == "PROCESSING"
+        or incident.state != "WAITING_FEEDBACK"
+        or attempt.status != "WAITING_FEEDBACK"
+    ):
         raise HTTPException(409, "Эта попытка не ожидает обратной связи")
     feedback = Feedback(attempt_id=attempt.id, helped=request.helped, comment=request.comment)
     session.add(feedback)
@@ -189,6 +199,7 @@ def accept_feedback(session, user_id, incident_id, request):
         incident.state = "RESOLVED"
         incident.pending_action = None
         incident.closed_at = now()
+        remember_resolution(session, incident, get_settings())
         messenger.send(session, incident.id, "Спасибо за обратную связь. Обращение решено.")
     else:
         incident.failed_attempts += 1

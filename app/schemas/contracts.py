@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt
 
 
 class StrictModel(BaseModel):
@@ -31,6 +31,14 @@ class AnalysisResult(StrictModel):
     problem_type: str | None = Field(default=None, max_length=100)
     equipment_model: str | None = Field(default=None, max_length=255)
     search_query: str = Field(max_length=1000)
+    clarification_key: Literal["DEVICE_MODEL", "CONNECTION", "ERROR_TEXT", "SYMPTOMS"] | None = None
+
+
+class FollowupResult(StrictModel):
+    result: Literal["EXCERPT", "NO_KNOWLEDGE"]
+    source_chunk_ids: list[str] = Field(default_factory=list, max_length=1)
+    step_indices: list[StrictInt] = Field(default_factory=list, max_length=12)
+    illustration_indices: list[StrictInt] = Field(default_factory=list, max_length=6)
 
 
 class AnswerResult(StrictModel):

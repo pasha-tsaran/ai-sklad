@@ -6,12 +6,15 @@ from app.models import (
     Job,
     KnowledgeChunk,
     KnowledgeDocument,
+    Message,
+    MessageAttachment,
     Solution,
     SolutionAttempt,
     now,
 )
-from app.schemas.contracts import AnalysisResult, AnswerResult, SummaryResult
+from app.schemas.contracts import AnalysisResult, AnswerResult, FollowupResult, SummaryResult
 from app.services.chat.audit import audit
+from app.services.chat.memory import load_context
 from app.services.chat.policies import MAX_ATTEMPTS
 from app.services.chat.service import ask_escalation, messenger
 from app.services.mail.mock import MockMail
@@ -20,10 +23,28 @@ from app.services.rag.retrieval import LocalRetriever
 from app.services.rag.openwebui import OpenWebUIKnowledge, save_snapshot
 from app.services.mail.smtp import SMTPMail
 from app.models import Conversation
+from app.services.rag.documents import Illustration
+
+CLARIFY_QUESTIONS = {
+    "DEVICE_MODEL": "Какое устройство не работает? Напишите его название и модель, если она указана на корпусе.",
+    "CONNECTION": "Как устройство подключено: кабелем USB к компьютеру, сетевым кабелем или по Wi-Fi?",
+    "ERROR_TEXT": "Какой точный текст ошибки вы видите? Перепишите его, пожалуйста.",
+    "SYMPTOMS": "Опишите, что именно не работает и что появляется на экране.",
+}
+NO_FOLLOWUP_ANSWER = (
+    "В переданной инструкции базы знаний нет ответа на этот вопрос. "
+    "Недостаточно сведений для ответа на ваше уточнение. "
+    "Требуется помощь специалиста технической поддержки. "
+    "Для перехода к оформлению заявки напишите «оператор». Обращение ещё не передано."
+)
+FOLLOWUP_UNAVAILABLE = (
+    "Не удалось проверить уточнение: сервис временно недоступен или вернул некорректный ответ. "
+    "Повторите вопрос или напишите «оператор». Текущая попытка сохранена."
+)
 
 
 def advance(factory, job_id, llm, settings):
-    with factory() as session:
+    with factory() as session, session.begin():
         job = session.get(Job, job_id)
         incident = session.get(Incident, job.incident_id)
         if incident.pending_action != "PROCESSING" or incident.version != job.expected_version:
@@ -36,6 +57,7 @@ def advance(factory, job_id, llm, settings):
         ).all()
         excluded = {a.solution_id for a in attempts}
         failures = incident.failed_attempts
+        context = load_context(session, incident, settings)
     # All model calls are outside database transactions.
     analysis = None
     candidate = None
@@ -47,16 +69,21 @@ def advance(factory, job_id, llm, settings):
     elif len(tokens(description)) < 2:
         result = "NEED_MORE_INFO"
     else:
-        analysis = AnalysisResult.model_validate(llm.analyze(description))
-        if settings.knowledge_backend == "openwebui":
-            candidates = OpenWebUIKnowledge(settings).search(description, excluded)
+        analysis = AnalysisResult.model_validate(llm.analyze_context(description, context))
+        if analysis.clarification_key:
+            result = "NEED_MORE_INFO"
+            candidates = None
+        elif settings.knowledge_backend == "openwebui":
+            candidates = OpenWebUIKnowledge(settings).search(description, excluded, context=context)
         else:
             with factory() as session:
                 retriever = LocalRetriever(session, settings.rag_min_score)
                 candidates = retriever.search(analysis.search_query, excluded)
                 grounded = {c.solution_id for c in retriever.search(description, excluded)}
                 candidates = [c for c in candidates if c.solution_id in grounded]
-        if not candidates:
+        if candidates is None:
+            pass
+        elif not candidates:
             reason = "NO_MORE_SOLUTIONS" if excluded else "NO_KNOWLEDGE"
         else:
             candidate = candidates[0]
@@ -116,7 +143,10 @@ def advance(factory, job_id, llm, settings):
         elif result == "NEED_MORE_INFO":
             incident.result = result
             incident.pending_action = None
-            messenger.send(session, incident_id, "Уточните устройство и опишите, что именно не работает.")
+            messenger.send(session, incident_id, CLARIFY_QUESTIONS.get(
+                analysis.clarification_key if analysis else None,
+                "Уточните устройство и опишите, что именно не работает.",
+            ))
         else:
             # Deliberately never use generated technical prose, commands or attachment URLs.
             intro = "Попробуйте шаги из утверждённой инструкции."
@@ -153,7 +183,7 @@ def advance(factory, job_id, llm, settings):
                     "chunk_id": candidate.chunk_id,
                     "content": candidate.content,
                     "steps": candidate.steps,
-                    "prompt_version": "v1",
+                    "prompt_version": "v2-grounded-memory",
                     "source": candidate.source,
                 },
                 retrieval_score=candidate.score,
@@ -179,6 +209,114 @@ def advance(factory, job_id, llm, settings):
                 llm_fallback=invalid_answer,
             )
         incident.version += 1
+
+
+def current_source(session, attempt):
+    row = session.execute(
+        select(Solution, KnowledgeDocument)
+        .join(KnowledgeChunk, Solution.chunk_id == KnowledgeChunk.id)
+        .join(KnowledgeDocument, KnowledgeChunk.document_id == KnowledgeDocument.id)
+        .where(Solution.id == attempt.solution_id)
+        .with_for_update()
+    ).first()
+    return bool(
+        row and row[0].active and row[1].approved
+        and row[0].chunk_id == attempt.evidence["chunk_id"]
+        and row[0].version == attempt.evidence["version"]
+        and row[0].steps == attempt.evidence["steps"]
+    )
+
+
+def clarify(factory, job_id, llm, settings):
+    """A question about a pending instruction never creates/counts another attempt."""
+    with factory() as session, session.begin():
+        job = session.get(Job, job_id)
+        incident = session.get(Incident, job.incident_id)
+        if (
+            incident.pending_action != "PROCESSING" or incident.version != job.expected_version
+            or incident.state != "WAITING_FEEDBACK"
+        ):
+            return
+        attempt = session.scalar(select(SolutionAttempt).where(
+            SolutionAttempt.incident_id == incident.id, SolutionAttempt.status == "WAITING_FEEDBACK",
+        ))
+        if not attempt:
+            raise ValueError("Missing pending attempt")
+        incident_id, version, attempt_id = incident.id, incident.version, attempt.id
+        evidence = dict(attempt.evidence)
+        context = load_context(session, incident, settings)
+        question = session.scalar(select(Message.content).where(
+            Message.incident_id == incident.id, Message.role == "user",
+        ).order_by(Message.sequence.desc()).limit(1))
+        # Associate images with this attempt's original response, not a different solution.
+        first = session.get(Message, attempt.message_id)
+        following_user = session.scalar(select(Message.sequence).where(
+            Message.incident_id == incident.id, Message.role == "user", Message.sequence > first.sequence,
+        ).order_by(Message.sequence).limit(1))
+        photos = session.scalars(select(MessageAttachment).join(Message).where(
+            Message.incident_id == incident.id, Message.sequence > first.sequence,
+            Message.sequence < following_user,
+        ).order_by(Message.sequence)).all() if following_user is not None else []
+        illustrations = [Illustration(p.filename, p.caption, p.content_type, p.data) for p in photos]
+        approved = current_source(session, attempt)
+    excerpts = [p for p in evidence["content"].split("\n\n") if p.strip()]
+    # Never truncate a procedure mid-sentence. The complete source remains in the response below.
+    if len(excerpts) > 256:
+        excerpts = [evidence["content"]]
+    answer = None
+    model_failed = False
+    source = evidence.get("source", {})
+    if approved and source.get("backend") == "openwebui":
+        approved = OpenWebUIKnowledge(settings).is_current(source)
+    if approved:
+        try:
+            answer = FollowupResult.model_validate(llm.followup(question, context, {
+                "chunk_id": evidence["chunk_id"], "title": evidence["title"], "excerpts": excerpts,
+                "illustrations": [{"index": i, "caption": p.caption} for i, p in enumerate(illustrations)],
+            }))
+            valid = (
+                answer.result == "EXCERPT" and answer.source_chunk_ids == [evidence["chunk_id"]]
+                and bool(answer.step_indices)
+                and len(set(answer.step_indices)) == len(answer.step_indices)
+                and len(set(answer.illustration_indices)) == len(answer.illustration_indices)
+                and all(0 <= i < len(excerpts) for i in answer.step_indices)
+                and all(0 <= i < len(illustrations) for i in answer.illustration_indices)
+            )
+        except Exception:
+            valid = False
+            model_failed = True
+    else:
+        valid = False
+    # Remote membership/content may change during the model call, just as local approval can.
+    if valid and source.get("backend") == "openwebui":
+        valid = OpenWebUIKnowledge(settings).is_current(source)
+    with factory() as session, session.begin():
+        incident = session.scalar(select(Incident).where(Incident.id == incident_id).with_for_update())
+        if incident.version != version or incident.pending_action != "PROCESSING":
+            audit(session, incident_id, "job.stale_result_ignored", job_id=job_id)
+            return
+        attempt = session.get(SolutionAttempt, attempt_id)
+        valid = valid and attempt.status == "WAITING_FEEDBACK" and current_source(session, attempt)
+        if valid:
+            content = (
+                "В утверждённой инструкции есть такой фрагмент:\n\n"
+                + "\n\n".join(excerpts[i] for i in sorted(answer.step_indices))
+            )
+            if len(answer.step_indices) < len(excerpts):
+                content += "\n\nПолная инструкция с условиями и предупреждениями:\n" + evidence["content"]
+            content += "\n\nИсточник: " + evidence["title"] + ".\nУдалось выполнить этот пункт?"
+            images = [illustrations[i] for i in sorted(answer.illustration_indices)]
+        else:
+            content = FOLLOWUP_UNAVAILABLE if model_failed else NO_FOLLOWUP_ANSWER
+            images = []
+        conversation = session.get(Conversation, incident.conversation_id)
+        if conversation.channel == "nextcloud_talk":
+            content += f"\nДля оценки решения:\nПомогло {attempt.id}\nили\nНе помогло {attempt.id}"
+        messenger.send(session, incident_id, content, images)
+        incident.pending_action = None
+        incident.result = "ANSWER" if valid else ("NEED_MORE_INFO" if model_failed else "NO_KNOWLEDGE")
+        incident.version += 1
+        audit(session, incident_id, "instruction.clarified", attempt_id=attempt_id, source_answer=bool(valid))
 
 
 def send_mail(factory, job_id, llm, settings):
@@ -250,7 +388,7 @@ def run_one(factory, llm, settings):
         job.tries += 1
         job_id, kind = job.id, job.kind
     try:
-        {"ADVANCE": advance, "SEND_MAIL": send_mail}[kind](factory, job_id, llm, settings)
+        {"ADVANCE": advance, "CLARIFY": clarify, "SEND_MAIL": send_mail}[kind](factory, job_id, llm, settings)
     except Exception as error:
         with factory() as session, session.begin():
             job = session.get(Job, job_id)
@@ -273,7 +411,7 @@ def run_one(factory, llm, settings):
                     .with_for_update()
                 )
                 if (
-                    kind == "ADVANCE"
+                    kind in {"ADVANCE", "CLARIFY"}
                     and incident.pending_action == "PROCESSING"
                     and incident.version == job.expected_version
                 ):

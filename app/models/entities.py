@@ -89,6 +89,27 @@ class Message(Entity, Base):
     __table_args__ = (UniqueConstraint("incident_id", "sequence"),)
 
 
+class IncidentMemory(Entity, Base):
+    """Bounded, reproducible user snippets omitted from the recent message window."""
+
+    __tablename__ = "incident_memory"
+    incident_id: Mapped[str] = mapped_column(ForeignKey("incidents.id"), unique=True)
+    through_sequence: Mapped[int] = mapped_column(Integer, default=0)
+    summary: Mapped[list] = mapped_column(JSON, default=list)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class ResolutionMemory(Entity, Base):
+    """Historical reported equipment/problem facts, never instructions or a user profile."""
+
+    __tablename__ = "resolution_memory"
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    incident_id: Mapped[str] = mapped_column(ForeignKey("incidents.id"), unique=True)
+    facts: Mapped[dict] = mapped_column(JSON)
+    resolved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+
+
 class KnowledgeDocument(Entity, Base):
     __tablename__ = "knowledge_documents"
     title: Mapped[str] = mapped_column(String(255))

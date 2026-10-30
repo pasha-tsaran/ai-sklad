@@ -35,6 +35,9 @@ class Settings(BaseSettings):
     seed_demo_knowledge: bool = False
     support_email: str = "support@example.invalid"
     rag_min_score: float = Field(default=0.30, ge=0, le=1)
+    memory_max_messages: int = Field(default=12, ge=2, le=40)
+    memory_max_chars: int = Field(default=12000, ge=2000, le=24000)
+    memory_retention_days: int = Field(default=90, ge=1, le=365)
 
     @model_validator(mode="after")
     def validate_credentials(self):
