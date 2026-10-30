@@ -11,6 +11,7 @@ from app.models import (
     Incident,
     Job,
     Message,
+    MessageAttachment,
     RequestReceipt,
     SolutionAttempt,
     User,
@@ -211,6 +212,13 @@ def accept_feedback(session, user_id, incident_id, request):
 
 
 def incident_view(session, incident):
+    attachments = {
+        row.message_id: row
+        for row in session.scalars(
+            select(MessageAttachment).join(Message, MessageAttachment.message_id == Message.id)
+            .where(Message.incident_id == incident.id)
+        )
+    }
     messages = session.scalars(
         select(Message).where(Message.incident_id == incident.id).order_by(Message.sequence)
     ).all()
@@ -239,6 +247,13 @@ def incident_view(session, incident):
                 "content": m.content,
                 "delivery_status": m.delivery_status,
                 "created_at": m.created_at,
+                "attachments": [{
+                    "id": attachments[m.id].id,
+                    "filename": attachments[m.id].filename,
+                    "caption": attachments[m.id].caption,
+                    "content_type": attachments[m.id].content_type,
+                    "url": f"/api/incidents/{incident.id}/attachments/{attachments[m.id].id}",
+                }] if m.id in attachments else [],
             }
             for m in messages
         ],

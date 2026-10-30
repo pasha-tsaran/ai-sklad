@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict
 
 from app.models import KnowledgeChunk, KnowledgeDocument, Solution
 from app.services.rag.interface import Candidate
+from app.services.rag.documents import read_docx, read_xlsx
 
 
 class Selection(BaseModel):
@@ -33,6 +34,8 @@ class OpenWebUIKnowledge:
             response.raise_for_status()
             # Fail closed on an incompatible server response, never search all knowledge.
             for item in response.json()["files"]:
+                if str(item.get("filename", "")).startswith(("ИТ_", "СПРАВОЧНИК_")):
+                    continue  # Reference/admin uploads are searchable in WebUI, not automatic employee solutions.
                 files[item["id"]] = item
         return files
 
@@ -86,13 +89,30 @@ class OpenWebUIKnowledge:
             response = client.get(self.base + "/api/v1/files/" + quote(file_id, safe="") + "/data/content")
             response.raise_for_status()
             content = response.json()["content"]
+            title = str(allowed[file_id].get("filename") or file_id)[:255]
+            illustrations, original_hash = [], None
+            if title.lower().endswith((".docx", ".xlsx")):
+                original = bytearray()
+                with client.stream("GET", self.base + "/api/v1/files/" + quote(file_id, safe="") + "/content") as raw:
+                    raw.raise_for_status()
+                    for block in raw.iter_bytes():
+                        original.extend(block)
+                        if len(original) > self.settings.knowledge_max_file_bytes:
+                            raise ValueError("Knowledge upload too large")
+                original_hash = hashlib.sha256(original).hexdigest()
+                if title.lower().endswith(".docx"):
+                    content, illustrations = read_docx(bytes(original))
+                else:
+                    content = read_xlsx(bytes(original))
+                # Bind original bytes and images to a still-approved source.
+                if file_id not in self._files(client):
+                    return []
             if not isinstance(content, str) or not content.strip():
                 raise ValueError("Empty knowledge source")
             if len(content) > self.settings.knowledge_max_chars:
                 raise ValueError("Source too large; split into complete instructions in Open WebUI")
             identity = self.identity(file_id)
             digest = hashlib.sha256(content.encode()).hexdigest()
-            title = str(allowed[file_id].get("filename") or file_id)[:255]
             return [
                 Candidate(
                     identity,
@@ -108,7 +128,10 @@ class OpenWebUIKnowledge:
                         "collection_ids": self.settings.openwebui_knowledge_ids,
                         "sha256": digest,
                         "base_url": self.base,
+                        "original_sha256": original_hash,
+                        "illustrations": [p.metadata() for p in illustrations],
                     },
+                    illustrations,
                 )
             ]
 

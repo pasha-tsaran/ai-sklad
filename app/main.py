@@ -47,4 +47,6 @@ def ready():
         if settings.knowledge_backend == "openwebui"
         else True,
         "demo_knowledge": settings.seed_demo_knowledge,
+        "talk_images_configured": bool(settings.nextcloud_files_username)
+        and bool(settings.nextcloud_files_app_password.get_secret_value()),
     }

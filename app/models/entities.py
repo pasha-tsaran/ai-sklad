@@ -11,6 +11,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     String,
     Text,
     UniqueConstraint,
@@ -193,3 +194,15 @@ class Delivery(Entity, Base):
     tries: Mapped[int] = mapped_column(Integer, default=0)
     error_code: Mapped[str | None] = mapped_column(String(100))
     remote_id: Mapped[str | None] = mapped_column(String(100))
+
+
+class MessageAttachment(Entity, Base):
+    """Immutable original illustration snapshot, one captioned photo per message."""
+
+    __tablename__ = "message_attachments"
+    message_id: Mapped[str] = mapped_column(ForeignKey("messages.id"), unique=True)
+    filename: Mapped[str] = mapped_column(String(100))
+    caption: Mapped[str] = mapped_column(Text)
+    content_type: Mapped[str] = mapped_column(String(100))
+    sha256: Mapped[str] = mapped_column(String(64))
+    data: Mapped[bytes] = mapped_column(LargeBinary)

@@ -1,10 +1,10 @@
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Response
 
 from app.api.dependencies import current_user, get_session
 from app.core.config import get_settings
-from app.models import Job
+from app.models import Job, Message, MessageAttachment
 from app.schemas.contracts import ChatRequest, EscalationDetails, FeedbackRequest
 from app.services.chat.service import accept_chat, accept_feedback, get_owned, idempotent, incident_view
 from app.services.feedback.service import solution_stats
@@ -61,6 +61,19 @@ def escalation_details(
 @router.get("/incidents/{incident_id}")
 def incident(incident_id: str, user_id=Depends(current_user), session=Depends(get_session)):
     return incident_view(session, get_owned(session, incident_id, user_id))
+
+
+@router.get("/incidents/{incident_id}/attachments/{attachment_id}")
+def illustration(incident_id: str, attachment_id: str,
+                 user_id=Depends(current_user), session=Depends(get_session)):
+    get_owned(session, incident_id, user_id)
+    attachment = session.get(MessageAttachment, attachment_id)
+    if not attachment or session.get(Message, attachment.message_id).incident_id != incident_id:
+        raise HTTPException(404, "Illustration not found")
+    return Response(attachment.data, media_type=attachment.content_type, headers={
+        "Content-Disposition": f'inline; filename="{attachment.filename}"',
+        "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff",
+    })
 
 
 @router.get("/operations/{operation_id}")

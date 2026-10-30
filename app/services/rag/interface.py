@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
 from typing import Protocol
 
+from app.services.rag.documents import Illustration
+
 
 @dataclass(frozen=True)
 class Candidate:
@@ -12,6 +14,7 @@ class Candidate:
     steps: list[str]
     score: float
     source: dict = field(default_factory=dict)
+    illustrations: list[Illustration] = field(default_factory=list)
 
 
 class Retriever(Protocol):

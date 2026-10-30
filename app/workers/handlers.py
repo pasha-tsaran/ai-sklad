@@ -141,7 +141,7 @@ def advance(factory, job_id, llm, settings):
             )
             incident.state = "SOLUTION_PROPOSED"
             audit(session, incident_id, "incident.state_changed", state=incident.state)
-            message = messenger.send(session, incident_id, content)
+            message = messenger.send(session, incident_id, content, candidate.illustrations)
             attempt = SolutionAttempt(
                 incident_id=incident_id,
                 solution_id=candidate.solution_id,

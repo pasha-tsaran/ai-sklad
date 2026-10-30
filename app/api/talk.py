@@ -23,6 +23,8 @@ FORM_HELP = "Отправьте одним сообщением:\nФИО: ...\n�
 
 def handle_event(session, payload, settings):
     actor, obj, target = payload.get("actor", {}), payload.get("object", {}), payload.get("target", {})
+    if settings.nextcloud_files_username and actor.get("id") == "users/" + settings.nextcloud_files_username:
+        return {"ignored": True}  # Our Files account's shares must not start new support conversations.
     if (
         payload.get("type") != "Create"
         or actor.get("type") != "Person"

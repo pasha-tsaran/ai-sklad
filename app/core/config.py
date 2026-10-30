@@ -16,10 +16,13 @@ class Settings(BaseSettings):
     knowledge_backend: Literal["openwebui", "demo"] = "openwebui"
     openwebui_knowledge_ids: list[str] = Field(default_factory=list)
     knowledge_max_chars: int = Field(default=20000, ge=1000, le=24000)
+    knowledge_max_file_bytes: int = Field(default=25_000_000, ge=1000, le=50_000_000)
     nextcloud_backend: Literal["mock", "talk"] = "mock"
     nextcloud_base_url: str = ""
     nextcloud_bot_secret: SecretStr = SecretStr("")
     nextcloud_allowed_rooms: list[str] = Field(default_factory=list)
+    nextcloud_files_username: str = ""
+    nextcloud_files_app_password: SecretStr = SecretStr("")
     integration_timeout_seconds: float = Field(default=20, gt=0, le=120)
     mail_backend: Literal["mock", "smtp"] = "mock"
     smtp_host: str = ""
@@ -52,6 +55,8 @@ class Settings(BaseSettings):
                 or not self.nextcloud_allowed_rooms
             ):
                 raise ValueError("Talk requires HTTPS URL, >=32 character secret and allowed rooms")
+        if bool(self.nextcloud_files_username) != bool(self.nextcloud_files_app_password.get_secret_value()):
+            raise ValueError("Nextcloud attachments require both files username and app password")
         if self.mail_backend == "smtp":
             if not self.smtp_host or not self.smtp_from or self.support_email.endswith(".invalid"):
                 raise ValueError("SMTP requires host, from and a real support address")
