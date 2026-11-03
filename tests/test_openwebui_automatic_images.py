@@ -80,6 +80,15 @@ def citation(file_id=DOC_ID, filename="33_Supermag — операции.docx"):
             "metadata": [{"file_id": file_id, "name": filename}]}
 
 
+SCANNER_QUERY = "В 1С адрес сканера неверный. Как настроить адрес сканера?"
+SCANNER_FILENAME = "33_1С — адрес сканера.docx"
+
+
+def search_chunk(file_id=DOC_ID, filename=SCANNER_FILENAME, content=None, **extra):
+    return {"file_id": file_id, "source": filename,
+            "content": content or "В 1С настройте адрес сканера по утверждённой инструкции.", **extra}
+
+
 def chat_body(current=None, messages=None):
     if messages is None:
         messages = [{"id": "user-1", "role": "user", "content": "Как выполнить операцию в Supermag?"},
@@ -96,7 +105,11 @@ class RuntimeState:
     def __init__(self, docs=None):
         self.documents = docs or {DOC_ID: document()}
         self.authorized = True
+        self.owner_authorized = True
         self.authorizations = 0
+        self.searches = []
+        self.search_result = {"status": "ok", "chunks": []}
+        self.search_exception = None
         self.reads = []
         self.shows = []
         self.verifications = []
@@ -113,6 +126,7 @@ class RuntimeState:
 class FakeRuntime:
     def __init__(self, state, body, meta, user, request, emitter, image_tool_id):
         self.state, self.emitter = state, emitter
+        self.owner_authorized = state.owner_authorized
 
     async def authorize(self):
         self.state.authorizations += 1
@@ -121,6 +135,12 @@ class FakeRuntime:
     async def read(self, file_id):
         self.state.reads.append(file_id)
         return copy.deepcopy(self.state.documents.get(file_id, {"status": "error", "code": "access_denied"}))
+
+    async def search(self, query):
+        self.state.searches.append(query)
+        if self.state.search_exception:
+            raise self.state.search_exception
+        return copy.deepcopy(self.state.search_result)
 
     async def show(self, file_id, selection, offset):
         self.state.shows.append((file_id, selection, offset))
@@ -179,13 +199,23 @@ def image_results(automatic, message):
     return [result for name, _, result in automatic.tool_results(message) if name == "show_instruction_images"]
 
 
+def file_events(state):
+    return [event for event in state.events if event["type"] == "files"]
+
+
+def assert_no_unverified_steps(result, original):
+    message = result["messages"][-1]
+    assert message["content"] != original["messages"][-1]["content"]
+    assert final_text(message) == message["content"]
+
+
 def test_photos_attached_automatically_when_model_only_read_instruction(automatic, monkeypatch):
     state = RuntimeState({DOC_ID: document(captions=["Откройте «Операции».", "Нажмите «ОК»."])})
     original = chat_body()
     result = apply_filter(automatic, monkeypatch, state, original)
     message = result["messages"][-1]
     assert state.reads == [DOC_ID] and state.shows == [(DOC_ID, "1,2", 0)]
-    assert len(state.events) == 1 and state.events[0]["type"] == "files"
+    assert len(file_events(state)) == 1
     assert "Откройте «Операции»." in message["content"] and "Нажмите «ОК»." in message["content"]
     assert "Перед началом закройте незавершённую операцию." in message["content"]
     assert message["content"].count("?") == 1
@@ -216,6 +246,139 @@ def test_single_acrobat_photo_does_not_drop_unpictured_original_print_steps(auto
     for number, step in enumerate(steps, 1):
         assert f"{number}. {step}" in text
     assert final_text(result["messages"][-1]) == text
+
+
+def test_model_without_any_tool_calls_is_forced_through_search_read_and_photo_delivery(automatic, monkeypatch):
+    caption = "В окне 1С выберите «Операции», затем откройте адрес сканера."
+    doc = document(filename=SCANNER_FILENAME, captions=[caption])
+    doc["content"] = "Адрес сканера в 1С\n\n1. Выберите меню «Операции» и откройте адрес сканера."
+    state = RuntimeState({DOC_ID: doc})
+    state.search_result = {"status": "ok", "chunks": [search_chunk(distance=0.1)]}
+    current = answer(read=False, content="Откройте меню «Сервис» → «Настройки». Измените адрес сканера.")
+    body = chat_body(messages=[{"id": "user-1", "role": "user", "content": SCANNER_QUERY}, current])
+    result = apply_filter(automatic, monkeypatch, state, body)
+    message = result["messages"][-1]
+    assert state.searches == [SCANNER_QUERY] and state.reads == [DOC_ID]
+    assert state.shows == [(DOC_ID, "1", 0)] and len(file_events(state)) == 1
+    assert "Сервис» → «Настройки" not in message["content"] and caption in message["content"]
+    assert final_text(message) == message["content"]
+    statuses = [event["data"] for event in state.events if event["type"] == "status"]
+    assert statuses and statuses[0]["done"] is False and statuses[-1]["done"] is True
+
+
+@pytest.mark.parametrize("failure", ["empty", "unavailable", "weak", "ambiguous", "exception"])
+def test_failed_fallback_never_leaves_hallucinated_technical_steps(automatic, monkeypatch, failure):
+    state = RuntimeState()
+    if failure == "unavailable":
+        state.search_result = {"status": "unavailable", "chunks": []}
+    elif failure == "weak":
+        state.search_result = {"status": "ok", "chunks": [search_chunk(
+            filename="44_Общие сведения.docx", content="Общие сведения об оборудовании."
+        )]}
+    elif failure == "ambiguous":
+        state.search_result = {"status": "ok", "chunks": [
+            search_chunk(distance=0.01), search_chunk(OTHER_ID, filename="44_1С — адрес сканера.docx", distance=0.9),
+        ]}
+    elif failure == "exception":
+        state.search_exception = ConnectionError("Private retrieval service unavailable")
+    current = answer(read=False, content="Откройте меню «Сервис», затем «Настройки» и измените порт.")
+    body = chat_body(messages=[{"id": "user-1", "role": "user", "content": SCANNER_QUERY}, current])
+    result = apply_filter(automatic, monkeypatch, state, body)
+    assert_no_unverified_steps(result, body)
+    assert "«Сервис»" not in result["messages"][-1]["content"]
+    assert not state.reads and not state.shows and not file_events(state)
+
+
+@pytest.mark.parametrize("chunk", [
+    search_chunk(filename="ИТ_1С — адрес сканера.docx"),
+    search_chunk(filename="СПРАВОЧНИК_1С — адрес сканера.docx"),
+    search_chunk(filename="1С — адрес сканера.png"),
+    search_chunk(file_id="not-a-file-uuid"),
+    search_chunk(type="external"),
+])
+def test_fallback_rejects_staff_only_external_and_invalid_sources(automatic, monkeypatch, chunk):
+    state = RuntimeState()
+    state.search_result = {"status": "ok", "chunks": [chunk]}
+    body = chat_body(messages=[{"id": "user-1", "role": "user", "content": SCANNER_QUERY},
+                               answer(read=False, content="Откройте «Сервис» и измените настройки.")])
+    result = apply_filter(automatic, monkeypatch, state, body)
+    assert_no_unverified_steps(result, body)
+    assert not state.reads and not state.shows and not file_events(state)
+
+
+def test_fallback_uses_current_problem_without_unrelated_history(automatic, monkeypatch):
+    state = RuntimeState({DOC_ID: document(filename=SCANNER_FILENAME)})
+    state.search_result = {"status": "ok", "chunks": [search_chunk()]}
+    body = chat_body(messages=[
+        {"id": "old-user", "role": "user", "content": "Предыдущая проблема: почта не открывается."},
+        answer("old-answer", read=False),
+        {"id": "current-user", "role": "user", "content": SCANNER_QUERY}, answer(read=False),
+    ])
+    apply_filter(automatic, monkeypatch, state, body)
+    assert state.searches == [SCANNER_QUERY]
+
+
+def test_fallback_read_failure_cannot_restore_unverified_menu_path(automatic, monkeypatch):
+    state = RuntimeState({DOC_ID: {"status": "error", "code": "access_denied"}})
+    state.search_result = {"status": "ok", "chunks": [search_chunk()]}
+    body = chat_body(messages=[{"id": "user-1", "role": "user", "content": SCANNER_QUERY},
+                               answer(read=False, content="Откройте меню «Сервис» и «Настройки».")])
+    result = apply_filter(automatic, monkeypatch, state, body)
+    assert_no_unverified_steps(result, body)
+    assert state.reads == [DOC_ID] and not state.shows and not file_events(state)
+
+
+def test_fallback_can_render_approved_text_when_document_has_no_photographs(automatic, monkeypatch):
+    approved = "Адрес сканера в 1С\n\n1. Откройте «Операции».\n\nЕсли адрес неизвестен, обратитесь в поддержку."
+    doc = document(count=0, filename=SCANNER_FILENAME)
+    doc["content"] = approved
+    state = RuntimeState({DOC_ID: doc})
+    state.search_result = {"status": "ok", "chunks": [search_chunk()]}
+    body = chat_body(messages=[{"id": "user-1", "role": "user", "content": SCANNER_QUERY},
+                               answer(read=False, content="Откройте «Сервис» и измените настройки.")])
+    result = apply_filter(automatic, monkeypatch, state, body)
+    message = result["messages"][-1]
+    assert approved in message["content"] and "«Сервис»" not in message["content"]
+    assert final_text(message) == message["content"]
+    assert state.reads == [DOC_ID] and not state.shows and not file_events(state)
+
+
+def test_short_printer_answer_keeps_the_immediately_preceding_pdf_problem(automatic, monkeypatch):
+    initial = "В Adobe Acrobat PDF с картинками печатается без изображений. Другие документы печатаются нормально."
+    filename = "05_Acrobat — PDF с картинками не печатается.docx"
+    caption = "Нажмите «Дополнительно» и включите «Печатать как изображение»."
+    state = RuntimeState({DOC_ID: document(filename=filename, captions=[caption])})
+    state.search_result = {"status": "ok", "chunks": [search_chunk(
+        filename=filename, content="Adobe Acrobat PDF с картинками: печать как изображение."
+    )]}
+    body = chat_body(messages=[
+        {"id": "user-1", "role": "user", "content": initial},
+        answer("question", read=False, content="Какой у вас принтер?"),
+        {"id": "user-2", "role": "user", "content": "HP"},
+        answer(read=False, content="Откройте параметры качества и включите цветную печать."),
+    ])
+    result = apply_filter(automatic, monkeypatch, state, body)
+    assert state.searches == [initial + "\nHP"] and state.reads == [DOC_ID]
+    assert caption in result["messages"][-1]["content"]
+    assert "цветную печать" not in result["messages"][-1]["content"]
+    assert len(file_events(state)) == 1
+
+
+def test_search_candidate_requires_lexical_evidence_and_clear_margin(automatic):
+    assert automatic.choose_search_source(SCANNER_QUERY, [search_chunk()]) == DOC_ID
+    assert automatic.choose_search_source(SCANNER_QUERY, [search_chunk(), copy.deepcopy(search_chunk())]) == DOC_ID
+    assert automatic.choose_search_source(SCANNER_QUERY, [
+        search_chunk(), search_chunk(OTHER_ID, filename="44_1С — адрес сканера.docx"),
+    ]) is None
+    assert automatic.choose_search_source(SCANNER_QUERY, [search_chunk(
+        filename="44_Общее.docx", content="Общие сведения."
+    )]) is None
+
+
+def test_search_candidate_recognizes_picture_synonym_without_arbitrary_first_hit(automatic):
+    assert automatic.choose_search_source("Acrobat картинки", [search_chunk(
+        filename="05_Acrobat — изображения.docx", content="Изображения в Acrobat."
+    )]) == DOC_ID
 
 
 def test_first_photo_batch_preserves_entry_step_and_excludes_later_procedure_steps(automatic, monkeypatch):
@@ -253,8 +416,8 @@ def test_ambiguous_search_hits_are_not_all_selected_as_instructions(automatic, m
     current["output"][:0] = native_pair("query_knowledge_files", {"query": "ошибка"},
                                        [{"file_id": DOC_ID}, {"file_id": OTHER_ID}])
     original = chat_body(current)
-    assert apply_filter(automatic, monkeypatch, state, original) == original
-    assert not state.reads and not state.shows and not state.events
+    assert_no_unverified_steps(apply_filter(automatic, monkeypatch, state, original), original)
+    assert not state.reads and not state.shows and not file_events(state)
 
 
 def test_unpaired_or_failed_read_does_not_count_as_approved_source(automatic, monkeypatch):
@@ -262,8 +425,8 @@ def test_unpaired_or_failed_read_does_not_count_as_approved_source(automatic, mo
     current = answer()
     current["output"][1]["call_id"] = "unrelated-call"
     original = chat_body(current)
-    assert apply_filter(automatic, monkeypatch, state, original) == original
-    assert not state.reads and not state.events
+    assert_no_unverified_steps(apply_filter(automatic, monkeypatch, state, original), original)
+    assert not state.reads and not file_events(state)
 
 
 def test_multiple_distinct_native_reads_do_not_select_an_arbitrary_document(automatic, monkeypatch):
@@ -273,7 +436,7 @@ def test_multiple_distinct_native_reads_do_not_select_an_arbitrary_document(auto
                                        {"id": OTHER_ID, "filename": "44_Принтер.docx", "content": "Другой текст."},
                                        call_id="read-other")
     original = chat_body(current)
-    assert apply_filter(automatic, monkeypatch, state, original) == original
+    assert_no_unverified_steps(apply_filter(automatic, monkeypatch, state, original), original)
     assert not state.reads and not state.shows
 
 
@@ -290,7 +453,7 @@ def test_one_cited_document_is_selected_from_multiple_search_sources(automatic, 
 def test_staff_only_or_non_docx_sources_are_not_automatically_displayed(automatic, monkeypatch, filename):
     state = RuntimeState()
     original = chat_body(answer(filename=filename))
-    assert apply_filter(automatic, monkeypatch, state, original) == original
+    assert_no_unverified_steps(apply_filter(automatic, monkeypatch, state, original), original)
     assert not state.reads and not state.shows
 
 
@@ -317,7 +480,7 @@ def test_fourteen_photos_advance_six_then_six_then_two_after_confirmation(automa
     assert [image["number"] for image in third_result["images"]] == [13, 14]
     assert not third_result["has_more"] and third_result["next_offset"] is None
     assert [show[2] for show in state.shows] == [0, 6, 12]
-    assert len(state.events) == 3
+    assert len(file_events(state)) == 3
 
 
 def test_ui_clarification_pins_previous_instruction_without_advancing_progress(automatic, monkeypatch):
@@ -372,7 +535,7 @@ def test_pinned_read_failure_does_not_expose_current_unrelated_it_commands(autom
     ])
     result = apply_filter(automatic, monkeypatch, state, body)
     text = result["messages"][-1]["content"]
-    assert len(state.shows) == 1 and len(state.events) == 1
+    assert len(state.shows) == 1 and len(file_events(state)) == 1
     assert "Не удалось проверить текущую инструкцию" in text
     assert "sudo" not in text and "apt install" not in text and "конфигурацию" not in text
     assert final_text(result["messages"][-1]) == text
@@ -399,7 +562,7 @@ def test_new_intervening_answer_does_not_resume_an_old_instruction_flow(automati
         answer("unrelated-answer", read=False, content="Уточните текст ошибки почты."),
         {"id": "user-next", "role": "user", "content": "Готово"}, answer("answer-2", read=False),
     ])
-    assert apply_filter(automatic, monkeypatch, state, body) == body
+    apply_filter(automatic, monkeypatch, state, body)
     assert len(state.shows) == 1
 
 
@@ -449,8 +612,8 @@ def test_negative_feedback_does_not_advance_image_progress(automatic, monkeypatc
     body = chat_body(messages=first["messages"] + [
         {"id": "user-2", "role": "user", "content": text}, answer("answer-2", read=False),
     ])
-    result = apply_filter(automatic, monkeypatch, state, body)
-    assert result == body and len(state.shows) == 1
+    apply_filter(automatic, monkeypatch, state, body)
+    assert len(state.shows) == 1 and len(file_events(state)) == 1
 
 
 def test_changed_source_hash_prevents_continuing_old_sequence(automatic, monkeypatch):
@@ -479,7 +642,7 @@ def test_model_image_call_is_not_reuploaded_but_gets_captions_and_progress(autom
                                        call_id="call_manual_images")
     result = apply_filter(automatic, monkeypatch, state, chat_body(current))
     message = result["messages"][-1]
-    assert not state.shows and not state.events
+    assert not state.shows and not file_events(state)
     assert "Выполните действие на снимке 1." in message["content"]
     assert "Выполните действие на снимке 6." in message["content"]
     assert "Готово" in message["content"] and "Выберите номера" not in message["content"]
@@ -487,7 +650,7 @@ def test_model_image_call_is_not_reuploaded_but_gets_captions_and_progress(autom
     recorded = image_results(automatic, message)
     assert len(recorded) == 1 and recorded[0]["_ai_support_flow"]["next_offset"] == 6
     repeated = apply_filter(automatic, monkeypatch, state, result)
-    assert repeated == result and not state.shows and not state.events
+    assert repeated == result and not state.shows and not file_events(state)
 
 
 def test_unknown_manual_delivery_is_not_automatically_retried(automatic, monkeypatch):
@@ -498,7 +661,7 @@ def test_unknown_manual_delivery_is_not_automatically_retried(automatic, monkeyp
                                        call_id="call_manual_images")
     original = chat_body(current)
     assert apply_filter(automatic, monkeypatch, state, original) == original
-    assert not state.reads and not state.shows and not state.events
+    assert not state.reads and not state.shows and not file_events(state)
 
 
 def test_changed_source_between_inspection_and_delivery_is_not_rendered_as_same_instruction(automatic, monkeypatch):
@@ -520,15 +683,36 @@ def test_repeated_filter_execution_does_not_upload_again(automatic, monkeypatch)
     first = apply_filter(automatic, monkeypatch, state, chat_body())
     repeated = apply_filter(automatic, monkeypatch, state, first)
     assert repeated == first
-    assert len(state.shows) == 1 and len(state.events) == 1
+    assert len(state.shows) == 1 and len(file_events(state)) == 1
 
 
 def test_unauthorized_runtime_cannot_read_or_upload(automatic, monkeypatch):
     state = RuntimeState()
     state.authorized = False
+    state.owner_authorized = False
     original = chat_body()
     assert apply_filter(automatic, monkeypatch, state, original) == original
     assert state.authorizations == 1 and not state.reads and not state.shows
+
+
+def test_missing_tool_configuration_is_visible_for_an_owned_chat(automatic, monkeypatch):
+    state = RuntimeState()
+    state.authorized = False
+    state.owner_authorized = True
+    body = chat_body(answer(read=False, content="Откройте «Сервис» и измените настройки."))
+    meta = dict(metadata(), tools={})
+    result = apply_filter(automatic, monkeypatch, state, body, meta=meta)
+    assert_no_unverified_steps(result, body)
+    assert state.authorizations == 1 and not state.reads and not state.shows
+
+
+def test_processed_private_delivery_is_idempotent_even_if_tools_are_absent_on_later_outlet(automatic, monkeypatch):
+    state = RuntimeState()
+    first = apply_filter(automatic, monkeypatch, state, chat_body())
+    state.authorized = False
+    state.owner_authorized = True
+    repeated = apply_filter(automatic, monkeypatch, state, first, meta=dict(metadata(), tools={}))
+    assert repeated == first and len(state.shows) == 1 and len(file_events(state)) == 1
 
 
 def test_question_only_reply_without_source_is_limited_to_one_clarification(automatic, monkeypatch):
@@ -541,13 +725,15 @@ def test_question_only_reply_without_source_is_limited_to_one_clarification(auto
     assert not state.reads and not state.shows
 
 
-def test_technical_steps_and_quoted_question_are_not_cut_by_question_limiter(automatic, monkeypatch):
+def test_question_limiter_preserves_procedure_but_knowledge_guard_rejects_unverified_steps(automatic, monkeypatch):
     state = RuntimeState()
     text = "1. Откройте окно и подтвердите вопрос «Продолжить?».\n2. Снимите галочку.\nУдалось выполнить?"
     body = chat_body(answer(read=False, content=text))
+    assert automatic.limit_clarifications(body, 1) == body
     result = apply_filter(automatic, monkeypatch, state, body)
-    assert result == body and result["messages"][-1]["content"] == text
-    assert final_text(result["messages"][-1]) == text
+    assert_no_unverified_steps(result, body)
+    assert "Откройте окно" not in result["messages"][-1]["content"]
+    assert not state.reads and not state.shows
 
 
 def test_backend_task_is_not_rewritten_by_question_limiter(automatic, monkeypatch):
@@ -558,7 +744,7 @@ def test_backend_task_is_not_rewritten_by_question_limiter(automatic, monkeypatc
     assert not state.authorizations
 
 
-@pytest.mark.parametrize("change", ["other_model", "task", "internal", "temporary", "channel", "api", "no_tools",
+@pytest.mark.parametrize("change", ["other_model", "task", "internal", "temporary", "channel", "api",
                                   "wrong_message", "no_user", "no_request", "no_emitter"])
 def test_unrelated_or_backend_context_is_not_modified(automatic, monkeypatch, change):
     state = RuntimeState()
@@ -572,8 +758,6 @@ def test_unrelated_or_backend_context_is_not_modified(automatic, monkeypatch, ch
         meta["chat_id"] = "local:temporary" if change == "temporary" else "channel:warehouse"
     elif change == "api":
         meta.pop("session_id")
-    elif change == "no_tools":
-        meta["tools"] = {}
     elif change == "wrong_message":
         meta["message_id"] = "another-answer"
     elif change == "no_user":
@@ -652,6 +836,75 @@ def test_runtime_uses_owned_chat_and_one_authorized_toolkit_pair(automatic, monk
         assert all(call[0] != "chat" for call in calls)
 
 
+def authorize_search_runtime(automatic, monkeypatch, query_callable, *, query_tool_id="builtin:query_knowledge_files",
+                             query_name="query_knowledge_files"):
+    class Users:
+        @staticmethod
+        async def get_user_by_id(user_id):
+            return SimpleNamespace(id=user_id, role="user")
+
+    class Chats:
+        @staticmethod
+        async def get_chat_by_id_and_user_id(chat_id, user_id):
+            return SimpleNamespace(id=chat_id, user_id=user_id)
+
+    async def tool_callable(**kwargs):
+        return json.dumps({"status": "ready"})
+
+    tools = {
+        "reader": {"tool_id": "approved-photos", "spec": {"name": "read_approved_instruction"},
+                   "callable": tool_callable},
+        "images": {"tool_id": "approved-photos", "spec": {"name": "show_instruction_images"},
+                   "callable": tool_callable},
+        "search": {"tool_id": query_tool_id, "spec": {"name": query_name}, "callable": query_callable},
+    }
+    install_module(monkeypatch, "open_webui.models.users", {"Users": Users})
+    install_module(monkeypatch, "open_webui.models.chats", {"Chats": Chats})
+    runtime = automatic._Runtime(chat_body(), dict(metadata(), tools=tools), {"id": "employee"},
+                                 SimpleNamespace(), None, "approved-photos")
+    assert run(runtime.authorize()) is True
+    return runtime
+
+
+def test_runtime_search_binds_real_builtin_even_when_image_tool_valve_is_scoped(automatic, monkeypatch):
+    calls = []
+    chunks = [search_chunk()]
+
+    async def query_callable(**kwargs):
+        calls.append(kwargs)
+        return json.dumps(chunks, ensure_ascii=False)
+
+    runtime = authorize_search_runtime(automatic, monkeypatch, query_callable)
+    assert run(runtime.search(SCANNER_QUERY)) == {"status": "ok", "chunks": chunks}
+    assert calls == [{"query": SCANNER_QUERY, "count": 8}]
+
+
+@pytest.mark.parametrize("tool_id,name", [
+    ("untrusted-search-tool", "query_knowledge_files"),
+    ("builtin:query_knowledge_files", "custom_query_knowledge_files"),
+])
+def test_runtime_search_does_not_use_custom_tool_impersonating_builtin(automatic, monkeypatch, tool_id, name):
+    async def forbidden_query(**kwargs):
+        raise AssertionError("Only the authorized built-in search callable may run")
+
+    runtime = authorize_search_runtime(automatic, monkeypatch, forbidden_query,
+                                       query_tool_id=tool_id, query_name=name)
+    assert run(runtime.search(SCANNER_QUERY)) == {"status": "unavailable", "chunks": []}
+
+
+@pytest.mark.parametrize("returned,expected_status", [
+    ("[]", "ok"), (json.dumps({"error": "Embedding function unavailable"}), "unavailable"),
+    ("not json", "unavailable"), (None, "unavailable"),
+])
+def test_runtime_search_distinguishes_empty_results_from_service_unavailability(
+        automatic, monkeypatch, returned, expected_status):
+    async def query_callable(**kwargs):
+        return returned
+
+    runtime = authorize_search_runtime(automatic, monkeypatch, query_callable)
+    assert run(runtime.search(SCANNER_QUERY)) == {"status": expected_status, "chunks": []}
+
+
 @pytest.mark.parametrize("mismatch", [None, "other_owner", "other_source", "other_hash", "other_number", "not_attached"])
 def test_real_verifier_requires_saved_private_png_source_provenance(automatic, monkeypatch, mismatch):
     file_id = str(UUID(int=987))
@@ -709,3 +962,10 @@ def test_only_controller_continuation_passes_private_progress_flag(automatic):
     run(runtime.show(DOC_ID, "auto", 6))
     assert "__allow_continuation__" not in received[0]
     assert received[1]["__allow_continuation__"] is True
+
+
+def test_source_free_clarification_does_not_keep_an_invented_diagnosis(automatic):
+    body = chat_body(answer(read=False, content="Причина — повреждённый драйвер. Какая версия 1С?"))
+    result = automatic.missing_source_reply(body, 1)
+    assert result["messages"][1]["content"] == "Какая версия 1С?"
+    assert final_text(result["messages"][1]) == "Какая версия 1С?"

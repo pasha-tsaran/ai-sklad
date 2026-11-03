@@ -3,7 +3,7 @@ title: AI Support — фотографии к ответу автоматиче�
 author: AI Support
 description: Автоматически прикладывает фотографии утверждённой инструкции и продолжает её по шагам.
 required_open_webui_version: 0.11.0
-version: 0.1.0
+version: 0.2.0
 """
 
 # Install as an admin Function (Filter), scoped to ai-support, not as a Tool.
@@ -105,6 +105,99 @@ def selected_source(message):
 
 def _normal(text):
     return " ".join(re.findall(r"[a-zа-яё0-9]+", str(text).casefold().replace("ё", "е")))
+
+
+_QUERY_NOISE = {
+    "работаю", "нужно", "нужен", "хочу", "помогите", "подскажите", "пожалуйста", "уже", "установлен",
+    "плохо", "разбираюсь", "настройках", "настроить", "настройка", "чего", "начать", "моего", "моем",
+    "рабочего", "рабочем", "места", "месте", "версии", "версия", "драйвер", "программе", "программа",
+    "документ", "документы", "инструкция", "инструкции", "показать", "покажи", "фото", "фотографии",
+    "скриншот", "первые", "действия", "правильно", "почему", "который",
+    "спасибо", "привет", "здравствуйте", "получилось", "готово", "дальше", "продолжить", "продолжай",
+    "это", "как", "что", "где", "для", "при", "или", "мой", "мне", "меня", "есть", "его", "вот",
+    "docx", "файл", "файла", "базе", "база", "знаний",
+}
+
+
+def search_terms(text):
+    terms = set()
+    for word in _normal(text).split():
+        if word in _QUERY_NOISE or word.isdigit() or (len(word) < 3 and word != "1с"):
+            continue
+        if word.startswith(("изображ", "картин", "рисунк")):
+            terms.add("image")
+        elif word.startswith(("акробат", "acrobat")):
+            terms.add("acrobat")
+        else:
+            terms.add(word[:5])
+    return terms
+
+
+def choose_search_source(query, chunks):
+    """Use clear lexical evidence within scoped semantic hits; never take an arbitrary first hit."""
+    terms = search_terms(query)
+    if len(terms) < 2 or not isinstance(chunks, list):
+        return None
+    grouped = {}
+    for chunk in chunks[:32]:
+        if not isinstance(chunk, dict) or chunk.get("type") in {"external", "note"}:
+            continue
+        file_id, filename = chunk.get("file_id"), chunk.get("source")
+        if not _allowed_file(file_id, filename):
+            continue
+        entry = grouped.setdefault(file_id, {"title": set(), "content": set()})
+        entry["title"].update(search_terms(filename))
+        entry["content"].update(search_terms(str(chunk.get("content", ""))[:50_000]))
+    ranked = []
+    for file_id, entry in grouped.items():
+        title_hits, content_hits = terms & entry["title"], terms & entry["content"]
+        if not title_hits or len(title_hits | content_hits) < 2:
+            continue
+        ranked.append((len(title_hits) * 3 + len(content_hits), file_id))
+    ranked.sort(reverse=True)
+    if not ranked or (len(ranked) > 1 and ranked[0][0] - ranked[1][0] < 2):
+        return None
+    return ranked[0][1]
+
+
+def problem_query(messages, user_entries):
+    index, last = user_entries[-1]
+    text = str(last.get("content", ""))
+    if re.fullmatch(r"(?:спасибо|благодарю|привет|здравствуйте|добрый день|все получилось|готово)[\s!.]*", text.casefold()):
+        return text
+    # A short answer to the immediately preceding clarification belongs to that
+    # question, not to an arbitrary older incident in this chat.
+    if len(_normal(text).split()) <= 4 and len(user_entries) >= 2:
+        previous = next((m for m in reversed(messages[:index]) if m.get("role") == "assistant"), {})
+        if "?" in str(previous.get("content", "")):
+            text = str(user_entries[-2][1].get("content", ""))[-4000:] + "\n" + text
+    return text[-6000:]
+
+
+def has_technical_actions(text):
+    return bool(re.search(r"(?m)^\s*\d+[.)]\s|```|(?:нажмите|откройте|выберите|введите|удалите|снимите|перейдите|включите)",
+                          str(text).casefold()))
+
+
+def missing_source_reply(body, index, unavailable=False):
+    text = body["messages"][index].get("content", "")
+    if not has_technical_actions(text) and str(text).count("?") == 1:
+        question = re.search(r"\b(?:(?:в|на|к|с|для)\s+)?(?:какой|какая|какое|какие|какую|каком|"
+                             r"что|где|когда|как|сколько|есть\s+ли|видно\s+ли)\b[^?]*\?", str(text), re.I)
+        if question:
+            # A clarification is allowed, an invented diagnosis preceding it is not.
+            actual_question = question.group().strip()
+            return body if actual_question == str(text).strip() else neutral_response(body, index, actual_question)
+    message = ("Сейчас не удалось проверить базу знаний. Я не могу предложить технические действия без проверенной инструкции."
+               if unavailable else "В утверждённой базе знаний не удалось найти подходящую инструкцию. Требуется помощь специалиста технической поддержки.")
+    return neutral_response(body, index, message)
+
+
+async def report_status(emitter, description, done):
+    try:
+        await emitter({"type": "status", "data": {"description": description, "done": done}})
+    except Exception:
+        log.debug("AI Support: status delivery unavailable")
 
 
 def is_confirmation(text):
@@ -298,6 +391,8 @@ class _Runtime:
         self.chat = None
         self.read_tool = None
         self.image_tool = None
+        self.search_tool = None
+        self.owner_authorized = False
 
     async def authorize(self):
         from open_webui.models.chats import Chats
@@ -309,11 +404,15 @@ class _Runtime:
         self.chat = await Chats.get_chat_by_id_and_user_id(self.metadata["chat_id"], self.user.id)
         if not self.chat:
             return False
+        self.owner_authorized = True
         tools = self.metadata.get("tools") or {}
         readers, images = [], []
         for tool in tools.values():
             if not isinstance(tool, dict) or not callable(tool.get("callable")):
                 continue
+            if (tool.get("tool_id") == "builtin:query_knowledge_files"
+                    and tool.get("spec", {}).get("name") == "query_knowledge_files"):
+                self.search_tool = tool
             if self.image_tool_id and tool.get("tool_id") != self.image_tool_id:
                 continue
             name = tool.get("spec", {}).get("name")
@@ -330,6 +429,15 @@ class _Runtime:
 
     async def read(self, file_id):
         return _json(await self.read_tool["callable"](file_id=file_id))
+
+    async def search(self, query):
+        if self.search_tool is None:
+            return {"status": "unavailable", "chunks": []}
+        try:
+            chunks = _json(await self.search_tool["callable"](query=query, count=8))
+            return {"status": "ok", "chunks": chunks} if isinstance(chunks, list) else {"status": "unavailable", "chunks": []}
+        except Exception:
+            return {"status": "unavailable", "chunks": []}
 
     async def show(self, file_id, selection, offset):
         arguments = {"file_id": file_id, "image_numbers": selection, "offset": offset}
@@ -379,11 +487,13 @@ class Filter:
     async def outlet(self, body: dict, __user__=None, __request__=None, __metadata__=None,
                      __event_emitter__=None, __model__=None) -> dict:
         metadata = __metadata__ if isinstance(__metadata__, dict) else {}
-        if (body.get("model") not in self.valves.enabled_model_ids or not _uuid(metadata.get("chat_id"))
+        model_id = (__model__.get("id") if isinstance(__model__, dict) else None) or body.get("model")
+        if (model_id not in self.valves.enabled_model_ids or not _uuid(metadata.get("chat_id"))
                 or not metadata.get("session_id") or not metadata.get("message_id")
                 or not isinstance(__user__, dict) or not __user__.get("id")
-                or not __request__ or not callable(__event_emitter__) or not metadata.get("tools")
+                or not __request__ or not callable(__event_emitter__)
                 or metadata.get("task") or metadata.get("internal")):
+            log.debug("AI Support automatic images: skipped outside enabled owned UI scope")
             return body  # Never alter backend JSON, temporary/API/channel or unrelated model responses.
         messages = body.get("messages", [])
         current_index = next((i for i in range(len(messages) - 1, -1, -1)
@@ -397,8 +507,21 @@ class Filter:
         user_text = user_entries[-1][1].get("content", "")
         keep_current = is_ui_question(user_text) or is_confirmation(user_text)
         runtime = _Runtime(body, metadata, __user__, __request__, __event_emitter__, self.valves.image_tool_id)
+        status_started = False
+        completion = "Проверка инструкции завершена"
         try:
             if not await runtime.authorize():
+                if getattr(runtime, "owner_authorized", False):
+                    # A duplicate old completed endpoint may omit tools. Keep an
+                    # already processed delivery only if private PNG proof survives.
+                    for name, _, result in tool_results(messages[current_index]):
+                        if (name == IMAGE_TOOL and isinstance(result, dict)
+                                and result.get("_ai_support_flow", {}).get("processed")
+                                and await runtime.verify(messages[current_index], result)):
+                            return body
+                    await report_status(__event_emitter__, "Обработчик знаний не подключён к этому чату", True)
+                    return neutral_response(body, current_index,
+                                            "Не удалось проверить инструкцию: обработчик знаний не подключён к этому чату. Обратитесь к администратору поддержки.")
                 return body
             body = limit_clarifications(body, current_index)
             messages = body["messages"]
@@ -414,6 +537,11 @@ class Filter:
                     break
                 if name == IMAGE_TOOL and isinstance(result, dict) and result.get("status") == "delivery_unknown":
                     return body
+            query = problem_query(messages, user_entries)
+            if not keep_current and not search_terms(query) and not has_technical_actions(current.get("content", "")):
+                return body  # Greetings/thanks are not a request for an arbitrary procedure.
+            await report_status(__event_emitter__, "Проверяю инструкцию и фотографии в базе знаний…", False)
+            status_started = True
             previous = None
             previous_index = None
             for message in reversed(messages[:current_index]):
@@ -440,15 +568,37 @@ class Filter:
             pinned = clarification or (advance and flow.get("has_more"))
             file_id = (previous[2].get("source", {}).get("file_id") if pinned else
                        existing[1].get("source", {}).get("file_id") if existing else selected_source(current))
+            search_trace = None
             if not _uuid(file_id):
-                return body
+                if len(search_terms(query)) < 2:
+                    return missing_source_reply(body, current_index)
+                searched = await runtime.search(query)
+                chunks = searched.get("chunks", []) if isinstance(searched, dict) else []
+                available = isinstance(searched, dict) and searched.get("status") == "ok"
+                file_id = choose_search_source(query, chunks) if available else None
+                # Persist a bounded source summary, not the whole search corpus in
+                # every future model context. The approved reader checks membership.
+                search_trace = {"status": "ok" if available else "unavailable", "sources": [
+                    {"file_id": chunk.get("file_id"), "source": chunk.get("source")}
+                    for chunk in chunks[:32] if isinstance(chunk, dict)
+                    and _allowed_file(chunk.get("file_id"), chunk.get("source"))
+                ]}
+                if not file_id:
+                    completion = "Подходящая инструкция не найдена" if available else "Проверка базы знаний недоступна"
+                    updated = missing_source_reply(body, current_index, unavailable=not available)
+                    if updated is body:
+                        updated = copy.deepcopy(body)
+                    record_call(updated["messages"][current_index], "query_knowledge_files",
+                                {"query": query, "count": 8}, search_trace)
+                    return updated
             document = await runtime.read(file_id)
             if (not isinstance(document, dict) or document.get("status") != "ready"
                     or document.get("source", {}).get("file_id") != file_id):
                 if pinned or existing:
                     return neutral_response(body, current_index,
                                             "Не удалось проверить текущую инструкцию. Я не могу заменить её другой процедурой без подтверждённых сведений.")
-                return body
+                completion = "Не удалось прочитать утверждённую инструкцию"
+                return missing_source_reply(body, current_index, unavailable=True)
             old_hash = previous[2].get("source", {}).get("sha256") if pinned else None
             if old_hash and document["source"].get("sha256") != old_hash:
                 text = "Инструкция изменилась. Не могу продолжить прежнюю последовательность без проверки актуального документа."
@@ -464,7 +614,14 @@ class Filter:
             user_context = "\n".join(str(m.get("content", "")) for i, m in user_entries if i >= start_index)
             eligible = applicable_images(document, user_context)
             if not eligible:
-                return body
+                approved_text = document.get("content", "").split("Фотографии и пояснения", 1)[0].strip()
+                if not approved_text:
+                    return missing_source_reply(body, current_index, unavailable=True)
+                completion = "Инструкция проверена, применимых фотографий нет"
+                updated = neutral_response(body, current_index, approved_text + "\n\nУдалось выполнить эти действия?")
+                record_call(updated["messages"][current_index], READ_TOOL, {"file_id": file_id},
+                            {"status": "ready", "source": document["source"]})
+                return updated
             selection, offset = ",".join(map(str, eligible)), 0
             if advance:
                 selection = flow.get("selection", previous[1].get("image_numbers", "auto"))
@@ -487,6 +644,8 @@ class Filter:
                 return body
             updated = copy.deepcopy(body)
             response = updated["messages"][current_index]
+            if search_trace is not None:
+                record_call(response, "query_knowledge_files", {"query": query, "count": 8}, search_trace)
             record_call(response, READ_TOOL, {"file_id": file_id}, {"status": "ready", "source": document["source"]})
             if result.get("status") != "displayed" or result.get("displayed") is not True:
                 record_call(response, IMAGE_TOOL, {"file_id": file_id, "image_numbers": selection, "offset": offset}, result)
@@ -522,11 +681,16 @@ class Filter:
             else:
                 record_call(response, IMAGE_TOOL, {"file_id": file_id, "image_numbers": selection, "offset": offset}, result)
             replace_text(response, render_steps(document, result.get("images", []), next_flow["has_more"], clarification))
+            completion = "Инструкция проверена, фотографии добавлены"
             return updated
         except Exception:
-            # Preserve the model response on integration failures; log no credentials or document text.
+            # Never retain unsupported technical instructions after a source-check failure.
             log.warning("AI Support automatic images: source delivery could not be completed")
             if keep_current:
                 return neutral_response(body, current_index,
                                         "Не удалось проверить текущую инструкцию. Я не могу предложить другую процедуру без подтверждённого источника.")
-            return body
+            completion = "Проверка базы знаний недоступна"
+            return missing_source_reply(body, current_index, unavailable=True)
+        finally:
+            if status_started:
+                await report_status(__event_emitter__, completion, True)
