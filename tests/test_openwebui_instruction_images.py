@@ -165,6 +165,7 @@ def test_total_normalized_picture_bytes_are_bounded(image_tool, monkeypatch):
 
 
 def test_selector_uses_real_document_numbers(image_tool):
+    assert image_tool.parse_image_numbers("auto", 3) == [1, 2, 3]
     assert image_tool.parse_image_numbers("all", 3) == [1, 2, 3]
     assert image_tool.parse_image_numbers("2", 3) == [2]
 
@@ -179,6 +180,33 @@ def test_missing_request_context_cannot_report_display_success(image_tool):
     result = json.loads(run(image_tool.Tools().show_instruction_images("source-file")))
     assert not result.get("displayed", False)
     assert result.get("error") or result.get("status") != "ok"
+
+
+def test_read_docx_text_preserves_body_warnings_and_does_not_duplicate_visible_caption(image_tool):
+    caption = "Нажмите «ОК»."
+    warning = "Если принтер не принимает задания, обратитесь в поддержку."
+    data = instruction((caption,), extra_paragraph=(
+        f"<w:p><w:r><w:t>{escape(caption)}</w:t></w:r></w:p>"
+        f"<w:p><w:r><w:t>{warning}</w:t></w:r></w:p>"
+    ))
+    text = image_tool.read_docx_text(data)
+    assert text == f"Утверждённая инструкция Acrobat\n\n{caption}\n\n{warning}"
+    assert text.count(caption) == 1
+
+
+def test_read_docx_text_fails_instead_of_truncating_conditions(image_tool):
+    data = instruction(extra_paragraph=f'<w:p><w:r><w:t>{"x" * 200001}</w:t></w:r></w:p>')
+    with pytest.raises(image_tool.ToolError) as exc:
+        image_tool.read_docx_text(data)
+    assert exc.value.code == "text_too_large"
+
+
+@pytest.mark.parametrize("data", [b"not a docx", office({
+    "word/document.xml": '<!DOCTYPE x [<!ENTITY value "unsafe">]><x>&value;</x>',
+})])
+def test_read_docx_text_rejects_bad_archive_or_xml_entities(image_tool, data):
+    with pytest.raises(image_tool.ToolError):
+        image_tool.read_docx_text(data)
 
 
 class FakeRuntime:
@@ -237,8 +265,8 @@ class FakeRuntime:
         return copy.deepcopy(self.saved_files)
 
 
-def display(image_tool, monkeypatch, runtime, *, selection="all", emitter=None, file_id=SOURCE_ID,
-            metadata=None):
+def display(image_tool, monkeypatch, runtime, *, selection="auto", offset=0, emitter=None, file_id=SOURCE_ID,
+            metadata=None, allow_continuation=False):
     monkeypatch.setattr(image_tool, "_OpenWebUI", lambda: runtime)
     events = []
 
@@ -246,8 +274,8 @@ def display(image_tool, monkeypatch, runtime, *, selection="all", emitter=None, 
         events.append(event)
 
     result = json.loads(run(image_tool.Tools().show_instruction_images(
-        file_id, selection, __user__={"id": "employee"}, __request__=SimpleNamespace(),
-        __event_emitter__=emitter or record, __metadata__=metadata,
+        file_id, selection, offset=offset, __user__={"id": "employee"}, __request__=SimpleNamespace(),
+        __event_emitter__=emitter or record, __metadata__=metadata, __allow_continuation__=allow_continuation,
     )))
     return result, events
 
@@ -272,6 +300,46 @@ def test_selected_original_images_delivered_as_one_real_native_event(image_tool,
     ]
     assert all("token" not in file["url"].lower() for file in files)
     assert runtime.discarded == []
+
+
+def test_inspector_returns_full_approved_text_and_captions_without_upload_or_emitter(image_tool, monkeypatch):
+    caption = "Нажмите «Дополнительно» в верхней части окна печати."
+    warning = "Если связи с принтером нет, нужна помощь поддержки."
+    runtime = FakeRuntime(image_tool, instruction((caption,), extra_paragraph=(
+        f"<w:p><w:r><w:t>{warning}</w:t></w:r></w:p>"
+    )))
+    monkeypatch.setattr(image_tool, "_OpenWebUI", lambda: runtime)
+    result = json.loads(run(image_tool.Tools().read_approved_instruction(
+        SOURCE_ID, __user__={"id": "employee"}, __request__=SimpleNamespace(),
+    )))
+    assert result["status"] == "ready"
+    assert result["source"]["file_id"] == SOURCE_ID and result["source"]["knowledge_id"] == KNOWLEDGE_ID
+    assert len(result["source"]["sha256"]) == 64
+    assert result["content"] == f"Утверждённая инструкция Acrobat\n\n{caption}\n\n{warning}"
+    assert result["images"] == [{"number": 1, "caption": caption}]
+    assert len(runtime.authorizations) == 2 and not runtime.uploads and not runtime.discarded
+
+
+@pytest.mark.parametrize("change", ["revoke_on_recheck", "replace_on_recheck"])
+def test_inspector_rechecks_access_and_source_before_disclosing_content(image_tool, monkeypatch, change):
+    runtime = FakeRuntime(image_tool)
+    setattr(runtime, change, True)
+    monkeypatch.setattr(image_tool, "_OpenWebUI", lambda: runtime)
+    result = json.loads(run(image_tool.Tools().read_approved_instruction(
+        SOURCE_ID, __user__={"id": "employee"}, __request__=SimpleNamespace(),
+    )))
+    assert result["status"] == "error"
+    assert not {"source", "content", "images"}.intersection(result)
+    assert len(runtime.authorizations) == 2 and not runtime.uploads
+
+
+@pytest.mark.parametrize("user,request_context", [(None, SimpleNamespace()), ({"id": "employee"}, None)])
+def test_inspector_requires_authenticated_request_context(image_tool, user, request_context):
+    result = json.loads(run(image_tool.Tools().read_approved_instruction(
+        SOURCE_ID, __user__=user, __request__=request_context,
+    )))
+    assert result["status"] == "error" and result["code"] == "missing_context"
+    assert "content" not in result
 
 
 def test_consecutive_calls_preserve_existing_images_without_duplicate_database_writes(image_tool, monkeypatch):
@@ -327,20 +395,102 @@ def test_existing_attachment_is_preserved_in_ui_resync(image_tool, monkeypatch):
     assert len(events[0]["data"]["files"]) == 1
 
 
-def test_large_instruction_requires_photo_selection_instead_of_flooding_chat(image_tool, monkeypatch):
+@pytest.mark.parametrize("selection", ["auto", "all", "1,2,3,4,5,6,7"])
+def test_large_instruction_shows_first_group_without_requesting_photo_numbers(image_tool, monkeypatch, selection):
     runtime = FakeRuntime(image_tool, instruction(tuple(f"Кнопка {number}." for number in range(7))))
-    result, events = display(image_tool, monkeypatch, runtime)
-    assert result["displayed"] is False and result["status"] == "selection_required"
-    assert runtime.uploads == [] and not any(event["type"] == "files" for event in events)
+    result, events = display(image_tool, monkeypatch, runtime, selection=selection)
+    assert result["displayed"] is True and result["status"] == "displayed"
+    assert [picture["number"] for picture in result["images"]] == [1, 2, 3, 4, 5, 6]
+    assert result["has_more"] is True and result["next_offset"] == 6
+    assert result["offset"] == 0 and result["total_images"] == 7
+    assert result["progress_message"] == "После этих шагов напишите «Готово», чтобы продолжить."
+    assert "выберите" not in result["message"].casefold() and "6" not in result["message"]
+    assert len(runtime.uploads) == 6
+    assert len([event for event in events if event["type"] == "files"]) == 1
 
 
-def test_selection_caption_list_is_also_reauthorized_before_disclosure(image_tool, monkeypatch):
+def test_large_instruction_first_group_is_reauthorized_before_disclosure(image_tool, monkeypatch):
     runtime = FakeRuntime(image_tool, instruction(tuple(f"Кнопка {number}." for number in range(7))))
     runtime.revoke_on_recheck = True
     result, events = display(image_tool, monkeypatch, runtime)
     assert result["displayed"] is False and result["status"] == "error"
     assert "images" not in result
-    assert runtime.uploads == [] and not any(event["type"] == "files" for event in events)
+    assert runtime.discarded == [upload.id for _, upload in runtime.uploads]
+    assert not any(event["type"] == "files" for event in events)
+
+
+def test_continuation_shows_only_next_group_then_finishes(image_tool, monkeypatch):
+    runtime = FakeRuntime(image_tool, instruction(tuple(f"Кнопка {number}." for number in range(14))))
+    first, _ = display(image_tool, monkeypatch, runtime)
+    second, _ = display(image_tool, monkeypatch, runtime, offset=first["next_offset"], allow_continuation=True)
+    last, _ = display(image_tool, monkeypatch, runtime, offset=second["next_offset"], allow_continuation=True)
+    assert [picture["number"] for picture in first["images"]] == [1, 2, 3, 4, 5, 6]
+    assert [picture["number"] for picture in second["images"]] == [7, 8, 9, 10, 11, 12]
+    assert [picture["number"] for picture in last["images"]] == [13, 14]
+    assert second["has_more"] is True and second["next_offset"] == 12
+    assert last["has_more"] is False and last["next_offset"] is None and last["progress_message"] is None
+    assert [picture.number for picture, _ in runtime.uploads] == list(range(1, 15))
+
+
+def test_explicit_subset_continuation_keeps_subset_positions(image_tool, monkeypatch):
+    runtime = FakeRuntime(image_tool, instruction(tuple(f"Кнопка {number}." for number in range(14))))
+    selector = "1,3,5,7,9,11,13"
+    first, _ = display(image_tool, monkeypatch, runtime, selection=selector)
+    last, _ = display(image_tool, monkeypatch, runtime, selection=selector, offset=first["next_offset"],
+                      allow_continuation=True)
+    assert [picture["number"] for picture in first["images"]] == [1, 3, 5, 7, 9, 11]
+    assert [picture["number"] for picture in last["images"]] == [13]
+    assert last["total_images"] == 7 and last["offset"] == 6
+    assert not last["has_more"] and last["next_offset"] is None
+
+
+@pytest.mark.parametrize("offset", [-1, True, False, "6", None, 1.5, 7, 100_000])
+def test_invalid_progress_does_not_upload_or_repeat_photos(image_tool, monkeypatch, offset):
+    runtime = FakeRuntime(image_tool, instruction(tuple("Кнопка." for _ in range(7))))
+    result, events = display(image_tool, monkeypatch, runtime, offset=offset, allow_continuation=True)
+    assert result["displayed"] is False and result["code"] == "invalid_offset"
+    assert not runtime.uploads and not any(event["type"] == "files" for event in events)
+
+
+@pytest.mark.parametrize("flag", [False, None, "true", "false", 1, 0, {}, []])
+def test_public_continuation_cannot_self_authorize_with_a_truthy_value(image_tool, monkeypatch, flag):
+    runtime = FakeRuntime(image_tool, instruction(tuple("Кнопка." for _ in range(14))))
+    result, events = display(image_tool, monkeypatch, runtime, offset=6, allow_continuation=flag)
+    assert result["status"] == "awaiting_confirmation" and result["displayed"] is False
+    assert result["message"] == "Продолжение будет показано после подтверждения предыдущих шагов."
+    assert not runtime.authorizations and not runtime.uploads and not events
+
+
+def test_model_cannot_call_first_then_next_page_in_the_same_reply(image_tool, monkeypatch):
+    runtime = FakeRuntime(image_tool, instruction(tuple("Кнопка." for _ in range(14))))
+    first, first_events = display(image_tool, monkeypatch, runtime)
+    authorizations_after_first = list(runtime.authorizations)
+    assert first["displayed"] is True and len(runtime.uploads) == 6 and len(first_events) == 1
+    next_page, next_events = display(image_tool, monkeypatch, runtime, offset=first["next_offset"])
+    assert next_page["status"] == "awaiting_confirmation" and next_page["displayed"] is False
+    assert runtime.authorizations == authorizations_after_first
+    assert len(runtime.uploads) == 6 and not next_events
+
+
+def test_specific_photo_for_ui_clarification_remains_available_without_page_advance(image_tool, monkeypatch):
+    runtime = FakeRuntime(image_tool, instruction(tuple("Кнопка." for _ in range(14))))
+    result, events = display(image_tool, monkeypatch, runtime, selection="7", offset=0)
+    assert result["displayed"] is True and [picture["number"] for picture in result["images"]] == [7]
+    assert len(runtime.uploads) == 1 and len(events) == 1
+
+
+def test_shared_batch_helper_preserves_approved_subset_order_and_bytes(image_tool):
+    pictures = [image_tool.Picture(number, f"Фото {number}.", bytes([number])) for number in range(1, 15)]
+    batch = image_tool.select_image_batch(pictures, "13,11,9,7,5,3,1,3", offset=6)
+    assert [picture.number for picture in batch["pictures"]] == [13]
+    assert batch["pictures"][0] is pictures[12]
+    assert batch == {"pictures": [pictures[12]], "offset": 6, "next_offset": None,
+                     "has_more": False, "total_images": 7}
+
+
+def test_shared_batch_helper_rejects_empty_source(image_tool):
+    with pytest.raises(image_tool.ToolError, match="фотографий"):
+        image_tool.select_image_batch([])
 
 
 def test_no_photos_does_not_claim_they_were_displayed(image_tool, monkeypatch):
@@ -470,6 +620,16 @@ def test_approved_collection_and_actual_user_permission_required(image_tool, mon
     assert source.file is file and source.user is user and source.knowledge_id == KNOWLEDGE_ID
     assert ("membership", KNOWLEDGE_ID, SOURCE_ID) in calls
     assert ("access", KNOWLEDGE_ID, "employee", "read") in calls
+
+
+@pytest.mark.parametrize("member,permitted", [(False, True), (True, False)])
+def test_inspector_cannot_disclose_unapproved_or_forbidden_file(image_tool, monkeypatch, member, permitted):
+    source_store(image_tool, monkeypatch, member=member, permitted=permitted)
+    result = json.loads(run(image_tool.Tools().read_approved_instruction(
+        SOURCE_ID, __user__={"id": "employee"}, __request__=SimpleNamespace(),
+    )))
+    assert result["status"] == "error" and result["code"] == "access_denied"
+    assert not {"source", "content", "images"}.intersection(result)
 
 
 @pytest.mark.parametrize("db_role,member,permitted", [

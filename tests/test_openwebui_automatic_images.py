@@ -1,0 +1,711 @@
+"""Automatic photo delivery must follow approved evidence and the user's progress."""
+
+import asyncio
+import copy
+import importlib.util
+import json
+import sys
+from pathlib import Path
+from types import ModuleType, SimpleNamespace
+from uuid import UUID
+
+import pytest
+
+
+FILTER_PATH = Path(__file__).resolve().parents[1] / "integrations/openwebui/automatic_instruction_images.py"
+DOC_ID = "00000000-0000-4000-8000-000000000033"
+OTHER_ID = "00000000-0000-4000-8000-000000000044"
+CHAT_ID = "00000000-0000-4000-8000-000000000077"
+KNOWLEDGE_ID = "85cda3aa-b854-4c26-9948-12da742277ef"
+
+
+@pytest.fixture
+def automatic():
+    name = "automatic_instruction_images_under_test"
+    spec = importlib.util.spec_from_file_location(name, FILTER_PATH)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+        yield module
+    finally:
+        sys.modules.pop(name, None)
+
+
+def run(awaitable):
+    return asyncio.run(awaitable)
+
+
+def source(file_id=DOC_ID, filename="33_Supermag — операции.docx", digest="a" * 64):
+    return {"file_id": file_id, "filename": filename, "knowledge_id": KNOWLEDGE_ID, "sha256": digest}
+
+
+def document(count=2, *, file_id=DOC_ID, filename="33_Supermag — операции.docx", digest="a" * 64,
+             captions=None):
+    captions = captions or [f"Выполните действие на снимке {number}." for number in range(1, count + 1)]
+    return {
+        "status": "ready", "source": source(file_id, filename, digest),
+        "content": "Инструкция Supermag\n\nПеред началом закройте незавершённую операцию.\n\n"
+                   "1. Выполните действия по инструкции.\n\nФотографии и пояснения",
+        "images": [{"number": number, "caption": caption} for number, caption in enumerate(captions, 1)],
+    }
+
+
+def native_pair(name, arguments, result, call_id="call_read"):
+    return [
+        {"type": "function_call", "id": call_id, "call_id": call_id, "name": name,
+         "arguments": json.dumps(arguments, ensure_ascii=False), "status": "completed"},
+        {"type": "function_call_output", "id": "out_" + call_id, "call_id": call_id,
+         "output": [{"type": "input_text", "text": json.dumps(result, ensure_ascii=False)}],
+         "status": "completed"},
+    ]
+
+
+def native_text(text):
+    return {"type": "message", "id": "native_text", "role": "assistant", "status": "completed",
+            "content": [{"type": "output_text", "text": text}]}
+
+
+def answer(message_id="answer-1", *, file_id=DOC_ID, filename="33_Supermag — операции.docx",
+           read=True, content="Выполните действия по инструкции.", sources=None):
+    output = native_pair("view_file", {"file_id": file_id},
+                         {"id": file_id, "filename": filename, "content": "Подтверждённая инструкция."}) if read else []
+    return {"id": message_id, "role": "assistant", "content": content,
+            "output": output + [native_text(content)], "sources": sources or []}
+
+
+def citation(file_id=DOC_ID, filename="33_Supermag — операции.docx"):
+    return {"source": {"id": file_id, "name": filename, "type": "file"},
+            "document": ["Найденный подтверждённый текст."],
+            "metadata": [{"file_id": file_id, "name": filename}]}
+
+
+def chat_body(current=None, messages=None):
+    if messages is None:
+        messages = [{"id": "user-1", "role": "user", "content": "Как выполнить операцию в Supermag?"},
+                    current or answer()]
+    return {"model": "ai-support", "messages": messages}
+
+
+def metadata(message_id="answer-1"):
+    return {"chat_id": CHAT_ID, "message_id": message_id, "session_id": "browser-session",
+            "tools": {"authorized_instruction_tool": {"server": "trusted"}}}
+
+
+class RuntimeState:
+    def __init__(self, docs=None):
+        self.documents = docs or {DOC_ID: document()}
+        self.authorized = True
+        self.authorizations = 0
+        self.reads = []
+        self.shows = []
+        self.verifications = []
+        self.events = []
+        self.private_images = {}
+        self.show_override = None
+
+    def register(self, result):
+        for image in result.get("images", []):
+            self.private_images[image["file_id"]] = (result["source"]["file_id"], result["source"]["sha256"],
+                                                       image["number"])
+
+
+class FakeRuntime:
+    def __init__(self, state, body, meta, user, request, emitter, image_tool_id):
+        self.state, self.emitter = state, emitter
+
+    async def authorize(self):
+        self.state.authorizations += 1
+        return self.state.authorized
+
+    async def read(self, file_id):
+        self.state.reads.append(file_id)
+        return copy.deepcopy(self.state.documents.get(file_id, {"status": "error", "code": "access_denied"}))
+
+    async def show(self, file_id, selection, offset):
+        self.state.shows.append((file_id, selection, offset))
+        if self.state.show_override is not None:
+            return copy.deepcopy(self.state.show_override)
+        doc = self.state.documents[file_id]
+        numbers = (list(range(1, len(doc["images"]) + 1)) if selection in {"auto", "all"}
+                   else sorted({int(number) for number in selection.split(",")}))
+        selected = numbers[offset:offset + 6]
+        result = {"status": "displayed", "displayed": True, "source": copy.deepcopy(doc["source"]),
+                  "images": [], "has_more": offset + len(selected) < len(numbers),
+                  "next_offset": offset + len(selected) if offset + len(selected) < len(numbers) else None,
+                  "offset": offset, "total_images": len(numbers)}
+        for number in selected:
+            image = copy.deepcopy(doc["images"][number - 1])
+            image["file_id"] = str(UUID(int=1000 + len(self.state.private_images)))
+            result["images"].append(image)
+            self.state.register({"source": result["source"], "images": [image]})
+        await self.emitter({"type": "files", "data": {"files": [
+            {"type": "image", "url": f"/api/v1/files/{image['file_id']}/content"}
+            for image in result["images"]
+        ]}})
+        return result
+
+    async def verify(self, message, result):
+        self.state.verifications.append((message.get("id"), result.get("source", {}).get("file_id")))
+        return bool(result.get("images")) and all(
+            self.state.private_images.get(image.get("file_id")) == (
+                result.get("source", {}).get("file_id"), result.get("source", {}).get("sha256"), image.get("number")
+            ) for image in result.get("images", [])
+        )
+
+
+def apply_filter(automatic, monkeypatch, state, body, *, meta=None, user=None, request_context=True, emitter=True):
+    monkeypatch.setattr(automatic, "_Runtime", lambda *args: FakeRuntime(state, *args))
+
+    async def record(event):
+        state.events.append(copy.deepcopy(event))
+
+    current_id = next((message["id"] for message in reversed(body["messages"])
+                       if message.get("role") == "assistant"), "missing")
+    return run(automatic.Filter().outlet(
+        body, __user__={"id": "employee"} if user is None else user,
+        __request__=SimpleNamespace() if request_context else None,
+        __metadata__=metadata(current_id) if meta is None else meta,
+        __event_emitter__=record if emitter else None,
+    ))
+
+
+def final_text(message):
+    return "\n".join(part.get("text", "") for item in message.get("output", [])
+                     if item.get("type") == "message" for part in item.get("content", []))
+
+
+def image_results(automatic, message):
+    return [result for name, _, result in automatic.tool_results(message) if name == "show_instruction_images"]
+
+
+def test_photos_attached_automatically_when_model_only_read_instruction(automatic, monkeypatch):
+    state = RuntimeState({DOC_ID: document(captions=["Откройте «Операции».", "Нажмите «ОК»."])})
+    original = chat_body()
+    result = apply_filter(automatic, monkeypatch, state, original)
+    message = result["messages"][-1]
+    assert state.reads == [DOC_ID] and state.shows == [(DOC_ID, "1,2", 0)]
+    assert len(state.events) == 1 and state.events[0]["type"] == "files"
+    assert "Откройте «Операции»." in message["content"] and "Нажмите «ОК»." in message["content"]
+    assert "Перед началом закройте незавершённую операцию." in message["content"]
+    assert message["content"].count("?") == 1
+    assert final_text(message) == message["content"]
+    assert any(name == "view_file" for name, _, _ in automatic.tool_results(message))
+    assert len(image_results(automatic, message)) == 1
+    assert original["messages"][-1]["content"] == "Выполните действия по инструкции."
+
+
+def test_single_acrobat_photo_does_not_drop_unpictured_original_print_steps(automatic, monkeypatch):
+    caption = "Нажмите «Дополнительно», включите «Печатать как изображение» и нажмите «ОК»."
+    steps = [
+        "Откройте документ и нажмите Ctrl+P.",
+        "Выберите свой принтер. Снимите «Выбрать источник бумаги по размеру страницы PDF».",
+        "Нажмите «Дополнительно» в верхней части окна печати.",
+        "Включите «Печатать как изображение», нажмите «ОК».",
+        "Напечатайте одну страницу и проверьте, появились ли изображения.",
+    ]
+    warning = "Если принтер вообще не принимает задания, сообщите об этом в поддержку."
+    doc = document(captions=[caption])
+    doc["content"] = "Acrobat — PDF с картинками не печатается\n\n" + "\n\n".join(
+        f"{number}. {step}" for number, step in enumerate(steps, 1)
+    ) + "\n\n" + warning + "\n\nФотографии и пояснения\n\n" + caption
+    state = RuntimeState({DOC_ID: doc})
+    result = apply_filter(automatic, monkeypatch, state, chat_body())
+    text = result["messages"][-1]["content"]
+    assert "Ctrl+P" in text and caption in text and warning in text
+    for number, step in enumerate(steps, 1):
+        assert f"{number}. {step}" in text
+    assert final_text(result["messages"][-1]) == text
+
+
+def test_first_photo_batch_preserves_entry_step_and_excludes_later_procedure_steps(automatic, monkeypatch):
+    panels = ["Альфа", "Бета", "Гамма", "Дельта", "Эпсилон", "Дзета", "Эта", "Тета", "Йота", "Каппа",
+              "Лямбда", "Мю", "Ню", "Кси"]
+    entry = "Откройте приложение с рабочего стола."
+    actions = [f"Выберите панель «{panel}»." for panel in panels]
+    doc = document(captions=[f"Откройте панель «{panel}»." for panel in panels])
+    doc["content"] = "Работа с панелями\n\n" + "\n\n".join(
+        f"{number}. {step}" for number, step in enumerate([entry] + actions, 1)
+    ) + "\n\nФотографии и пояснения"
+    state = RuntimeState({DOC_ID: doc})
+    result = apply_filter(automatic, monkeypatch, state, chat_body())
+    text = result["messages"][-1]["content"]
+    assert entry in text
+    assert all(action in text for action in actions[:6])
+    assert all(action not in text for action in actions[6:])
+    assert state.shows == [(DOC_ID, ",".join(str(number) for number in range(1, 15)), 0)]
+    assert "Готово" in text
+
+
+def test_query_only_unique_cited_document_is_inspected_before_automatic_delivery(automatic, monkeypatch):
+    state = RuntimeState()
+    current = answer(read=False, content="Выполните инструкцию [1].", sources=[citation()])
+    current["output"][:0] = native_pair("query_knowledge_files", {"query": "Supermag"},
+                                       [{"file_id": DOC_ID, "content": "Текст из инструкции."}])
+    result = apply_filter(automatic, monkeypatch, state, chat_body(current))
+    assert state.reads == [DOC_ID] and len(state.shows) == 1
+    assert image_results(automatic, result["messages"][-1])[0]["displayed"] is True
+
+
+def test_ambiguous_search_hits_are_not_all_selected_as_instructions(automatic, monkeypatch):
+    state = RuntimeState()
+    current = answer(read=False, sources=[citation(), citation(OTHER_ID, "44_Принтер.docx")])
+    current["output"][:0] = native_pair("query_knowledge_files", {"query": "ошибка"},
+                                       [{"file_id": DOC_ID}, {"file_id": OTHER_ID}])
+    original = chat_body(current)
+    assert apply_filter(automatic, monkeypatch, state, original) == original
+    assert not state.reads and not state.shows and not state.events
+
+
+def test_unpaired_or_failed_read_does_not_count_as_approved_source(automatic, monkeypatch):
+    state = RuntimeState()
+    current = answer()
+    current["output"][1]["call_id"] = "unrelated-call"
+    original = chat_body(current)
+    assert apply_filter(automatic, monkeypatch, state, original) == original
+    assert not state.reads and not state.events
+
+
+def test_multiple_distinct_native_reads_do_not_select_an_arbitrary_document(automatic, monkeypatch):
+    state = RuntimeState()
+    current = answer()
+    current["output"][:0] = native_pair("view_knowledge_file", {"file_id": OTHER_ID},
+                                       {"id": OTHER_ID, "filename": "44_Принтер.docx", "content": "Другой текст."},
+                                       call_id="read-other")
+    original = chat_body(current)
+    assert apply_filter(automatic, monkeypatch, state, original) == original
+    assert not state.reads and not state.shows
+
+
+def test_one_cited_document_is_selected_from_multiple_search_sources(automatic, monkeypatch):
+    state = RuntimeState()
+    current = answer(read=False, content="Следуйте инструкции [2].", sources=[
+        citation(OTHER_ID, "44_Принтер.docx"), citation(),
+    ])
+    apply_filter(automatic, monkeypatch, state, chat_body(current))
+    assert state.reads == [DOC_ID] and state.shows[0][0] == DOC_ID
+
+
+@pytest.mark.parametrize("filename", ["ИТ_настройка.docx", "СПРАВОЧНИК_администрирование.docx", "screenshot.png"])
+def test_staff_only_or_non_docx_sources_are_not_automatically_displayed(automatic, monkeypatch, filename):
+    state = RuntimeState()
+    original = chat_body(answer(filename=filename))
+    assert apply_filter(automatic, monkeypatch, state, original) == original
+    assert not state.reads and not state.shows
+
+
+def test_fourteen_photos_advance_six_then_six_then_two_after_confirmation(automatic, monkeypatch):
+    state = RuntimeState({DOC_ID: document(14)})
+    first = apply_filter(automatic, monkeypatch, state, chat_body())
+    first_message = first["messages"][-1]
+    first_result = image_results(automatic, first_message)[0]
+    assert [image["number"] for image in first_result["images"]] == list(range(1, 7))
+    assert first_result["has_more"] and first_result["next_offset"] == 6
+    assert "Готово" in first_message["content"] and "Выберите" not in first_message["content"]
+    assert len(state.shows) == 1
+    second_body = chat_body(messages=first["messages"] + [
+        {"id": "user-2", "role": "user", "content": "Готово"}, answer("answer-2", read=False),
+    ])
+    second = apply_filter(automatic, monkeypatch, state, second_body)
+    second_result = image_results(automatic, second["messages"][-1])[0]
+    assert [image["number"] for image in second_result["images"]] == list(range(7, 13))
+    third_body = chat_body(messages=second["messages"] + [
+        {"id": "user-3", "role": "user", "content": "Сделал"}, answer("answer-3", read=False),
+    ])
+    third = apply_filter(automatic, monkeypatch, state, third_body)
+    third_result = image_results(automatic, third["messages"][-1])[0]
+    assert [image["number"] for image in third_result["images"]] == [13, 14]
+    assert not third_result["has_more"] and third_result["next_offset"] is None
+    assert [show[2] for show in state.shows] == [0, 6, 12]
+    assert len(state.events) == 3
+
+
+def test_ui_clarification_pins_previous_instruction_without_advancing_progress(automatic, monkeypatch):
+    captions = ["Откройте меню «Операции» в главном окне Supermag."] + [
+        f"Следующее действие {number}." for number in range(2, 8)
+    ]
+    state = RuntimeState({DOC_ID: document(captions=captions)})
+    first = apply_filter(automatic, monkeypatch, state, chat_body())
+    body = chat_body(messages=first["messages"] + [
+        {"id": "user-2", "role": "user", "content": "Не вижу «Операции»"},
+        answer("answer-2", file_id=OTHER_ID, filename="ИТ_Настройка.docx"),
+    ])
+    result = apply_filter(automatic, monkeypatch, state, body)
+    shown = image_results(automatic, result["messages"][-1])[0]
+    assert state.shows[-1] == (DOC_ID, "1", 0)
+    assert [image["number"] for image in shown["images"]] == [1]
+    assert shown["_ai_support_flow"]["next_offset"] == 6
+    assert shown["_ai_support_flow"]["has_more"] is True
+    assert state.reads == [DOC_ID, DOC_ID]
+    assert result["messages"][-1]["content"].endswith("Удалось найти этот пункт?")
+    continuation = chat_body(messages=result["messages"] + [
+        {"id": "user-3", "role": "user", "content": "Готово"}, answer("answer-3", read=False),
+    ])
+    apply_filter(automatic, monkeypatch, state, continuation)
+    assert state.shows[-1][0] == DOC_ID and state.shows[-1][2] == 6
+
+
+@pytest.mark.parametrize("question", ["Не нахожу Операции", "Нет такого пункта", "Где Операции?",
+                                      "У меня нет этой кнопки"])
+def test_ui_question_synonyms_pin_the_previous_approved_instruction(automatic, monkeypatch, question):
+    captions = ["Откройте меню «Операции» в главном окне Supermag.", "Нажмите «ОК»."]
+    state = RuntimeState({DOC_ID: document(captions=captions)})
+    first = apply_filter(automatic, monkeypatch, state, chat_body())
+    body = chat_body(messages=first["messages"] + [
+        {"id": "user-2", "role": "user", "content": question},
+        answer("answer-2", file_id=OTHER_ID, filename="ИТ_Настройка.docx", content="Установите другую программу."),
+    ])
+    result = apply_filter(automatic, monkeypatch, state, body)
+    assert state.reads == [DOC_ID, DOC_ID] and state.shows[-1] == (DOC_ID, "1", 0)
+    assert captions[0] in result["messages"][-1]["content"]
+    assert "Установите другую программу" not in result["messages"][-1]["content"]
+
+
+def test_pinned_read_failure_does_not_expose_current_unrelated_it_commands(automatic, monkeypatch):
+    state = RuntimeState({DOC_ID: document(captions=["Выберите меню «Операции»."])})
+    first = apply_filter(automatic, monkeypatch, state, chat_body())
+    state.documents[DOC_ID] = {"status": "error", "code": "access_denied"}
+    body = chat_body(messages=first["messages"] + [
+        {"id": "user-2", "role": "user", "content": "Не нахожу Операции"},
+        answer("answer-2", file_id=OTHER_ID, filename="ИТ_Настройка.docx",
+               content="Выполните sudo apt install и измените конфигурацию системы."),
+    ])
+    result = apply_filter(automatic, monkeypatch, state, body)
+    text = result["messages"][-1]["content"]
+    assert len(state.shows) == 1 and len(state.events) == 1
+    assert "Не удалось проверить текущую инструкцию" in text
+    assert "sudo" not in text and "apt install" not in text and "конфигурацию" not in text
+    assert final_text(result["messages"][-1]) == text
+
+
+def test_ui_question_can_use_previous_real_read_even_without_prior_image_delivery(automatic, monkeypatch):
+    state = RuntimeState({DOC_ID: document(captions=["Выберите меню «Операции».", "Нажмите «ОК»."])})
+    previous = answer("earlier-answer")
+    body = chat_body(messages=[
+        {"id": "user-1", "role": "user", "content": "Как провести операцию в Supermag?"}, previous,
+        {"id": "user-2", "role": "user", "content": "Не вижу Операции"},
+        answer("answer-2", file_id=OTHER_ID, filename="ИТ_Настройка.docx"),
+    ])
+    result = apply_filter(automatic, monkeypatch, state, body)
+    assert state.reads == [DOC_ID] and state.shows == [(DOC_ID, "1", 0)]
+    assert "Выберите меню «Операции»." in result["messages"][-1]["content"]
+
+
+def test_new_intervening_answer_does_not_resume_an_old_instruction_flow(automatic, monkeypatch):
+    state = RuntimeState({DOC_ID: document(14)})
+    first = apply_filter(automatic, monkeypatch, state, chat_body())
+    body = chat_body(messages=first["messages"] + [
+        {"id": "user-new", "role": "user", "content": "Новый вопрос: почта не открывается."},
+        answer("unrelated-answer", read=False, content="Уточните текст ошибки почты."),
+        {"id": "user-next", "role": "user", "content": "Готово"}, answer("answer-2", read=False),
+    ])
+    assert apply_filter(automatic, monkeypatch, state, body) == body
+    assert len(state.shows) == 1
+
+
+def test_decorative_and_source_marked_staff_driver_images_are_not_user_steps(automatic, monkeypatch):
+    captions = [
+        "Логотип Supermag служит оформлением инструкции.",
+        "Выберите меню «Операции».",
+        "Если драйвер не установлен, установку выполняет специалист поддержки.",
+        "Нажмите кнопку «ОК».",
+    ]
+    state = RuntimeState({DOC_ID: document(captions=captions)})
+    result = apply_filter(automatic, monkeypatch, state, chat_body())
+    assert state.shows == [(DOC_ID, "2,4", 0)]
+    text = result["messages"][-1]["content"]
+    assert captions[1] in text and captions[3] in text
+    assert captions[0] not in text and captions[2] not in text
+
+
+def test_driver_context_from_old_unrelated_question_is_not_reused(automatic, monkeypatch):
+    captions = ["Если драйвер не установлен, откройте его установщик.", "Нажмите «ОК»."]
+    state = RuntimeState({DOC_ID: document(captions=captions)})
+    body = chat_body(messages=[
+        {"id": "old-user", "role": "user", "content": "Драйвер уже установлен на другом компьютере."},
+        answer("old-answer", read=False, content="Предыдущее обращение закрыто."),
+        {"id": "new-user", "role": "user", "content": "У новой рабочей станции версия драйвера неизвестна."},
+        answer(),
+    ])
+    apply_filter(automatic, monkeypatch, state, body)
+    assert state.shows == [(DOC_ID, "1,2", 0)]
+
+
+def test_latest_driver_status_correction_restores_the_conditional_photo(automatic):
+    captions = [f"Действие на снимке {number}." for number in range(1, 7)] + [
+        "Если драйвер не установлен, откройте окно его установки."
+    ]
+    doc = document(captions=captions)
+    assert automatic.applicable_images(doc, "Драйвер сканера уже установлен.") == list(range(1, 7))
+    assert automatic.applicable_images(
+        doc, "Драйвер сканера уже установлен.\nНет, драйвер не установлен."
+    ) == list(range(1, 8))
+
+
+@pytest.mark.parametrize("text", ["Не готово", "Нет", "Не получилось", "Ошибка", "Почему не работает?"])
+def test_negative_feedback_does_not_advance_image_progress(automatic, monkeypatch, text):
+    state = RuntimeState({DOC_ID: document(14)})
+    first = apply_filter(automatic, monkeypatch, state, chat_body())
+    body = chat_body(messages=first["messages"] + [
+        {"id": "user-2", "role": "user", "content": text}, answer("answer-2", read=False),
+    ])
+    result = apply_filter(automatic, monkeypatch, state, body)
+    assert result == body and len(state.shows) == 1
+
+
+def test_changed_source_hash_prevents_continuing_old_sequence(automatic, monkeypatch):
+    state = RuntimeState({DOC_ID: document(14)})
+    first = apply_filter(automatic, monkeypatch, state, chat_body())
+    state.documents[DOC_ID]["source"]["sha256"] = "b" * 64
+    body = chat_body(messages=first["messages"] + [
+        {"id": "user-2", "role": "user", "content": "Готово"}, answer("answer-2", read=False),
+    ])
+    result = apply_filter(automatic, monkeypatch, state, body)
+    assert len(state.shows) == 1
+    assert "Инструкция изменилась" in result["messages"][-1]["content"]
+    assert final_text(result["messages"][-1]) == result["messages"][-1]["content"]
+
+
+def test_model_image_call_is_not_reuploaded_but_gets_captions_and_progress(automatic, monkeypatch):
+    doc = document(8)
+    state = RuntimeState({DOC_ID: doc})
+    shown_images = [dict(image, file_id=str(UUID(int=5000 + image["number"]))) for image in doc["images"][:6]]
+    shown = {"status": "displayed", "displayed": True, "source": copy.deepcopy(doc["source"]),
+             "images": shown_images, "has_more": True, "next_offset": 6, "offset": 0, "total_images": 8}
+    state.register(shown)
+    current = answer(read=False, content="Изображения отправлены. Выберите номера для продолжения.")
+    current["output"][:0] = native_pair("show_instruction_images",
+                                       {"file_id": DOC_ID, "image_numbers": "auto", "offset": 0}, shown,
+                                       call_id="call_manual_images")
+    result = apply_filter(automatic, monkeypatch, state, chat_body(current))
+    message = result["messages"][-1]
+    assert not state.shows and not state.events
+    assert "Выполните действие на снимке 1." in message["content"]
+    assert "Выполните действие на снимке 6." in message["content"]
+    assert "Готово" in message["content"] and "Выберите номера" not in message["content"]
+    assert final_text(message) == message["content"]
+    recorded = image_results(automatic, message)
+    assert len(recorded) == 1 and recorded[0]["_ai_support_flow"]["next_offset"] == 6
+    repeated = apply_filter(automatic, monkeypatch, state, result)
+    assert repeated == result and not state.shows and not state.events
+
+
+def test_unknown_manual_delivery_is_not_automatically_retried(automatic, monkeypatch):
+    state = RuntimeState()
+    current = answer()
+    current["output"][:0] = native_pair("show_instruction_images", {"file_id": DOC_ID},
+                                       {"status": "delivery_unknown", "displayed": False},
+                                       call_id="call_manual_images")
+    original = chat_body(current)
+    assert apply_filter(automatic, monkeypatch, state, original) == original
+    assert not state.reads and not state.shows and not state.events
+
+
+def test_changed_source_between_inspection_and_delivery_is_not_rendered_as_same_instruction(automatic, monkeypatch):
+    state = RuntimeState({DOC_ID: document(captions=["Откройте старое окно."])})
+    state.show_override = {"status": "displayed", "displayed": True,
+                           "source": source(digest="b" * 64),
+                           "images": [{"number": 1, "caption": "Совершенно другая версия.",
+                                       "file_id": str(UUID(int=5000))}],
+                           "has_more": False, "next_offset": None}
+    result = apply_filter(automatic, monkeypatch, state, chat_body())
+    message = result["messages"][-1]
+    assert "Совершенно другая версия." not in message["content"]
+    assert "Откройте старое окно." not in message["content"]
+    assert "не удалось подтвердить" in message["content"].casefold()
+
+
+def test_repeated_filter_execution_does_not_upload_again(automatic, monkeypatch):
+    state = RuntimeState()
+    first = apply_filter(automatic, monkeypatch, state, chat_body())
+    repeated = apply_filter(automatic, monkeypatch, state, first)
+    assert repeated == first
+    assert len(state.shows) == 1 and len(state.events) == 1
+
+
+def test_unauthorized_runtime_cannot_read_or_upload(automatic, monkeypatch):
+    state = RuntimeState()
+    state.authorized = False
+    original = chat_body()
+    assert apply_filter(automatic, monkeypatch, state, original) == original
+    assert state.authorizations == 1 and not state.reads and not state.shows
+
+
+def test_question_only_reply_without_source_is_limited_to_one_clarification(automatic, monkeypatch):
+    state = RuntimeState()
+    current = answer(read=False, content="Какая у вас модель принтера? Как подключён принтер?")
+    result = apply_filter(automatic, monkeypatch, state, chat_body(current))
+    message = result["messages"][-1]
+    assert message["content"] == "Какая у вас модель принтера?"
+    assert final_text(message) == message["content"]
+    assert not state.reads and not state.shows
+
+
+def test_technical_steps_and_quoted_question_are_not_cut_by_question_limiter(automatic, monkeypatch):
+    state = RuntimeState()
+    text = "1. Откройте окно и подтвердите вопрос «Продолжить?».\n2. Снимите галочку.\nУдалось выполнить?"
+    body = chat_body(answer(read=False, content=text))
+    result = apply_filter(automatic, monkeypatch, state, body)
+    assert result == body and result["messages"][-1]["content"] == text
+    assert final_text(result["messages"][-1]) == text
+
+
+def test_backend_task_is_not_rewritten_by_question_limiter(automatic, monkeypatch):
+    state = RuntimeState()
+    body = chat_body(answer(read=False, content="Какая модель? Как подключено?"))
+    meta = dict(metadata(), task="backend_json")
+    assert apply_filter(automatic, monkeypatch, state, body, meta=meta) == body
+    assert not state.authorizations
+
+
+@pytest.mark.parametrize("change", ["other_model", "task", "internal", "temporary", "channel", "api", "no_tools",
+                                  "wrong_message", "no_user", "no_request", "no_emitter"])
+def test_unrelated_or_backend_context_is_not_modified(automatic, monkeypatch, change):
+    state = RuntimeState()
+    body, meta = chat_body(), metadata()
+    kwargs = {}
+    if change == "other_model":
+        body["model"] = "other-model"
+    elif change in {"task", "internal"}:
+        meta[change] = True
+    elif change in {"temporary", "channel"}:
+        meta["chat_id"] = "local:temporary" if change == "temporary" else "channel:warehouse"
+    elif change == "api":
+        meta.pop("session_id")
+    elif change == "no_tools":
+        meta["tools"] = {}
+    elif change == "wrong_message":
+        meta["message_id"] = "another-answer"
+    elif change == "no_user":
+        kwargs["user"] = {}
+    elif change == "no_request":
+        kwargs["request_context"] = False
+    elif change == "no_emitter":
+        kwargs["emitter"] = False
+    original = copy.deepcopy(body)
+    assert apply_filter(automatic, monkeypatch, state, body, meta=meta, **kwargs) == original
+    assert not state.authorizations and not state.reads and not state.shows
+
+
+def install_module(monkeypatch, name, values):
+    parts = name.split(".")
+    for count in range(1, len(parts)):
+        package_name = ".".join(parts[:count])
+        if package_name not in sys.modules:
+            package = ModuleType(package_name)
+            package.__path__ = []
+            monkeypatch.setitem(sys.modules, package_name, package)
+    module = ModuleType(name)
+    for key, value in values.items():
+        setattr(module, key, value)
+    monkeypatch.setitem(sys.modules, name, module)
+
+
+@pytest.mark.parametrize("invalid", [None, "pending_user", "foreign_chat", "no_reader", "other_tool_ids", "ambiguous_pair"])
+def test_runtime_uses_owned_chat_and_one_authorized_toolkit_pair(automatic, monkeypatch, invalid):
+    calls = []
+
+    class Users:
+        @staticmethod
+        async def get_user_by_id(user_id):
+            calls.append(("user", user_id))
+            return SimpleNamespace(id=user_id, role="pending" if invalid == "pending_user" else "user")
+
+    class Chats:
+        @staticmethod
+        async def get_chat_by_id_and_user_id(chat_id, user_id):
+            calls.append(("chat", chat_id, user_id))
+            return None if invalid == "foreign_chat" else SimpleNamespace(id=chat_id, user_id=user_id)
+
+    async def read_callable(**kwargs):
+        calls.append(("read", kwargs))
+        return json.dumps(document(), ensure_ascii=False)
+
+    async def image_callable(**kwargs):
+        calls.append(("show", kwargs))
+        return json.dumps({"status": "displayed", "displayed": True})
+
+    tools = {
+        "reader": {"tool_id": "approved-photos", "spec": {"name": "read_approved_instruction"},
+                   "callable": read_callable},
+        "images": {"tool_id": "approved-photos", "spec": {"name": "show_instruction_images"},
+                   "callable": image_callable},
+    }
+    if invalid == "no_reader":
+        tools.pop("reader")
+    elif invalid == "other_tool_ids":
+        tools["reader"]["tool_id"] = "different-toolkit"
+    elif invalid == "ambiguous_pair":
+        tools["another-reader"] = copy.copy(tools["reader"])
+    meta = dict(metadata(), tools=tools)
+    install_module(monkeypatch, "open_webui.models.users", {"Users": Users})
+    install_module(monkeypatch, "open_webui.models.chats", {"Chats": Chats})
+    runtime = automatic._Runtime(chat_body(), meta, {"id": "employee", "role": "admin"},
+                                 SimpleNamespace(), None, "")
+    assert run(runtime.authorize()) is (invalid is None)
+    if invalid is None:
+        assert run(runtime.read(DOC_ID))["source"]["file_id"] == DOC_ID
+        assert run(runtime.show(DOC_ID, "1,2", 0))["displayed"] is True
+        assert ("read", {"file_id": DOC_ID}) in calls
+        assert ("show", {"file_id": DOC_ID, "image_numbers": "1,2", "offset": 0}) in calls
+    if invalid == "pending_user":
+        assert all(call[0] != "chat" for call in calls)
+
+
+@pytest.mark.parametrize("mismatch", [None, "other_owner", "other_source", "other_hash", "other_number", "not_attached"])
+def test_real_verifier_requires_saved_private_png_source_provenance(automatic, monkeypatch, mismatch):
+    file_id = str(UUID(int=987))
+    photo = {"number": 1, "caption": "Откройте «Операции».", "file_id": file_id}
+    result = {"status": "displayed", "displayed": True, "source": source(), "images": [photo]}
+    provenance = {"ai_support_tool": "approved_instruction_images", "source_file_id": DOC_ID,
+                  "source_sha256": "a" * 64, "illustration_number": 1, "caption": photo["caption"]}
+    file = SimpleNamespace(id=file_id, user_id="employee", meta={"data": provenance})
+    if mismatch == "other_owner":
+        file.user_id = "another-user"
+    elif mismatch == "other_source":
+        provenance["source_file_id"] = OTHER_ID
+    elif mismatch == "other_hash":
+        provenance["source_sha256"] = "b" * 64
+    elif mismatch == "other_number":
+        provenance["illustration_number"] = 2
+
+    class Files:
+        @staticmethod
+        async def get_file_by_id(requested_id):
+            assert requested_id == file_id
+            return file
+
+    install_module(monkeypatch, "open_webui.models.files", {"Files": Files})
+    runtime = automatic._Runtime({}, {}, {"id": "employee"}, SimpleNamespace(), None, "")
+    runtime.user = SimpleNamespace(id="employee")
+    runtime.chat = SimpleNamespace(chat={"history": {"messages": {"reply": {"files": [] if mismatch == "not_attached"
+        else [{"type": "image", "url": f"/api/v1/files/{file_id}/content"}]}}}})
+    assert run(runtime.verify({"id": "reply"}, result)) is (mismatch is None)
+
+
+def test_initial_prerequisite_is_not_moved_to_matching_final_photo(automatic):
+    labels = ["Альфа", "Бета", "Гамма", "Дельта", "Эта", "Мю", "Ню", "Кси"]
+    images = [{"number": i, "caption": f"Выберите панель {label}."}
+              for i, label in enumerate(labels, 1)]
+    images.append({"number": 9, "caption": "Закройте программу после завершения."})
+    actions = ["Закройте программу."] + [f"Выберите панель {label}." for label in labels]
+    doc = {"content": "\n\n".join(f"{i}. {step}" for i, step in enumerate(actions, 1)), "images": images}
+    first = automatic.procedure_for_images(doc, images[:6])
+    assert first[0] == "Закройте программу."
+    assert "Выберите панель Кси." not in first
+    assert "Выберите панель Ню." not in first
+
+
+def test_only_controller_continuation_passes_private_progress_flag(automatic):
+    received = []
+
+    async def image_callable(**kwargs):
+        received.append(kwargs)
+        return json.dumps({"status": "displayed", "displayed": True})
+
+    runtime = automatic._Runtime({}, {}, {}, SimpleNamespace(), None, "")
+    runtime.image_tool = {"callable": image_callable}
+    run(runtime.show(DOC_ID, "auto", 0))
+    run(runtime.show(DOC_ID, "auto", 6))
+    assert "__allow_continuation__" not in received[0]
+    assert received[1]["__allow_continuation__"] is True
