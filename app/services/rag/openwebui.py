@@ -90,6 +90,7 @@ class OpenWebUIKnowledge:
                     "stream": False,
                     "temperature": 0,
                     "tool_ids": [],
+                    "tools": [],
                     "features": {"web_search": False},
                     "response_format": {"type": "json_object"},
                     "files": [{"type": "collection", "id": k} for k in self.settings.openwebui_knowledge_ids],

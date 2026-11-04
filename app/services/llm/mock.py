@@ -1,9 +1,15 @@
-from app.schemas.contracts import AnalysisResult, AnswerResult, FollowupResult, SummaryResult
+from app.schemas.contracts import AnalysisResult, AnswerResult, DialogueResult, FollowupResult, SummaryResult
 from app.services.rag.embeddings import tokens
 
 
 class MockLLM:
     name = "mock-v1"
+
+    def dialogue(self, message, context):
+        normalized = message.strip().casefold().rstrip(".!?")
+        if normalized in {"привет", "здравствуйте", "добрый день", "спасибо", "как дела"}:
+            return DialogueResult(route="SOCIAL", reply="Здравствуйте! Рад помочь. Как проходит ваш день?")
+        return DialogueResult(route="SUPPORT")
 
     def analyze(self, message):
         return AnalysisResult(

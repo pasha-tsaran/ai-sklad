@@ -31,6 +31,7 @@ def knowledge_transport(selected="file-1", content="Проверьте подк�
             body = json.loads(request.content)
             assert body["files"] == [{"type": "collection", "id": "approved"}]
             assert body["tool_ids"] == []
+            assert body["tools"] == []
             return httpx.Response(
                 200, json={"choices": [{"message": {"content": json.dumps({"file_id": selected})}}]}
             )

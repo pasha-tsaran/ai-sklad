@@ -34,6 +34,11 @@ class AnalysisResult(StrictModel):
     clarification_key: Literal["DEVICE_MODEL", "CONNECTION", "ERROR_TEXT", "SYMPTOMS"] | None = None
 
 
+class DialogueResult(StrictModel):
+    route: Literal["SUPPORT", "SOCIAL", "REFUSE"]
+    reply: str = Field(default="", max_length=800)
+
+
 class FollowupResult(StrictModel):
     result: Literal["EXCERPT", "NO_KNOWLEDGE"]
     source_chunk_ids: list[str] = Field(default_factory=list, max_length=1)

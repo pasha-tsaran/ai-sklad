@@ -2,9 +2,9 @@ import httpx
 from langchain_core.runnables import RunnableLambda
 from langsmith import tracing_context
 
-from app.schemas.contracts import AnalysisResult, AnswerResult, FollowupResult, SummaryResult
+from app.schemas.contracts import AnalysisResult, AnswerResult, DialogueResult, FollowupResult, SummaryResult
 from app.services.llm.prompts import (
-    ANALYZE_TASK, COMPOSE_TASK, FOLLOWUP_TASK, SUMMARY_TASK, stage_messages,
+    ANALYZE_TASK, COMPOSE_TASK, DIALOGUE_TASK, FOLLOWUP_TASK, SUMMARY_TASK, stage_messages,
 )
 
 
@@ -36,6 +36,9 @@ class OpenWebUILLM:
                     "model": self.settings.openwebui_model,
                     "stream": False,
                     "tool_ids": [],
+                    # Open WebUI otherwise adds profile built-ins even when
+                    # tool_ids is empty. Explicit tools opts out of resolution.
+                    "tools": [],
                     "features": {"web_search": False},
                     "temperature": 0,
                     "max_tokens": 1200,
@@ -50,6 +53,9 @@ class OpenWebUILLM:
 
     def analyze(self, message):
         return self.analyze_context(message, {})
+
+    def dialogue(self, message, context):
+        return self._call(DialogueResult, DIALOGUE_TASK, {"message": message, "context": context})
 
     def analyze_context(self, message, context):
         return self._call(AnalysisResult, ANALYZE_TASK, {"message": message, "context": context})

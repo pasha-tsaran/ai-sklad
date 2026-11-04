@@ -1,6 +1,7 @@
 from sqlalchemy import select
 
 from app.models import (
+    AuditEvent,
     Escalation,
     Incident,
     Job,
@@ -12,8 +13,9 @@ from app.models import (
     SolutionAttempt,
     now,
 )
-from app.schemas.contracts import AnalysisResult, AnswerResult, FollowupResult, SummaryResult
+from app.schemas.contracts import AnalysisResult, AnswerResult, DialogueResult, FollowupResult, SummaryResult
 from app.services.chat.audit import audit
+from app.services.chat.dialogue import REFUSAL, refusal_reply, requires_support, safe_social_reply
 from app.services.chat.memory import load_context
 from app.services.chat.policies import MAX_ATTEMPTS
 from app.services.chat.service import ask_escalation, messenger
@@ -41,6 +43,70 @@ FOLLOWUP_UNAVAILABLE = (
     "Не удалось проверить уточнение: сервис временно недоступен или вернул некорректный ответ. "
     "Повторите вопрос или напишите «оператор». Текущая попытка сохранена."
 )
+
+
+def converse_or_support(factory, job_id, llm, settings, handler):
+    """Route ordinary chat without spending or resolving a technical attempt."""
+    with factory() as session, session.begin():
+        job = session.get(Job, job_id)
+        incident = session.get(Incident, job.incident_id)
+        if incident.pending_action != "PROCESSING" or incident.version != job.expected_version:
+            return
+        incident_id, version = incident.id, incident.version
+        message = session.scalar(select(Message.content).where(
+            Message.incident_id == incident.id, Message.role == "user",
+        ).order_by(Message.sequence.desc()).limit(1)) or ""
+        response = refusal_reply(message)
+        technical = requires_support(message)
+        context = load_context(session, incident, settings) if not response and not technical else {}
+    if not response and not technical:
+        try:
+            routed = DialogueResult.model_validate(llm.dialogue(message, context))
+            if routed.route == "REFUSE":
+                response = REFUSAL
+            elif routed.route == "SOCIAL":
+                response = safe_social_reply(routed.reply)
+        except Exception:
+            # Invalid free text cannot bypass approved-source rendering.
+            response = None
+    if not response:
+        with factory() as session, session.begin():
+            incident = session.scalar(select(Incident).where(Incident.id == incident_id).with_for_update())
+            if incident.version != version or incident.pending_action != "PROCESSING":
+                audit(session, incident_id, "job.stale_result_ignored", job_id=job_id)
+                return
+            accepted = session.scalar(select(AuditEvent).where(
+                AuditEvent.incident_id == incident.id, AuditEvent.event == "message.accepted",
+                AuditEvent.details["operation_id"].as_string() == job_id,
+            ))
+            # The explicit acceptance marker distinguishes new deferred reports
+            # from legacy jobs and feedback, whose report is already populated.
+            if (accepted and accepted.details.get("technical_description_deferred")
+                    and not accepted.details.get("technical_description_applied")):
+                if not incident.description:
+                    incident.subject = message[:200]
+                incident.description = (incident.description + "\n" + message).strip()[-8000:]
+                accepted.details = {**accepted.details, "technical_description_applied": True}
+        return handler(factory, job_id, llm, settings)
+    with factory() as session, session.begin():
+        incident = session.scalar(select(Incident).where(Incident.id == incident_id).with_for_update())
+        if incident.version != version or incident.pending_action != "PROCESSING":
+            audit(session, incident_id, "job.stale_result_ignored", job_id=job_id)
+            return
+        # Keep the full transcript. Deferred conversational text never enters
+        # the technical report used to derive structured long-term facts.
+        if not incident.description:
+            incident.subject = "Диалог с поддержкой"
+        accepted = session.scalar(select(AuditEvent).where(
+            AuditEvent.incident_id == incident.id, AuditEvent.event == "message.accepted",
+            AuditEvent.details["operation_id"].as_string() == job_id,
+        ))
+        if accepted and accepted.details.get("technical_description_deferred"):
+            incident.result = accepted.details.get("previous_result")
+        messenger.send(session, incident_id, response)
+        incident.pending_action = None
+        incident.version += 1
+        audit(session, incident_id, "dialogue.replied", refused=response == REFUSAL)
 
 
 def advance(factory, job_id, llm, settings):
@@ -388,7 +454,10 @@ def run_one(factory, llm, settings):
         job.tries += 1
         job_id, kind = job.id, job.kind
     try:
-        {"ADVANCE": advance, "CLARIFY": clarify, "SEND_MAIL": send_mail}[kind](factory, job_id, llm, settings)
+        if kind in {"ADVANCE", "CLARIFY"}:
+            converse_or_support(factory, job_id, llm, settings, advance if kind == "ADVANCE" else clarify)
+        else:
+            {"SEND_MAIL": send_mail}[kind](factory, job_id, llm, settings)
     except Exception as error:
         with factory() as session, session.begin():
             job = session.get(Job, job_id)

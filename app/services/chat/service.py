@@ -133,15 +133,19 @@ def accept_chat(session, user_id, request):
     followup = bool(incident and incident.state == "WAITING_FEEDBACK")
     if not incident:
         incident = Incident(
-            conversation_id=conversation.id, subject=request.message[:200], description=request.message
+            conversation_id=conversation.id, subject=request.message[:200],
+            description=request.message if intent == "HUMAN" else "",
         )
         session.add(incident)
         session.flush()
         audit(session, incident.id, "incident.created")
-    else:
-        incident.description = (incident.description + "\n" + request.message)[-8000:]
+    elif intent == "HUMAN":
+        if not incident.description:
+            incident.subject = request.message[:200]
+        incident.description = (incident.description + "\n" + request.message).strip()[-8000:]
     message = add_user_message(session, incident, request.message)
     incident.version += 1
+    previous_result = incident.result
     if intent == "HUMAN":
         pending = session.scalar(
             select(SolutionAttempt).where(
@@ -159,7 +163,8 @@ def accept_chat(session, user_id, request):
         incident.pending_action = "PROCESSING"
         incident.result = None
         operation_id = enqueue(session, incident, "CLARIFY" if followup else "ADVANCE").id
-    audit(session, incident.id, "message.accepted", message_id=message.id)
+    audit(session, incident.id, "message.accepted", message_id=message.id,
+          operation_id=operation_id, technical_description_deferred=intent != "HUMAN", previous_result=previous_result)
     return {"incident_id": incident.id, "message_id": message.id, "operation_id": operation_id}
 
 

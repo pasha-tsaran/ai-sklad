@@ -15,7 +15,7 @@ def model_with_response(content, inspect_request=None):
         assert payload["model"] == "local-support"
         assert payload["stream"] is False
         assert payload["tool_ids"] == []
-        assert "tools" not in payload
+        assert payload["tools"] == []
         assert payload["features"] == {"web_search": False}
         assert payload["response_format"] == {"type": "json_object"}
         assert [message["role"] for message in payload["messages"]] == ["system", "user"]
