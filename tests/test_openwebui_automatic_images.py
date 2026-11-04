@@ -116,6 +116,8 @@ class RuntimeState:
         self.events = []
         self.private_images = {}
         self.show_override = None
+        self.presentations = []
+        self.presentation_allowed = True
 
     def register(self, result):
         for image in result.get("images", []):
@@ -172,6 +174,13 @@ class FakeRuntime:
                 result.get("source", {}).get("file_id"), result.get("source", {}).get("sha256"), image.get("number")
             ) for image in result.get("images", [])
         )
+
+    async def present_inline(self, message, result):
+        if not self.state.presentation_allowed or not await self.verify(message, result):
+            return False
+        message["files"] = []
+        self.state.presentations.append(copy.deepcopy(message))
+        return True
 
 
 def apply_filter(automatic, monkeypatch, state, body, *, meta=None, user=None, request_context=True, emitter=True):
@@ -943,7 +952,7 @@ def test_initial_prerequisite_is_not_moved_to_matching_final_photo(automatic):
     images.append({"number": 9, "caption": "Закройте программу после завершения."})
     actions = ["Закройте программу."] + [f"Выберите панель {label}." for label in labels]
     doc = {"content": "\n\n".join(f"{i}. {step}" for i, step in enumerate(actions, 1)), "images": images}
-    first = automatic.procedure_for_images(doc, images[:6])
+    first = [step for group in automatic.procedure_image_groups(doc, images[:6]) for step in group]
     assert first[0] == "Закройте программу."
     assert "Выберите панель Кси." not in first
     assert "Выберите панель Ню." not in first
@@ -969,3 +978,183 @@ def test_source_free_clarification_does_not_keep_an_invented_diagnosis(automatic
     result = automatic.missing_source_reply(body, 1)
     assert result["messages"][1]["content"] == "Какая версия 1С?"
     assert final_text(result["messages"][1]) == "Какая версия 1С?"
+
+
+def test_each_action_and_caption_precedes_its_own_inline_photo(automatic, monkeypatch):
+    captions = ["На первом снимке откройте панель Альфа.", "На втором снимке выберите панель Бета."]
+    doc = document(captions=captions)
+    doc["content"] = "1. Откройте панель Альфа.\n\n2. Выберите панель Бета.\n\nФотографии и пояснения"
+    state = RuntimeState({DOC_ID: doc})
+    result = apply_filter(automatic, monkeypatch, state, chat_body())
+    message = result["messages"][-1]
+    photos = image_results(automatic, message)[0]["images"]
+    embeds = [f"![Иллюстрация {image['number']}](/api/v1/files/{image['file_id']}/content)" for image in photos]
+    text = message["content"]
+    assert text.index("Откройте панель Альфа.") < text.index(captions[0]) < text.index(embeds[0])
+    assert text.index(embeds[0]) < text.index("Выберите панель Бета.") < text.index(captions[1]) < text.index(embeds[1])
+    assert all(text.count(embed) == 1 for embed in embeds)
+    assert text.count("![") == 2 and message["files"] == []
+    assert final_text(message) == text and len(state.presentations) == 1
+    assert image_results(automatic, message)[0]["_ai_support_flow"]["layout"] == "inline"
+
+
+def test_caption_only_instruction_still_has_description_before_each_photo(automatic, monkeypatch):
+    captions = ["Красная рамка отмечает кнопку «Операции».", "На снимке выделена кнопка «ОК»."]
+    doc = document(captions=captions)
+    doc["content"] = "Инструкция без пронумерованных действий.\n\nФотографии и пояснения"
+    state = RuntimeState({DOC_ID: doc})
+    result = apply_filter(automatic, monkeypatch, state, chat_body())
+    message = result["messages"][-1]
+    images = image_results(automatic, message)[0]["images"]
+    for image in images:
+        embed = f"![Иллюстрация {image['number']}](/api/v1/files/{image['file_id']}/content)"
+        assert message["content"].index(image["caption"]) < message["content"].index(embed)
+    assert message["content"].count("![") == len(captions)
+
+
+def test_acrobat_entry_steps_and_caption_precede_single_inline_photo(automatic, monkeypatch):
+    caption = "На снимке выделены «Дополнительно» и «Печатать как изображение»."
+    doc = document(captions=[caption])
+    doc["content"] = "1. Откройте PDF и нажмите Ctrl+P.\n\n2. Нажмите «Дополнительно».\n\n" \
+                     "3. Включите «Печатать как изображение».\n\nФотографии и пояснения"
+    state = RuntimeState({DOC_ID: doc})
+    result = apply_filter(automatic, monkeypatch, state, chat_body())
+    message = result["messages"][-1]
+    text = message["content"]
+    assert text.index("Ctrl+P") < text.index(caption) < text.index("![Иллюстрация 1]")
+    assert text.index("3. Включите «Печатать как изображение».") < text.index("![Иллюстрация 1]")
+    assert text.count("![") == 1 and message["files"] == []
+
+
+def test_confirmed_continuation_contains_only_the_next_group_of_inline_photos(automatic, monkeypatch):
+    state = RuntimeState({DOC_ID: document(8)})
+    first = apply_filter(automatic, monkeypatch, state, chat_body())
+    first_text = first["messages"][-1]["content"]
+    first_photos = image_results(automatic, first["messages"][-1])[0]["images"]
+    assert first_text.count("![") == 6
+    body = chat_body(messages=first["messages"] + [
+        {"id": "user-2", "role": "user", "content": "Готово"}, answer("answer-2", read=False),
+    ])
+    result = apply_filter(automatic, monkeypatch, state, body)
+    text = result["messages"][-1]["content"]
+    assert text.count("![") == 2 and "![Иллюстрация 7]" in text and "![Иллюстрация 8]" in text
+    assert all(image["file_id"] not in text for image in first_photos)
+    assert len(state.presentations) == 2
+
+
+def test_failed_inline_presentation_does_not_publish_unverified_image_links(automatic, monkeypatch):
+    state = RuntimeState()
+    state.presentation_allowed = False
+    result = apply_filter(automatic, monkeypatch, state, chat_body())
+    message = result["messages"][-1]
+    assert "![" not in message["content"] and not state.presentations
+    assert final_text(message) == message["content"]
+    repeated = apply_filter(automatic, monkeypatch, state, result)
+    assert "![" not in repeated["messages"][-1]["content"]
+    assert len(state.shows) == 1 and len(file_events(state)) == 1
+
+
+def inline_runtime(automatic, monkeypatch, *, saved=None, upsert_allowed=True, emit_failure=False):
+    file_id = str(UUID(int=987))
+    image = {"number": 1, "caption": "Нажмите «ОК».", "file_id": file_id}
+    result = {"status": "displayed", "displayed": True, "source": source(), "images": [image],
+              "_ai_support_flow": {"processed": True, "layout": "inline"}}
+    provenance = {"ai_support_tool": "approved_instruction_images", "source_file_id": DOC_ID,
+                  "source_sha256": "a" * 64, "illustration_number": 1, "caption": image["caption"]}
+    private_file = SimpleNamespace(id=file_id, user_id="employee", meta={"data": provenance})
+    generated = {"type": "image", "url": f"/api/v1/files/{file_id}/content"}
+    unrelated = {"type": "file", "id": "unrelated-file", "url": "/api/v1/files/unrelated-file/content"}
+    saved = copy.deepcopy(saved) if saved is not None else {"id": "reply", "files": [generated, unrelated]}
+    writes, events = [], []
+
+    class Files:
+        @staticmethod
+        async def get_file_by_id(requested_id):
+            return private_file if requested_id == file_id else None
+
+    class Chats:
+        @staticmethod
+        async def get_message_by_id_and_message_id(chat_id, message_id):
+            assert (chat_id, message_id) == (CHAT_ID, "reply")
+            return copy.deepcopy(saved)
+
+        @staticmethod
+        async def upsert_message_to_chat_by_id_and_message_id(chat_id, message_id, data, *, touch=True):
+            assert (chat_id, message_id) == (CHAT_ID, "reply")
+            writes.append((copy.deepcopy(data), touch))
+            if not upsert_allowed:
+                return None
+            saved.update(copy.deepcopy(data))
+            return SimpleNamespace(chat={"history": {"messages": {"reply": copy.deepcopy(saved)}}})
+
+    async def emitter(event):
+        if emit_failure:
+            raise RuntimeError("Disconnected browser")
+        events.append(copy.deepcopy(event))
+
+    install_module(monkeypatch, "open_webui.models.files", {"Files": Files})
+    install_module(monkeypatch, "open_webui.models.chats", {"Chats": Chats})
+    runtime = automatic._Runtime({}, metadata("reply"), {"id": "employee"}, SimpleNamespace(), emitter, "")
+    runtime.user = SimpleNamespace(id="employee")
+    runtime.chat = SimpleNamespace(chat={"history": {"messages": {"reply": copy.deepcopy(saved)}}})
+    message = {"id": "reply", "role": "assistant", "files": [generated, unrelated],
+               "content": f"Нажмите «ОК».\n\n![Иллюстрация 1](/api/v1/files/{file_id}/content)"}
+    message["output"] = [native_text(message["content"])]
+    return runtime, message, result, saved, writes, events, unrelated, private_file
+
+
+def test_inline_presentation_persists_ordered_content_and_removes_only_its_gallery_items(automatic, monkeypatch):
+    runtime, message, result, saved, writes, events, unrelated, _ = inline_runtime(automatic, monkeypatch)
+    # Authorization predates the tool's upload; only a fresh saved read has the batch.
+    runtime.chat.chat["history"]["messages"]["reply"]["files"] = []
+    assert run(runtime.present_inline(message, result)) is True
+    assert message["files"] == [unrelated] and saved["files"] == [unrelated]
+    assert writes == [({"content": message["content"], "output": message["output"], "files": [unrelated]}, False)]
+    assert saved["content"] == final_text(message)
+    assert events == [{"type": "chat:message:files", "data": {"files": [unrelated]}}]
+    assert run(runtime.verify(message, result)) is True
+
+
+@pytest.mark.parametrize("failure", ["empty_saved", "missing_provenance", "other_owner", "wrong_caption", "no_upsert"])
+def test_failed_inline_proof_preserves_existing_gallery(automatic, monkeypatch, failure):
+    runtime, message, result, saved, writes, events, _, file = inline_runtime(
+        automatic, monkeypatch, saved={} if failure == "empty_saved" else None,
+        upsert_allowed=failure != "no_upsert",
+    )
+    original_files = copy.deepcopy(saved.get("files", []))
+    if failure == "missing_provenance":
+        file.meta = {}
+    elif failure == "other_owner":
+        file.user_id = "another-user"
+    elif failure == "wrong_caption":
+        file.meta["data"]["caption"] = "Другая подпись."
+    assert run(runtime.present_inline(message, result)) is False
+    assert saved.get("files", []) == original_files and not events
+    if failure != "no_upsert":
+        assert not writes
+
+
+def test_inline_presentation_keeps_saved_success_when_browser_event_fails(automatic, monkeypatch):
+    runtime, message, result, saved, writes, events, unrelated, _ = inline_runtime(
+        automatic, monkeypatch, emit_failure=True
+    )
+    assert run(runtime.present_inline(message, result)) is True
+    assert saved["files"] == [unrelated] and saved["content"] == message["content"]
+    assert len(writes) == 1 and not events
+
+
+@pytest.mark.parametrize("reference", ["inline", "plain_link", "foreign_host", "wrong_file", "not_referenced"])
+def test_saved_inline_proof_requires_exact_embed_of_private_source_photo(automatic, monkeypatch, reference):
+    runtime, message, result, saved, _, _, _, _ = inline_runtime(automatic, monkeypatch)
+    saved["files"] = []
+    path = f"/api/v1/files/{result['images'][0]['file_id']}/content"
+    content = {
+        "inline": f"Нажмите «ОК».\n\n![Иллюстрация 1]({path})",
+        "plain_link": f"[Иллюстрация 1]({path})",
+        "foreign_host": f"![Иллюстрация 1](https://example.com{path})",
+        "wrong_file": f"![Иллюстрация 1](/api/v1/files/{OTHER_ID}/content)",
+        "not_referenced": "Фотография показана.",
+    }[reference]
+    saved["content"] = content
+    runtime.chat.chat["history"]["messages"]["reply"] = copy.deepcopy(saved)
+    assert run(runtime.verify(message, result)) is (reference == "inline")

@@ -3,7 +3,7 @@ title: AI Support — фотографии к ответу автоматиче�
 author: AI Support
 description: Автоматически прикладывает фотографии утверждённой инструкции и продолжает её по шагам.
 required_open_webui_version: 0.11.0
-version: 0.2.0
+version: 0.3.0
 """
 
 # Install as an admin Function (Filter), scoped to ai-support, not as a Tool.
@@ -260,7 +260,7 @@ def _source_notes(document):
     return "\n\n".join(dict.fromkeys(notes))
 
 
-def procedure_for_images(document, images):
+def procedure_image_groups(document, images):
     """Keep original numbered actions, including unpictured entry/prerequisite steps.
 
     Prepared DOCX captions describe the screenshots, not necessarily every action
@@ -270,11 +270,12 @@ def procedure_for_images(document, images):
     text = document.get("content", "").split("Фотографии и пояснения", 1)[0]
     steps = [re.sub(r"^\d+[.)]\s*", "", p.strip()) for p in text.split("\n\n")
              if re.match(r"^\d+[.)]\s", p.strip())]
+    groups = {image["number"]: [] for image in images}
     if not steps:
-        return []
+        return [[] for image in images]
     original_images = document.get("images", [])
     if len(original_images) == 1:
-        return steps
+        return [steps if image["number"] == original_images[0]["number"] else [] for image in images]
     stop = {"нажмите", "откройт", "выберит", "рисунке", "снимке", "иллюстр", "картинк", "окне", "окно",
             "на", "по", "из", "со", "во", "до", "за", "не", "при", "для", "это", "что", "как", "его", "ее", "или"}
 
@@ -283,7 +284,6 @@ def procedure_for_images(document, images):
 
     tokens = [words(image.get("caption", "")) for image in original_images]
     frequencies = {word: sum(word in token_set for token_set in tokens) for word in set().union(*tokens)}
-    shown = {image["number"] for image in images}
     candidates = [(0, 0, 1.0)]  # The first original action is an entry/prerequisite, never a later-page action.
     for step_index, step in enumerate(steps[1:], 1):
         terms = words(step)
@@ -301,12 +301,12 @@ def procedure_for_images(document, images):
         paths.append(chain + [index])
     chain = max(paths, key=lambda value: (len(value), sum(candidates[j][2] for j in value)), default=[])
     anchors = {candidates[i][0]: candidates[i][1] for i in chain}
-    previous, selected = 0, []
+    previous = 0
     for index, step in enumerate(steps):
         previous = anchors.get(index, previous)
-        if original_images and original_images[previous].get("number") in shown:
-            selected.append(step)
-    return selected
+        if original_images and original_images[previous].get("number") in groups:
+            groups[original_images[previous]["number"]].append(step)
+    return [groups[image["number"]] for image in images]
 
 
 def render_steps(document, images, has_more, clarification=False):
@@ -314,12 +314,18 @@ def render_steps(document, images, has_more, clarification=False):
     notes = _source_notes(document)
     if notes:
         parts.append(notes)
-    procedure = [] if clarification else procedure_for_images(document, images)
-    if procedure:
-        parts.append("Выполните действия из инструкции:")
-        parts.append("\n".join(f"{index}. {step}" for index, step in enumerate(procedure, 1)))
-    parts.append("Ориентируйтесь на снимок из этой инструкции:" if clarification else "На фотографиях:")
-    parts.append("\n".join(f"{index}. {image['caption']}" for index, image in enumerate(images, 1)))
+    groups = [[] for image in images] if clarification else procedure_image_groups(document, images)
+    step_number = 1
+    for index, (image, steps) in enumerate(zip(images, groups), 1):
+        if not _uuid(image.get("file_id")):
+            raise ValueError("An inline illustration requires its real private file UUID")
+        parts.append(f"**Шаг {index}**")
+        if steps:
+            parts.append("\n".join(f"{number}. {step}" for number, step in enumerate(steps, step_number)))
+            step_number += len(steps)
+        if not any(_normal(image["caption"]) == _normal(step) for step in steps):
+            parts.append(image["caption"])
+        parts.append(f"![Иллюстрация {image['number']}](/api/v1/files/{image['file_id']}/content)")
     if clarification:
         parts.append("Удалось найти этот пункт?")
     elif has_more:
@@ -449,9 +455,12 @@ class _Runtime:
 
     async def verify(self, message, result):
         """A model assertion is not delivery: bind saved private PNGs to this reply/source."""
+        saved = self.chat.chat.get("history", {}).get("messages", {}).get(message.get("id"), {})
+        return await self._verify_saved(saved, result)
+
+    async def _verify_saved(self, saved, result):
         from open_webui.models.files import Files
 
-        saved = self.chat.chat.get("history", {}).get("messages", {}).get(message.get("id"), {})
         attached = set()
         for file in saved.get("files", []):
             match = re.fullmatch(r"/api/v1/files/([a-fA-F0-9-]+)/content", file.get("url", ""))
@@ -462,16 +471,52 @@ class _Runtime:
         if not images or len(images) > 6 or not _uuid(source.get("file_id")):
             return False
         for image in images:
-            if image.get("file_id") not in attached:
+            file_id = image.get("file_id")
+            if not _uuid(file_id):
                 return False
-            file = await Files.get_file_by_id(image["file_id"])
+            inline = (result.get("_ai_support_flow", {}).get("layout") == "inline"
+                      and f"![Иллюстрация {image.get('number')}](/api/v1/files/{file_id}/content)"
+                      in saved.get("content", ""))
+            if file_id not in attached and not inline:
+                return False
+            file = await Files.get_file_by_id(file_id)
             provenance = (file.meta or {}).get("data", {}) if file else {}
             if (not file or file.user_id != self.user.id
                     or provenance.get("ai_support_tool") != "approved_instruction_images"
                     or provenance.get("source_file_id") != source.get("file_id")
                     or provenance.get("source_sha256") != source.get("sha256")
-                    or provenance.get("illustration_number") != image.get("number")):
+                    or provenance.get("illustration_number") != image.get("number")
+                    or provenance.get("caption") != image.get("caption")):
                 return False
+        return True
+
+    async def present_inline(self, message, result):
+        """Keep private files, move only this verified batch from the gallery into text."""
+        from open_webui.models.chats import Chats
+
+        try:
+            saved = await Chats.get_message_by_id_and_message_id(self.metadata["chat_id"], message["id"])
+            if not isinstance(saved, dict) or not await self._verify_saved(saved, result):
+                return False
+            urls = {f"/api/v1/files/{image['file_id']}/content" for image in result["images"]}
+            remaining = [file for file in saved.get("files", []) if file.get("url") not in urls]
+            patch = {"content": message["content"], "output": message["output"], "files": remaining}
+            updated_chat = await Chats.upsert_message_to_chat_by_id_and_message_id(
+                self.metadata["chat_id"], message["id"], patch, touch=False
+            )
+            if updated_chat is None:
+                return False
+        except Exception:
+            log.warning("AI Support automatic images: inline layout could not be saved")
+            return False
+        self.chat = updated_chat
+        message["files"] = remaining
+        try:
+            # v0.11 renders files above all text. Persist first, then remove only
+            # our gallery entries live; the returned outlet also carries files.
+            await self.emitter({"type": "chat:message:files", "data": {"files": remaining}})
+        except Exception:
+            log.warning("AI Support automatic images: saved inline layout awaits UI refresh")
         return True
 
 
@@ -531,7 +576,8 @@ class Filter:
             for name, arguments, result in tool_results(current):
                 if (name == IMAGE_TOOL and isinstance(result, dict) and result.get("displayed") is True
                         and await runtime.verify(current, result)):
-                    if result.get("_ai_support_flow", {}).get("processed"):
+                    if (result.get("_ai_support_flow", {}).get("processed")
+                            and result.get("_ai_support_flow", {}).get("layout") == "inline"):
                         return body
                     existing = (arguments, result)
                     break
@@ -674,13 +720,19 @@ class Filter:
                 more = next_position < len(eligible)
                 next_flow = {"selection": ",".join(map(str, eligible)), "has_more": more,
                              "next_offset": next_position if more else None}
-            next_flow.update({"processed": True, "start_user_id": start_user_id})
+            next_flow.update({"processed": True, "layout": "inline", "start_user_id": start_user_id})
             result["_ai_support_flow"] = next_flow
             if existing:
                 annotate_flow(response, result["images"], next_flow)
             else:
                 record_call(response, IMAGE_TOOL, {"file_id": file_id, "image_numbers": selection, "offset": offset}, result)
             replace_text(response, render_steps(document, result.get("images", []), next_flow["has_more"], clarification))
+            if not await runtime.present_inline(response, result):
+                next_flow["processed"] = False
+                annotate_flow(response, result["images"], next_flow)
+                completion = "Фотографии получены, оформление ответа не сохранено"
+                return neutral_response(updated, current_index,
+                                        "Фотографии получены, но сохранить пояснения рядом с ними не удалось. Попробуйте повторить сообщение.")
             completion = "Инструкция проверена, фотографии добавлены"
             return updated
         except Exception:
