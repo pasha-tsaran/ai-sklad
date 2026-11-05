@@ -3,7 +3,7 @@ title: AI Support — фотографии к ответу автоматиче�
 author: AI Support
 description: Автоматически прикладывает фотографии утверждённой инструкции и продолжает её по шагам.
 required_open_webui_version: 0.11.0
-version: 0.4.0
+version: 0.4.1
 """
 
 # Install as an admin Function (Filter), scoped to ai-support, not as a Tool.
@@ -21,6 +21,7 @@ log = logging.getLogger(__name__)
 IMAGE_TOOL = "show_instruction_images"
 READ_TOOL = "read_approved_instruction"
 DIALOGUE_TOOL = "ai_support_dialogue"
+REFUSAL_MARKER = "_ai_support_refusal"
 
 
 # Standalone copies of the bounded dialogue policy and redaction from app/services/chat.
@@ -540,7 +541,7 @@ class _Runtime:
         self.search_tool = None
         self.owner_authorized = False
 
-    async def authorize(self):
+    async def authorize_owner(self):
         from open_webui.models.chats import Chats
         from open_webui.models.users import Users
 
@@ -551,6 +552,11 @@ class _Runtime:
         if not self.chat:
             return False
         self.owner_authorized = True
+        return True
+
+    async def authorize(self):
+        if not await self.authorize_owner():
+            return False
         tools = self.metadata.get("tools") or {}
         readers, images = [], []
         for tool in tools.values():
@@ -715,6 +721,7 @@ class Filter:
             metadata["chat_id"], user.id
         ):
             raise ValueError("Доступ к этому чату не подтверждён.")
+        metadata.pop(REFUSAL_MARKER, None)
         builtin = model.get("info", {}).get("meta", {}).get("builtinTools") or {}
         unsafe = [name for name in ("chats", "subagents", "memory", "notes", "channels", "tasks",
                                     "automations", "calendar", "notifications") if builtin.get(name, True)]
@@ -724,8 +731,6 @@ class Filter:
         messages = body.get("messages") or []
         current = next((item for item in reversed(messages) if item.get("role") == "user"), {})
         refused = refusal_reply(current.get("content", ""))
-        if refused:
-            raise ValueError(refused)
         updated = copy.deepcopy(body)
         allowed = [self.valves.image_tool_id] if self.valves.image_tool_id else self.valves.allowed_tool_ids
         updated["tool_ids"] = [tool_id for tool_id in (updated.get("tool_ids") or []) if tool_id in allowed]
@@ -736,6 +741,28 @@ class Filter:
         for feature in ("web_search", "image_generation", "code_interpreter", "memory"):
             features[feature] = False
         metadata["tool_servers"] = []
+        if refused:
+            # An inlet exception marks the saved reply as failed and blocks the
+            # next UI message. Complete a harmless, tool-free request instead.
+            # Only this constant reaches the provider; original history stays in DB.
+            updated["messages"] = [
+                {"role": "system", "content": "Верни дословно текст единственного сообщения пользователя. "
+                 "Ответ должен быть коротким, без инструментов и дополнительных действий."},
+                {"role": "user", "content": REFUSAL},
+            ]
+            updated["tool_ids"] = []
+            updated["tools"] = []
+            updated["files"] = []
+            updated["features"] = {}
+            updated["temperature"] = 0
+            updated["max_tokens"] = 256
+            for name in ("response_format", "options", "format", "stop", "tool_choice", "function_call", "functions"):
+                updated.pop(name, None)
+            params = metadata.get("params") if isinstance(metadata.get("params"), dict) else {}
+            metadata["params"] = {**params, "function_calling": "legacy"}
+            updated["params"] = {"function_calling": "legacy"}
+            metadata.update({REFUSAL_MARKER: metadata.get("message_id"), "tool_ids": [], "tools": {},
+                             "files": [], "features": {}, "skill_ids": [], "terminal_id": None})
         return updated
 
     async def outlet(self, body: dict, __user__=None, __request__=None, __metadata__=None,
@@ -764,6 +791,15 @@ class Filter:
         status_started = False
         completion = "Проверка инструкции завершена"
         try:
+            refused = refusal_reply(user_text)
+            if metadata.get(REFUSAL_MARKER) == metadata["message_id"]:
+                refused = REFUSAL
+            if refused:
+                if not await runtime.authorize_owner():
+                    return body
+                updated = neutral_response(body, current_index, refused)
+                record_call(updated["messages"][current_index], DIALOGUE_TOOL, {}, {"route": "REFUSE"})
+                return updated
             if not await runtime.authorize():
                 if getattr(runtime, "owner_authorized", False):
                     # A duplicate old completed endpoint may omit tools. Keep an
@@ -780,11 +816,6 @@ class Filter:
             body = limit_clarifications(body, current_index)
             messages = body["messages"]
             current = messages[current_index]
-            refused = refusal_reply(user_text)
-            if refused:
-                updated = neutral_response(body, current_index, refused)
-                record_call(updated["messages"][current_index], DIALOGUE_TOOL, {}, {"route": "REFUSE"})
-                return updated
             existing = None
             # Render a real manual delivery once; repeated outlet runs do not upload/render twice.
             for name, arguments, result in tool_results(current):
