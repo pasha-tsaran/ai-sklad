@@ -66,6 +66,45 @@ def test_knowledge_rejects_invalid_sources(selected, content):
         OpenWebUIKnowledge(remote_settings(), transport).search("принтер", set())
 
 
+def test_backend_never_reads_an_accessible_foreign_knowledge_file():
+    calls = []
+    allowed_id = "85cda3aa-b854-4c26-9948-12da742277ef"
+    foreign_id = "00000000-0000-4000-8000-000000000099"
+
+    def handler(request):
+        calls.append(request.url.path)
+        if request.url.path == f"/api/v1/knowledge/{allowed_id}":
+            return httpx.Response(200, json={"files": [{"id": "our-file", "filename": "Scanner.md"}]})
+        if request.url.path == "/api/chat/completions":
+            payload = json.loads(request.content)
+            assert payload["files"] == [{"type": "collection", "id": allowed_id}]
+            data = json.loads(payload["messages"][-1]["content"])
+            assert data["allowed_file_ids"] == ["our-file"]
+            return httpx.Response(200, json={"choices": [{"message": {
+                "content": json.dumps({"file_id": foreign_id})
+            }}]})
+        # This service account can read the other base. The application must
+        # reject the foreign selection before requesting this available text.
+        return httpx.Response(200, json={"content": "FOREIGN_KNOWLEDGE_CONTROL_VALUE"})
+
+    settings = Settings(_env_file=None, openwebui_api_key="test", openwebui_knowledge_ids=[allowed_id])
+    with pytest.raises(ValueError, match="Unapproved knowledge reference"):
+        OpenWebUIKnowledge(settings, httpx.MockTransport(handler)).search("Настроить сканер", set())
+    assert calls == [f"/api/v1/knowledge/{allowed_id}", "/api/chat/completions"]
+
+
+def test_empty_backend_knowledge_configuration_does_not_search_all_bases():
+    calls = []
+
+    def handler(request):
+        calls.append(request.url.path)
+        return httpx.Response(200, json={"files": []})
+
+    settings = Settings(_env_file=None, openwebui_api_key="test", openwebui_knowledge_ids=[])
+    assert OpenWebUIKnowledge(settings, httpx.MockTransport(handler)).search("Настроить сканер", set()) == []
+    assert not calls
+
+
 def test_remote_worker_keeps_snapshot_and_no_local_fallback(env, monkeypatch):
     settings = get_settings()
     settings.knowledge_backend = "openwebui"

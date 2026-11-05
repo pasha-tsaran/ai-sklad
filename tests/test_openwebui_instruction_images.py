@@ -658,8 +658,8 @@ def test_forged_admin_role_from_tool_context_is_not_trusted(image_tool, monkeypa
     assert result["displayed"] is False and result["code"] == "access_denied"
 
 
-@pytest.mark.parametrize("filename", ["ИТ_прошивка.docx", "СПРАВОЧНИК_администрирование.docx", "photo.png"])
-def test_staff_only_documents_and_non_docx_files_are_excluded(image_tool, monkeypatch, filename):
+@pytest.mark.parametrize("filename", ["ИТ_прошивка.docx", "СПРАВОЧНИК_администрирование.docx"])
+def test_staff_only_documents_are_excluded(image_tool, monkeypatch, filename):
     source_store(image_tool, monkeypatch, filename=filename)
     with pytest.raises(image_tool.ToolError):
         run(image_tool._OpenWebUI().source(SOURCE_ID, "employee", [KNOWLEDGE_ID]))
@@ -815,3 +815,214 @@ def test_channel_context_cannot_falsely_confirm_photo_display(image_tool):
     )))
     assert result["status"] == "error" and result["displayed"] is False
     assert result["code"] == "unsupported_context"
+
+
+@pytest.mark.parametrize("filename", ["Инструкция.md", "Таблица.xlsx", "Инструкция.pdf"])
+def test_reader_uses_complete_server_extracted_text_for_approved_non_docx(image_tool, monkeypatch, filename):
+    runtime = FakeRuntime(image_tool)
+    runtime.file.filename = filename
+    runtime.file.data = {"content": "Утверждённая инструкция.\n\nЕсли шаг не помог, обратитесь в поддержку."}
+    monkeypatch.setattr(image_tool, "_OpenWebUI", lambda: runtime)
+    result = json.loads(run(image_tool.Tools().read_approved_instruction(
+        SOURCE_ID, __user__={"id": "employee"}, __request__=SimpleNamespace(),
+    )))
+    assert result["status"] == "ready" and result["content"] == runtime.file.data["content"]
+    assert result["source"]["filename"] == filename and result["images"] == []
+    assert len(result["source"]["sha256"]) == 64
+    assert len(runtime.authorizations) == 2 and not runtime.uploads
+
+
+@pytest.mark.parametrize("content,code", [
+    (None, "unavailable_text"), ("", "unavailable_text"), ("x" * 200001, "text_too_large"),
+    ("Только для ИТ. Установка системного драйвера.", "restricted_instruction"),
+], ids=["missing", "empty", "too-large", "restricted"])
+def test_non_docx_reader_never_invents_or_truncates_unavailable_text(image_tool, monkeypatch, content, code):
+    runtime = FakeRuntime(image_tool)
+    runtime.file.filename = "Инструкция.md"
+    runtime.file.data = {"content": content}
+    monkeypatch.setattr(image_tool, "_OpenWebUI", lambda: runtime)
+    result = json.loads(run(image_tool.Tools().read_approved_instruction(
+        SOURCE_ID, __user__={"id": "employee"}, __request__=SimpleNamespace(),
+    )))
+    assert result["status"] == "error" and result["code"] == code
+    assert "content" not in result and "source" not in result
+
+
+def test_non_docx_text_change_without_metadata_change_prevents_disclosure(image_tool, monkeypatch):
+    runtime = FakeRuntime(image_tool)
+    runtime.file.filename = "Инструкция.md"
+    runtime.file.data = {"content": "Первоначальная инструкция."}
+    original_source = runtime.source
+
+    async def source(*args):
+        result = await original_source(*args)
+        if len(runtime.authorizations) == 2:
+            result.file.data["content"] = "Текст изменился во время чтения."
+        return result
+
+    runtime.source = source
+    monkeypatch.setattr(image_tool, "_OpenWebUI", lambda: runtime)
+    result = json.loads(run(image_tool.Tools().read_approved_instruction(
+        SOURCE_ID, __user__={"id": "employee"}, __request__=SimpleNamespace(),
+    )))
+    assert result["status"] == "error" and result["code"] == "source_changed"
+    assert "content" not in result and "source" not in result
+
+
+def test_non_docx_photo_request_has_no_upload_or_display_event(image_tool, monkeypatch):
+    runtime = FakeRuntime(image_tool)
+    runtime.file.filename = "Таблица.xlsx"
+    runtime.file.data = {"content": "Текст таблицы, извлечённый сервером."}
+    result, events = display(image_tool, monkeypatch, runtime)
+    assert result["status"] == "error" and result["code"] == "unsupported_document"
+    assert not runtime.uploads and not events
+
+
+def scoped_search_store(monkeypatch, *, role="user", permitted=True, exists=True):
+    foreign_id = "00000000-0000-4000-8000-000000000099"
+    internal_id = "00000000-0000-4000-8000-000000000098"
+    files = {
+        SOURCE_ID: SimpleNamespace(id=SOURCE_ID, filename="Сканер.docx", path="approved", updated_at=1,
+                                   hash="approved-hash", meta={}),
+        foreign_id: SimpleNamespace(id=foreign_id, filename="Другой бот.docx", path="foreign", updated_at=1,
+                                    hash="foreign-hash", meta={}),
+        internal_id: SimpleNamespace(id=internal_id, filename="ИТ_Администратору.docx", path="internal", updated_at=1,
+                                     hash="internal-hash", meta={}),
+    }
+    state = SimpleNamespace(role=role, permitted=permitted, exists=exists, external=False, calls=[], queries=[], memberships=0,
+                            revoke=False, replace=False, chunks=[
+                                {"content": "Разрешённый результат.", "source": "Неверное имя из индекса", "file_id": SOURCE_ID},
+                                {"content": "FOREIGN_KNOWLEDGE_CANARY", "source": "Другой бот.docx", "file_id": foreign_id},
+                                {"content": "INTERNAL_KNOWLEDGE_CANARY", "source": "ИТ_Администратору.docx", "file_id": internal_id},
+                                {"content": "NOTE_KNOWLEDGE_CANARY", "source": "Заметка", "file_id": SOURCE_ID, "type": "note"},
+                            ])
+
+    class Users:
+        @staticmethod
+        async def get_user_by_id(user_id):
+            state.calls.append(("user", user_id))
+            return SimpleNamespace(id=user_id, role=state.role)
+
+    class Files:
+        @staticmethod
+        async def get_file_by_id(file_id):
+            state.calls.append(("file", file_id))
+            return files.get(file_id)
+
+    class Knowledges:
+        @staticmethod
+        async def get_knowledge_by_id(knowledge_id):
+            state.calls.append(("knowledge", knowledge_id))
+            return (SimpleNamespace(id=knowledge_id, meta={"source": "external"} if state.external else {})
+                    if state.exists and knowledge_id == KNOWLEDGE_ID else None)
+
+        @staticmethod
+        async def check_access_by_user_id(knowledge_id, user_id, permission):
+            state.calls.append(("access", knowledge_id, user_id, permission))
+            return state.permitted
+
+        @staticmethod
+        async def has_file(knowledge_id, file_id):
+            state.calls.append(("membership", knowledge_id, file_id))
+            if file_id == SOURCE_ID:
+                state.memberships += 1
+                if state.memberships > 1 and state.replace:
+                    files[SOURCE_ID].hash = "replacement-hash"
+                if state.memberships > 1 and state.revoke:
+                    return False
+            return knowledge_id == KNOWLEDGE_ID and file_id in {SOURCE_ID, internal_id}
+
+    async def query_knowledge_files(**kwargs):
+        state.queries.append(kwargs)
+        return json.dumps(state.chunks)
+
+    install_modules(monkeypatch, {
+        "open_webui.models.users": {"Users": Users},
+        "open_webui.models.files": {"Files": Files},
+        "open_webui.models.knowledge": {"Knowledges": Knowledges},
+        "open_webui.tools.builtin": {"query_knowledge_files": query_knowledge_files},
+    })
+    return state
+
+
+@pytest.mark.parametrize("role", ["user", "admin"])
+def test_search_forces_approved_scope_and_filters_foreign_results_even_for_admin(image_tool, monkeypatch, role):
+    state = scoped_search_store(monkeypatch, role=role)
+    request = SimpleNamespace(state=SimpleNamespace(metadata={"folder_knowledge": [
+        {"type": "collection", "id": "foreign-collection"},
+    ]}))
+    result = json.loads(run(image_tool.Tools().search_approved_instructions(
+        "Настройка сканера", __user__={"id": "employee", "role": "admin"}, __request__=request,
+    )))
+    assert result == {"status": "ok", "knowledge_ids": [KNOWLEDGE_ID], "chunks": [
+        {"content": "Разрешённый результат.", "source": "Сканер.docx", "file_id": SOURCE_ID},
+    ]}
+    assert state.queries[0]["__model_knowledge__"] == [{"type": "collection", "id": KNOWLEDGE_ID}]
+    assert state.queries[0]["knowledge_ids"] == [KNOWLEDGE_ID]
+    assert state.queries[0]["__user__"] == {"id": "employee", "role": role}
+    assert state.queries[0]["count"] == 8 and state.queries[0]["__request__"] is request
+    assert "CANARY" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("case", ["missing_collection", "no_permission", "pending_user"])
+def test_search_checks_actual_collection_permission_before_query(image_tool, monkeypatch, case):
+    state = scoped_search_store(monkeypatch, role="pending" if case == "pending_user" else "user",
+                                permitted=case != "no_permission", exists=case != "missing_collection")
+    result = json.loads(run(image_tool.Tools().search_approved_instructions(
+        "Сканер", __user__={"id": "employee", "role": "admin"}, __request__=SimpleNamespace(),
+    )))
+    assert result["status"] == "error" and result["code"] == "access_denied"
+    assert "chunks" not in result and not state.queries
+
+
+@pytest.mark.parametrize("allowed", [[], ["invalid-id"], [KNOWLEDGE_ID] * 21])
+def test_search_with_no_valid_allowlist_cannot_fall_back_to_all_knowledge(image_tool, monkeypatch, allowed):
+    state = scoped_search_store(monkeypatch)
+    tool = image_tool.Tools()
+    tool.valves.allowed_knowledge_ids = allowed
+    result = json.loads(run(tool.search_approved_instructions(
+        "Сканер", __user__={"id": "employee"}, __request__=SimpleNamespace(),
+    )))
+    assert result["status"] == "error" and result["code"] == "not_configured"
+    assert not state.calls and not state.queries and "chunks" not in result
+
+
+@pytest.mark.parametrize("changed", ["revoke", "replace"])
+def test_search_rechecks_membership_and_source_before_returning_chunks(image_tool, monkeypatch, changed):
+    state = scoped_search_store(monkeypatch)
+    setattr(state, changed, True)
+    result = json.loads(run(image_tool.Tools().search_approved_instructions(
+        "Сканер", __user__={"id": "employee"}, __request__=SimpleNamespace(),
+    )))
+    assert result["status"] == "error" and "chunks" not in result
+
+
+@pytest.mark.parametrize("query,count", [("", 8), ("x" * 6001, 8), ("Сканер", 0), ("Сканер", 21), ("Сканер", True)],
+                         ids=["empty", "too-large", "zero-count", "large-count", "boolean-count"])
+def test_search_rejects_unbounded_or_invalid_requests(image_tool, monkeypatch, query, count):
+    state = scoped_search_store(monkeypatch)
+    result = json.loads(run(image_tool.Tools().search_approved_instructions(
+        query, count=count, __user__={"id": "employee"}, __request__=SimpleNamespace(),
+    )))
+    assert result["status"] == "error" and result["code"] == "invalid_query"
+    assert not state.queries and not state.calls
+
+
+def test_search_does_not_contact_external_knowledge_backend(image_tool, monkeypatch):
+    state = scoped_search_store(monkeypatch)
+    state.external = True
+    result = json.loads(run(image_tool.Tools().search_approved_instructions(
+        "Сканер", __user__={"id": "employee"}, __request__=SimpleNamespace(),
+    )))
+    assert result["status"] == "error" and result["code"] == "unsupported_knowledge"
+    assert not state.queries and "chunks" not in result
+
+
+@pytest.mark.parametrize("user,request_context", [(None, SimpleNamespace()), ({"id": "employee"}, None)])
+def test_search_requires_current_authenticated_request(image_tool, monkeypatch, user, request_context):
+    state = scoped_search_store(monkeypatch)
+    result = json.loads(run(image_tool.Tools().search_approved_instructions(
+        "Сканер", __user__=user, __request__=request_context,
+    )))
+    assert result["status"] == "error" and result["code"] == "missing_context"
+    assert not state.calls and not state.queries and "chunks" not in result

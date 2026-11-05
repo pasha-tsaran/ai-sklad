@@ -3,7 +3,7 @@ title: AI Support — фотографии к ответу автоматиче�
 author: AI Support
 description: Автоматически прикладывает фотографии утверждённой инструкции и продолжает её по шагам.
 required_open_webui_version: 0.11.0
-version: 0.4.1
+version: 0.5.0
 """
 
 # Install as an admin Function (Filter), scoped to ai-support, not as a Tool.
@@ -20,8 +20,10 @@ from pydantic import BaseModel, Field
 log = logging.getLogger(__name__)
 IMAGE_TOOL = "show_instruction_images"
 READ_TOOL = "read_approved_instruction"
+SEARCH_TOOL = "search_approved_instructions"
 DIALOGUE_TOOL = "ai_support_dialogue"
 REFUSAL_MARKER = "_ai_support_refusal"
+DEFAULT_KNOWLEDGE_IDS = ["85cda3aa-b854-4c26-9948-12da742277ef"]
 
 
 # Standalone copies of the bounded dialogue policy and redaction from app/services/chat.
@@ -159,6 +161,12 @@ def _uuid(value):
         return False
 
 
+def _knowledge_ids(values):
+    if not isinstance(values, list) or not 1 <= len(values) <= 20 or any(not _uuid(value) for value in values):
+        return None
+    return list(dict.fromkeys(str(UUID(value)) for value in values))
+
+
 def _json(value):
     if isinstance(value, dict):
         return value
@@ -197,7 +205,7 @@ def is_side_dialogue(message):
 
 
 def _allowed_file(file_id, filename):
-    return (_uuid(file_id) and isinstance(filename, str) and filename.lower().endswith(".docx")
+    return (_uuid(file_id) and isinstance(filename, str) and bool(filename.strip())
             and not filename.casefold().startswith(("ит_", "справочник_")))
 
 
@@ -531,7 +539,7 @@ def limit_clarifications(body, index):
 
 
 class _Runtime:
-    def __init__(self, body, metadata, user, request, emitter, image_tool_id):
+    def __init__(self, body, metadata, user, request, emitter, image_tool_id, allowed_knowledge_ids=None):
         self.body, self.metadata, self.user_context = body, metadata, user
         self.request, self.emitter, self.image_tool_id = request, emitter, image_tool_id
         self.user = None
@@ -540,6 +548,8 @@ class _Runtime:
         self.image_tool = None
         self.search_tool = None
         self.owner_authorized = False
+        self.allowed_knowledge_ids = (DEFAULT_KNOWLEDGE_IDS.copy() if allowed_knowledge_ids is None
+                                      else _knowledge_ids(allowed_knowledge_ids) or [])
 
     async def authorize_owner(self):
         from open_webui.models.chats import Chats
@@ -555,16 +565,13 @@ class _Runtime:
         return True
 
     async def authorize(self):
-        if not await self.authorize_owner():
+        if not await self.authorize_owner() or not self.allowed_knowledge_ids:
             return False
         tools = self.metadata.get("tools") or {}
-        readers, images = [], []
+        readers, images, searches = [], [], []
         for tool in tools.values():
             if not isinstance(tool, dict) or not callable(tool.get("callable")):
                 continue
-            if (tool.get("tool_id") == "builtin:query_knowledge_files"
-                    and tool.get("spec", {}).get("name") == "query_knowledge_files"):
-                self.search_tool = tool
             if self.image_tool_id and tool.get("tool_id") != self.image_tool_id:
                 continue
             name = tool.get("spec", {}).get("name")
@@ -572,15 +579,21 @@ class _Runtime:
                 readers.append(tool)
             elif name == IMAGE_TOOL:
                 images.append(tool)
-        pairs = [(reader, image) for reader in readers for image in images
-                 if reader.get("tool_id") == image.get("tool_id") and reader.get("tool_id")]
+            elif name == SEARCH_TOOL:
+                searches.append(tool)
+        pairs = [(reader, image, search) for reader in readers for image in images for search in searches
+                 if reader.get("tool_id") == image.get("tool_id") == search.get("tool_id")
+                 and reader.get("tool_id")]
         if len(pairs) != 1:
             return False
-        self.read_tool, self.image_tool = pairs[0]
+        self.read_tool, self.image_tool, self.search_tool = pairs[0]
         return True
 
     async def read(self, file_id):
-        return _json(await self.read_tool["callable"](file_id=file_id))
+        result = _json(await self.read_tool["callable"](file_id=file_id))
+        if isinstance(result, dict) and result.get("source", {}).get("knowledge_id") in self.allowed_knowledge_ids:
+            return result
+        return {"status": "error", "code": "unapproved_collection"}
 
     async def dialogue(self, message, history):
         """Isolated, typed conversation stage with no tools or inherited request state."""
@@ -614,8 +627,12 @@ class _Runtime:
         if self.search_tool is None:
             return {"status": "unavailable", "chunks": []}
         try:
-            chunks = _json(await self.search_tool["callable"](query=query, count=8))
-            return {"status": "ok", "chunks": chunks} if isinstance(chunks, list) else {"status": "unavailable", "chunks": []}
+            result = _json(await self.search_tool["callable"](query=query, count=8))
+            ids = _knowledge_ids(result.get("knowledge_ids")) if isinstance(result, dict) else None
+            if (isinstance(result, dict) and result.get("status") == "ok" and ids
+                    and set(ids) == set(self.allowed_knowledge_ids) and isinstance(result.get("chunks"), list)):
+                return {"status": "ok", "chunks": result["chunks"]}
+            return {"status": "unavailable", "chunks": []}
         except Exception:
             return {"status": "unavailable", "chunks": []}
 
@@ -625,7 +642,11 @@ class _Runtime:
             # This private flag is absent from the model's public schema. Only the
             # controller reaches a nonzero offset after checking the user's reply.
             arguments["__allow_continuation__"] = True
-        return _json(await self.image_tool["callable"](**arguments))
+        result = _json(await self.image_tool["callable"](**arguments))
+        if (isinstance(result, dict) and (result.get("displayed") is not True
+                or result.get("source", {}).get("knowledge_id") in self.allowed_knowledge_ids)):
+            return result
+        return {"status": "error", "displayed": False, "code": "unapproved_collection"}
 
     async def verify(self, message, result):
         """A model assertion is not delivery: bind saved private PNGs to this reply/source."""
@@ -642,7 +663,8 @@ class _Runtime:
                 attached.add(match.group(1))
         source = result.get("source", {})
         images = result.get("images", [])
-        if not images or len(images) > 6 or not _uuid(source.get("file_id")):
+        if (not images or len(images) > 6 or not _uuid(source.get("file_id"))
+                or source.get("knowledge_id") not in self.allowed_knowledge_ids):
             return False
         for image in images:
             file_id = image.get("file_id")
@@ -701,6 +723,8 @@ class Filter:
         image_tool_id: str = Field(default="", description="Обычно пусто: используется разрешённый инструмент текущего запроса.")
         allowed_tool_ids: list[str] = Field(default_factory=lambda: ["ai_support"],
                                            description="ID установленного доверенного инструмента инструкций.")
+        allowed_knowledge_ids: list[str] = Field(default_factory=lambda: DEFAULT_KNOWLEDGE_IDS.copy(),
+                                               description="Только утверждённые коллекции. Должны совпадать с Valves инструмента.")
 
     def __init__(self):
         self.valves = self.Valves()
@@ -709,7 +733,7 @@ class Filter:
         metadata = __metadata__ if isinstance(__metadata__, dict) else {}
         model = __model__ if isinstance(__model__, dict) else {}
         if (model.get("id") not in self.valves.enabled_model_ids or not _uuid(metadata.get("chat_id"))
-                or not metadata.get("session_id") or metadata.get("task") or metadata.get("internal")
+                or not metadata.get("session_id")
                 or not __request__ or not isinstance(__user__, dict) or not __user__.get("id")):
             return body
         from open_webui.models.chats import Chats
@@ -717,17 +741,20 @@ class Filter:
         from open_webui.env import ENABLE_KB_EXEC
 
         user = await Users.get_user_by_id(__user__["id"])
-        if not user or user.role not in {"user", "admin"} or not await Chats.get_chat_by_id_and_user_id(
-            metadata["chat_id"], user.id
-        ):
+        if not user or user.role not in {"user", "admin"}:
             raise ValueError("Доступ к этому чату не подтверждён.")
+        chat = await Chats.get_chat_by_id_and_user_id(metadata["chat_id"], user.id)
+        if not chat:
+            raise ValueError("Доступ к этому чату не подтверждён.")
+        chat_meta = getattr(chat, "meta", None) or {}
+        if chat_meta.get("internal") is True and chat_meta.get("type") == "note":
+            raise ValueError("Для AI Support откройте обычный чат. Чат заметки добавляет посторонний контекст.")
         metadata.pop(REFUSAL_MARKER, None)
-        builtin = model.get("info", {}).get("meta", {}).get("builtinTools") or {}
-        unsafe = [name for name in ("chats", "subagents", "memory", "notes", "channels", "tasks",
-                                    "automations", "calendar", "notifications") if builtin.get(name, True)]
-        if unsafe or ENABLE_KB_EXEC or body.get("tools"):
-            raise ValueError("Для AI Support включите только встроенные категории «База знаний», «Файлы» "
-                             "и при необходимости «Время». Остальные категории и выполнение кода в знаниях отключаются администратором.")
+        model_meta = model.get("info", {}).get("meta") or {}
+        if ((model_meta.get("capabilities") or {}).get("builtin_tools") is not False
+                or model_meta.get("skillIds") or ENABLE_KB_EXEC or body.get("tools")):
+            raise ValueError("Для AI Support отключите возможность «Встроенные инструменты», навыки профиля и выполнение кода в знаниях. "
+                             "Используйте доверенный инструмент поиска и чтения утверждённых инструкций.")
         messages = body.get("messages") or []
         current = next((item for item in reversed(messages) if item.get("role") == "user"), {})
         refused = refusal_reply(current.get("content", ""))
@@ -763,6 +790,73 @@ class Filter:
             updated["params"] = {"function_calling": "legacy"}
             metadata.update({REFUSAL_MARKER: metadata.get("message_id"), "tool_ids": [], "tools": {},
                              "files": [], "features": {}, "skill_ids": [], "terminal_id": None})
+            return updated
+
+        from open_webui.models.knowledge import Knowledges
+        from open_webui.models.tools import Tools as ToolStore
+
+        knowledge_ids = _knowledge_ids(self.valves.allowed_knowledge_ids)
+        selected = list(dict.fromkeys(updated["tool_ids"]))
+        if not knowledge_ids or len(selected) != 1:
+            raise ValueError("Укажите утверждённую базу знаний и один доверенный инструмент инструкций в настройках AI Support.")
+        tool_valves = await ToolStore.get_tool_valves_by_id(selected[0])
+        tool_ids = _knowledge_ids((tool_valves or {}).get("allowed_knowledge_ids", DEFAULT_KNOWLEDGE_IDS))
+        if not tool_ids or set(tool_ids) != set(knowledge_ids):
+            raise ValueError("Списки разрешённых баз знаний в Filter и инструменте должны совпадать.")
+        for knowledge_id in knowledge_ids:
+            if user.role != "admin" and not await Knowledges.check_access_by_user_id(
+                knowledge_id, user.id, permission="read"
+            ):
+                raise ValueError("Нет доступа к утверждённой базе знаний AI Support.")
+
+        async def approved_reference(item):
+            if not isinstance(item, dict):
+                return None
+            kind, item_id = item.get("type", "file"), item.get("id")
+            if not _uuid(item_id):
+                return None
+            item_id = str(UUID(item_id))
+            if kind == "collection" and item_id in knowledge_ids:
+                return {"type": kind, "id": item_id}
+            if kind == "file":
+                for knowledge_id in knowledge_ids:
+                    if await Knowledges.has_file(knowledge_id, item_id):
+                        return {"type": kind, "id": item_id}
+            return None
+
+        for item in model_meta.get("knowledge") or []:
+            if await approved_reference(item) is None:
+                raise ValueError("В профиле AI Support прикреплены знания вне разрешённого списка.")
+        for container, key in ((updated, "files"), (metadata, "files"), (metadata, "folder_knowledge")):
+            scoped = []
+            for item in container.get(key) or []:
+                reference = await approved_reference(item)
+                if reference is not None:
+                    scoped.append(reference)
+            container[key] = scoped
+        if isinstance(updated.get("metadata"), dict):
+            for key in ("files", "folder_knowledge", "tool_servers"):
+                updated["metadata"][key] = metadata.get(key, [])
+        for message in updated.get("messages", []):
+            if isinstance(message.get("content"), str):
+                message["content"] = message["content"].replace("<$", "&lt;$").replace("</", "&lt;/")
+                continue
+            if not isinstance(message.get("content"), list):
+                continue
+            parts = []
+            for part in message["content"]:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "text":
+                    part["text"] = str(part.get("text", "")).replace("<$", "&lt;$").replace("</", "&lt;/")
+                    parts.append(part)
+                elif part.get("type") == "image_url":
+                    value = part.get("image_url") or {}
+                    url = value.get("url") if isinstance(value, dict) else value
+                    match = re.fullmatch(r"/api/v1/files/([a-fA-F0-9-]+)/content", str(url))
+                    if match and await approved_reference({"type": "file", "id": match.group(1)}):
+                        parts.append(part)
+            message["content"] = parts
         return updated
 
     async def outlet(self, body: dict, __user__=None, __request__=None, __metadata__=None,
@@ -787,7 +881,8 @@ class Filter:
             return body
         user_text = user_entries[-1][1].get("content", "")
         keep_current = is_ui_question(user_text) or is_confirmation(user_text)
-        runtime = _Runtime(body, metadata, __user__, __request__, __event_emitter__, self.valves.image_tool_id)
+        runtime = _Runtime(body, metadata, __user__, __request__, __event_emitter__, self.valves.image_tool_id,
+                           self.valves.allowed_knowledge_ids)
         status_started = False
         completion = "Проверка инструкции завершена"
         try:
@@ -887,7 +982,8 @@ class Filter:
                 file_id = choose_search_source(query, chunks) if available else None
                 # Persist a bounded source summary, not the whole search corpus in
                 # every future model context. The approved reader checks membership.
-                search_trace = {"status": "ok" if available else "unavailable", "sources": [
+                search_trace = {"status": "ok" if available else "unavailable",
+                                "knowledge_ids": self.valves.allowed_knowledge_ids if available else [], "sources": [
                     {"file_id": chunk.get("file_id"), "source": chunk.get("source")}
                     for chunk in chunks[:32] if isinstance(chunk, dict)
                     and _allowed_file(chunk.get("file_id"), chunk.get("source"))
@@ -897,7 +993,7 @@ class Filter:
                     updated = missing_source_reply(body, current_index, unavailable=not available)
                     if updated is body:
                         updated = copy.deepcopy(body)
-                    record_call(updated["messages"][current_index], "query_knowledge_files",
+                    record_call(updated["messages"][current_index], SEARCH_TOOL,
                                 {"query": query, "count": 8}, search_trace)
                     return updated
             document = await runtime.read(file_id)
@@ -954,7 +1050,7 @@ class Filter:
             updated = copy.deepcopy(body)
             response = updated["messages"][current_index]
             if search_trace is not None:
-                record_call(response, "query_knowledge_files", {"query": query, "count": 8}, search_trace)
+                record_call(response, SEARCH_TOOL, {"query": query, "count": 8}, search_trace)
             record_call(response, READ_TOOL, {"file_id": file_id}, {"status": "ready", "source": document["source"]})
             if result.get("status") != "displayed" or result.get("displayed") is not True:
                 record_call(response, IMAGE_TOOL, {"file_id": file_id, "image_numbers": selection, "offset": offset}, result)

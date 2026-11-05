@@ -17,6 +17,7 @@ DOC_ID = "00000000-0000-4000-8000-000000000033"
 OTHER_ID = "00000000-0000-4000-8000-000000000044"
 CHAT_ID = "00000000-0000-4000-8000-000000000077"
 KNOWLEDGE_ID = "85cda3aa-b854-4c26-9948-12da742277ef"
+OTHER_KNOWLEDGE_ID = "00000000-0000-4000-8000-000000000088"
 
 
 @pytest.fixture
@@ -130,7 +131,7 @@ class RuntimeState:
 
 
 class FakeRuntime:
-    def __init__(self, state, body, meta, user, request, emitter, image_tool_id):
+    def __init__(self, state, body, meta, user, request, emitter, image_tool_id, allowed_knowledge_ids=None):
         self.state, self.emitter = state, emitter
         self.owner_authorized = state.owner_authorized
 
@@ -315,7 +316,6 @@ def test_failed_fallback_never_leaves_hallucinated_technical_steps(automatic, mo
 @pytest.mark.parametrize("chunk", [
     search_chunk(filename="ИТ_1С — адрес сканера.docx"),
     search_chunk(filename="СПРАВОЧНИК_1С — адрес сканера.docx"),
-    search_chunk(filename="1С — адрес сканера.png"),
     search_chunk(file_id="not-a-file-uuid"),
     search_chunk(type="external"),
 ])
@@ -472,12 +472,34 @@ def test_one_cited_document_is_selected_from_multiple_search_sources(automatic, 
     assert state.reads == [DOC_ID] and state.shows[0][0] == DOC_ID
 
 
-@pytest.mark.parametrize("filename", ["ИТ_настройка.docx", "СПРАВОЧНИК_администрирование.docx", "screenshot.png"])
-def test_staff_only_or_non_docx_sources_are_not_automatically_displayed(automatic, monkeypatch, filename):
+@pytest.mark.parametrize("filename", ["ИТ_настройка.docx", "СПРАВОЧНИК_администрирование.docx"])
+def test_staff_only_sources_are_not_automatically_displayed(automatic, monkeypatch, filename):
     state = RuntimeState()
     original = chat_body(answer(filename=filename))
     assert_no_unverified_steps(apply_filter(automatic, monkeypatch, state, original), original)
     assert not state.reads and not state.shows
+
+
+@pytest.mark.parametrize("filename", ["Инструкция.md", "Справочник.xlsx", "Инструкция.pdf"])
+def test_approved_text_source_uses_exact_read_content_without_a_photo_call(automatic, monkeypatch, filename):
+    approved = "1. Выберите нужный пункт.\n\nЕсли пункт недоступен, обратитесь в поддержку."
+    doc = {"status": "ready", "source": source(filename=filename), "content": approved, "images": []}
+    state = RuntimeState({DOC_ID: doc})
+    body = chat_body(answer(filename=filename, content="Откройте «Сервис» и переустановите устройство."))
+    result = apply_filter(automatic, monkeypatch, state, body)
+    text = result["messages"][-1]["content"]
+    assert approved in text and "переустановите" not in text
+    assert state.reads == [DOC_ID] and not state.shows and not file_events(state)
+    assert final_text(result["messages"][-1]) == text
+
+
+def test_unreadable_approved_text_source_does_not_expose_generated_instructions(automatic, monkeypatch):
+    state = RuntimeState({DOC_ID: {"status": "error", "code": "no_text"}})
+    body = chat_body(answer(filename="Инструкция.pdf", content="Откройте «Сервис» и удалите драйвер."))
+    result = apply_filter(automatic, monkeypatch, state, body)
+    assert_no_unverified_steps(result, body)
+    assert "удалите драйвер" not in result["messages"][-1]["content"]
+    assert state.reads == [DOC_ID] and not state.shows and not file_events(state)
 
 
 def test_fourteen_photos_advance_six_then_six_then_two_after_confirmation(automatic, monkeypatch):
@@ -808,8 +830,9 @@ def install_module(monkeypatch, name, values):
     monkeypatch.setitem(sys.modules, name, module)
 
 
-@pytest.mark.parametrize("invalid", [None, "pending_user", "foreign_chat", "no_reader", "other_tool_ids", "ambiguous_pair"])
-def test_runtime_uses_owned_chat_and_one_authorized_toolkit_pair(automatic, monkeypatch, invalid):
+@pytest.mark.parametrize("invalid", [None, "pending_user", "foreign_chat", "no_reader", "no_search", "other_tool_ids",
+                                     "ambiguous_pair"])
+def test_runtime_uses_owned_chat_and_one_authorized_toolkit(automatic, monkeypatch, invalid):
     calls = []
 
     class Users:
@@ -830,16 +853,24 @@ def test_runtime_uses_owned_chat_and_one_authorized_toolkit_pair(automatic, monk
 
     async def image_callable(**kwargs):
         calls.append(("show", kwargs))
-        return json.dumps({"status": "displayed", "displayed": True})
+        return json.dumps({"status": "displayed", "displayed": True, "source": source()})
+
+    async def search_callable(**kwargs):
+        calls.append(("search", kwargs))
+        return json.dumps({"status": "ok", "knowledge_ids": [KNOWLEDGE_ID], "chunks": []})
 
     tools = {
         "reader": {"tool_id": "approved-photos", "spec": {"name": "read_approved_instruction"},
                    "callable": read_callable},
         "images": {"tool_id": "approved-photos", "spec": {"name": "show_instruction_images"},
                    "callable": image_callable},
+        "search": {"tool_id": "approved-photos", "spec": {"name": "search_approved_instructions"},
+                   "callable": search_callable},
     }
     if invalid == "no_reader":
         tools.pop("reader")
+    elif invalid == "no_search":
+        tools.pop("search")
     elif invalid == "other_tool_ids":
         tools["reader"]["tool_id"] = "different-toolkit"
     elif invalid == "ambiguous_pair":
@@ -859,8 +890,9 @@ def test_runtime_uses_owned_chat_and_one_authorized_toolkit_pair(automatic, monk
         assert all(call[0] != "chat" for call in calls)
 
 
-def authorize_search_runtime(automatic, monkeypatch, query_callable, *, query_tool_id="builtin:query_knowledge_files",
-                             query_name="query_knowledge_files"):
+def authorize_search_runtime(automatic, monkeypatch, query_callable, *, query_tool_id="approved-photos",
+                             query_name="search_approved_instructions", expected_authorized=True,
+                             allowed_knowledge_ids=None):
     class Users:
         @staticmethod
         async def get_user_by_id(user_id):
@@ -884,18 +916,18 @@ def authorize_search_runtime(automatic, monkeypatch, query_callable, *, query_to
     install_module(monkeypatch, "open_webui.models.users", {"Users": Users})
     install_module(monkeypatch, "open_webui.models.chats", {"Chats": Chats})
     runtime = automatic._Runtime(chat_body(), dict(metadata(), tools=tools), {"id": "employee"},
-                                 SimpleNamespace(), None, "approved-photos")
-    assert run(runtime.authorize()) is True
+                                 SimpleNamespace(), None, "approved-photos", allowed_knowledge_ids)
+    assert run(runtime.authorize()) is expected_authorized
     return runtime
 
 
-def test_runtime_search_binds_real_builtin_even_when_image_tool_valve_is_scoped(automatic, monkeypatch):
+def test_runtime_search_uses_the_same_approved_toolkit_and_collection_scope(automatic, monkeypatch):
     calls = []
     chunks = [search_chunk()]
 
     async def query_callable(**kwargs):
         calls.append(kwargs)
-        return json.dumps(chunks, ensure_ascii=False)
+        return json.dumps({"status": "ok", "knowledge_ids": [KNOWLEDGE_ID], "chunks": chunks}, ensure_ascii=False)
 
     runtime = authorize_search_runtime(automatic, monkeypatch, query_callable)
     assert run(runtime.search(SCANNER_QUERY)) == {"status": "ok", "chunks": chunks}
@@ -903,20 +935,27 @@ def test_runtime_search_binds_real_builtin_even_when_image_tool_valve_is_scoped(
 
 
 @pytest.mark.parametrize("tool_id,name", [
-    ("untrusted-search-tool", "query_knowledge_files"),
-    ("builtin:query_knowledge_files", "custom_query_knowledge_files"),
+    ("untrusted-search-tool", "search_approved_instructions"),
+    ("builtin:query_knowledge_files", "query_knowledge_files"),
+    ("approved-photos", "query_knowledge_files"),
 ])
-def test_runtime_search_does_not_use_custom_tool_impersonating_builtin(automatic, monkeypatch, tool_id, name):
+def test_runtime_search_rejects_unscoped_or_different_toolkit_search(automatic, monkeypatch, tool_id, name):
     async def forbidden_query(**kwargs):
-        raise AssertionError("Only the authorized built-in search callable may run")
+        raise AssertionError("Only the approved toolkit's scoped search may run")
 
     runtime = authorize_search_runtime(automatic, monkeypatch, forbidden_query,
-                                       query_tool_id=tool_id, query_name=name)
+                                       query_tool_id=tool_id, query_name=name, expected_authorized=False)
     assert run(runtime.search(SCANNER_QUERY)) == {"status": "unavailable", "chunks": []}
 
 
 @pytest.mark.parametrize("returned,expected_status", [
-    ("[]", "ok"), (json.dumps({"error": "Embedding function unavailable"}), "unavailable"),
+    (json.dumps({"status": "ok", "knowledge_ids": [KNOWLEDGE_ID], "chunks": []}), "ok"),
+    (json.dumps({"error": "Embedding function unavailable"}), "unavailable"),
+    (json.dumps({"status": "ok", "knowledge_ids": [OTHER_KNOWLEDGE_ID], "chunks": []}), "unavailable"),
+    (json.dumps({"status": "ok", "knowledge_ids": [KNOWLEDGE_ID, OTHER_KNOWLEDGE_ID], "chunks": []}), "unavailable"),
+    (json.dumps({"status": "ok", "knowledge_ids": [], "chunks": []}), "unavailable"),
+    (json.dumps({"status": "ok", "chunks": []}), "unavailable"),
+    ("[]", "unavailable"),
     ("not json", "unavailable"), (None, "unavailable"),
 ])
 def test_runtime_search_distinguishes_empty_results_from_service_unavailability(
@@ -928,11 +967,40 @@ def test_runtime_search_distinguishes_empty_results_from_service_unavailability(
     assert run(runtime.search(SCANNER_QUERY)) == {"status": expected_status, "chunks": []}
 
 
-@pytest.mark.parametrize("mismatch", [None, "other_owner", "other_source", "other_hash", "other_number", "not_attached"])
+@pytest.mark.parametrize("scope", [[], ["not-a-knowledge-id"]])
+def test_runtime_with_no_valid_scope_never_authorizes_a_search(automatic, monkeypatch, scope):
+    async def forbidden_query(**kwargs):
+        raise AssertionError("An empty scope cannot fall back to all accessible knowledge")
+
+    runtime = authorize_search_runtime(automatic, monkeypatch, forbidden_query,
+                                       allowed_knowledge_ids=scope, expected_authorized=False)
+    assert run(runtime.search(SCANNER_QUERY)) == {"status": "unavailable", "chunks": []}
+
+
+@pytest.mark.parametrize("operation", ["read", "show"])
+def test_runtime_rejects_foreign_collection_proof_even_from_a_selected_tool(automatic, operation):
+    foreign_source = source()
+    foreign_source["knowledge_id"] = OTHER_KNOWLEDGE_ID
+
+    async def unexpected_source(**kwargs):
+        return json.dumps({"status": "ready" if operation == "read" else "displayed", "displayed": True,
+                           "source": foreign_source, "content": "FOREIGN_COLLECTION_CONTENT_81"})
+
+    runtime = automatic._Runtime({}, {}, {"id": "employee"}, SimpleNamespace(), None, "approved-photos")
+    runtime.read_tool = runtime.image_tool = {"callable": unexpected_source}
+    result = run(runtime.read(DOC_ID) if operation == "read" else runtime.show(DOC_ID, "1", 0))
+    assert result.get("status") not in {"ready", "displayed"}
+    assert "FOREIGN_COLLECTION_CONTENT_81" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("mismatch", [None, "other_owner", "other_source", "other_hash", "other_number", "not_attached",
+                                      "other_knowledge"])
 def test_real_verifier_requires_saved_private_png_source_provenance(automatic, monkeypatch, mismatch):
     file_id = str(UUID(int=987))
     photo = {"number": 1, "caption": "Откройте «Операции».", "file_id": file_id}
     result = {"status": "displayed", "displayed": True, "source": source(), "images": [photo]}
+    if mismatch == "other_knowledge":
+        result["source"]["knowledge_id"] = OTHER_KNOWLEDGE_ID
     provenance = {"ai_support_tool": "approved_instruction_images", "source_file_id": DOC_ID,
                   "source_sha256": "a" * 64, "illustration_number": 1, "caption": photo["caption"]}
     file = SimpleNamespace(id=file_id, user_id="employee", meta={"data": provenance})
@@ -1420,7 +1488,7 @@ def test_real_dialogue_validation_failures_return_support_route(automatic, monke
     assert run(runtime.dialogue("Привет", [])) == {"route": "SUPPORT", "reply": ""}
 
 
-def inlet_context(automatic, monkeypatch, *, role="user", owned=True, kb_exec=False):
+def inlet_context(automatic, monkeypatch, *, role="user", owned=True, kb_exec=False, chat_meta=None):
     class Users:
         @staticmethod
         async def get_user_by_id(user_id):
@@ -1429,15 +1497,37 @@ def inlet_context(automatic, monkeypatch, *, role="user", owned=True, kb_exec=Fa
     class Chats:
         @staticmethod
         async def get_chat_by_id_and_user_id(chat_id, user_id):
-            return SimpleNamespace(id=chat_id, user_id=user_id) if owned else None
+            return SimpleNamespace(id=chat_id, user_id=user_id, meta=copy.deepcopy(chat_meta)) if owned else None
+
+    class Tools:
+        @staticmethod
+        async def get_tool_valves_by_id(tool_id):
+            assert tool_id == "ai_support"
+            return {"allowed_knowledge_ids": [KNOWLEDGE_ID]}
+
+    class Knowledges:
+        @staticmethod
+        async def has_file(knowledge_id, file_id):
+            return (knowledge_id, file_id) in {(KNOWLEDGE_ID, DOC_ID), (OTHER_KNOWLEDGE_ID, OTHER_ID)}
+
+        @staticmethod
+        async def check_access_by_user_id(knowledge_id, user_id, permission="read"):
+            # Both collections are accessible to this user. Only the configured
+            # collection may be used by this particular assistant.
+            return user_id == "employee" and permission == "read"
 
     install_module(monkeypatch, "open_webui.models.users", {"Users": Users})
     install_module(monkeypatch, "open_webui.models.chats", {"Chats": Chats})
+    install_module(monkeypatch, "open_webui.models.tools", {"Tools": Tools})
+    install_module(monkeypatch, "open_webui.models.knowledge", {"Knowledges": Knowledges})
     install_module(monkeypatch, "open_webui.env", {"ENABLE_KB_EXEC": kb_exec})
     categories = {name: False for name in ("chats", "subagents", "memory", "notes", "channels", "tasks",
                                           "automations", "calendar", "notifications")}
     categories.update({"knowledge": True, "files": True, "time": True})
-    model = {"id": "ai-support", "info": {"meta": {"builtinTools": categories}}}
+    model = {"id": "ai-support", "info": {"meta": {
+        "capabilities": {"builtin_tools": False}, "builtinTools": categories,
+        "knowledge": [{"type": "collection", "id": KNOWLEDGE_ID}],
+    }}}
     body = {"model": "ai-support", "messages": [{"role": "user", "content": SCANNER_QUERY}],
             "tool_ids": ["ai_support", "remote_tool", "terminal_tool"], "skill_ids": ["untrusted-skill"],
             "terminal_id": "terminal-session", "features": {"web_search": True, "code_interpreter": True,
@@ -1457,6 +1547,178 @@ def test_inlet_preserves_only_owned_instruction_tool_and_disables_execution_feat
     assert result["messages"] == original["messages"]
 
 
+@pytest.mark.parametrize("role", ["user", "admin"])
+def test_inlet_keeps_only_canonical_approved_knowledge_context_for_accessible_foreign_sources(
+        automatic, monkeypatch, role):
+    filter_instance, body, model, meta = inlet_context(automatic, monkeypatch, role=role)
+    contexts = [
+        {"type": "collection", "id": KNOWLEDGE_ID, "name": "Approved instructions"},
+        {"type": "file", "id": DOC_ID, "file": {"id": OTHER_ID},
+         "url": "https://foreign.example/private", "data": {"content": "FOREIGN_PAYLOAD_71"}},
+        {"type": "collection", "id": OTHER_KNOWLEDGE_ID},
+        {"type": "file", "id": OTHER_ID},
+        {"type": "note", "id": DOC_ID},
+        {"type": "external", "id": "foreign-service"},
+    ]
+    body["files"] = copy.deepcopy(contexts)
+    meta["files"] = copy.deepcopy(contexts)
+    meta["folder_knowledge"] = copy.deepcopy(contexts)
+    original, original_model = copy.deepcopy(body), copy.deepcopy(model)
+
+    result = run(filter_instance.inlet(body, __user__={"id": "employee"}, __request__=SimpleNamespace(),
+                                       __metadata__=meta, __model__=model))
+    approved = [{"type": "collection", "id": KNOWLEDGE_ID}, {"type": "file", "id": DOC_ID}]
+    assert result["files"] == approved and meta["files"] == approved and meta["folder_knowledge"] == approved
+    assert body == original and model == original_model
+    assert "FOREIGN_PAYLOAD_71" not in json.dumps(result, ensure_ascii=False)
+    assert result["tool_ids"] == ["ai_support"]
+
+
+@pytest.mark.parametrize("role", ["user", "admin"])
+@pytest.mark.parametrize("foreign", [
+    {"type": "collection", "id": OTHER_KNOWLEDGE_ID},
+    {"type": "file", "id": OTHER_ID},
+    {"type": "note", "id": DOC_ID},
+])
+def test_profile_cannot_expand_approved_scope_even_when_user_has_foreign_access(
+        automatic, monkeypatch, role, foreign):
+    filter_instance, body, model, meta = inlet_context(automatic, monkeypatch, role=role)
+    model["info"]["meta"]["knowledge"].append(copy.deepcopy(foreign))
+    with pytest.raises(ValueError):
+        run(filter_instance.inlet(body, __user__={"id": "employee"}, __request__=SimpleNamespace(),
+                                   __metadata__=meta, __model__=model))
+
+
+@pytest.mark.parametrize("configured", [[], ["not-a-collection-id"], [OTHER_KNOWLEDGE_ID], "not-a-list"])
+def test_inlet_rejects_tool_scope_that_is_empty_invalid_or_different(automatic, monkeypatch, configured):
+    filter_instance, body, model, meta = inlet_context(automatic, monkeypatch)
+
+    async def valves(tool_id):
+        assert tool_id == "ai_support"
+        return {"allowed_knowledge_ids": configured}
+
+    monkeypatch.setattr(sys.modules["open_webui.models.tools"].Tools, "get_tool_valves_by_id", staticmethod(valves))
+    with pytest.raises(ValueError):
+        run(filter_instance.inlet(body, __user__={"id": "employee"}, __request__=SimpleNamespace(),
+                                   __metadata__=meta, __model__=model))
+
+
+@pytest.mark.parametrize("configured", [None, {}])
+def test_default_tool_scope_is_the_single_approved_collection(automatic, monkeypatch, configured):
+    filter_instance, body, model, meta = inlet_context(automatic, monkeypatch)
+
+    async def valves(tool_id):
+        return configured
+
+    monkeypatch.setattr(sys.modules["open_webui.models.tools"].Tools, "get_tool_valves_by_id", staticmethod(valves))
+    result = run(filter_instance.inlet(body, __user__={"id": "employee"}, __request__=SimpleNamespace(),
+                                       __metadata__=meta, __model__=model))
+    assert result["tool_ids"] == ["ai_support"]
+
+
+@pytest.mark.parametrize("configured", [[], ["not-a-collection-id"], [KNOWLEDGE_ID] * 21])
+def test_empty_or_invalid_filter_scope_never_becomes_all_knowledge(automatic, monkeypatch, configured):
+    filter_instance, body, model, meta = inlet_context(automatic, monkeypatch)
+    filter_instance.valves.allowed_knowledge_ids = configured
+    with pytest.raises(ValueError):
+        run(filter_instance.inlet(body, __user__={"id": "employee"}, __request__=SimpleNamespace(),
+                                   __metadata__=meta, __model__=model))
+
+
+def test_inlet_can_use_the_scoped_tool_without_attached_model_knowledge(automatic, monkeypatch):
+    filter_instance, body, model, meta = inlet_context(automatic, monkeypatch)
+    model["info"]["meta"]["knowledge"] = []
+    result = run(filter_instance.inlet(body, __user__={"id": "employee"}, __request__=SimpleNamespace(),
+                                       __metadata__=meta, __model__=model))
+    assert result["tool_ids"] == ["ai_support"]
+    assert model["info"]["meta"]["capabilities"]["builtin_tools"] is False
+
+
+def test_foreign_image_parts_cannot_become_approved_model_context(automatic, monkeypatch):
+    filter_instance, body, model, meta = inlet_context(automatic, monkeypatch)
+    body["messages"][-1]["content"] = [
+        {"type": "text", "text": SCANNER_QUERY},
+        {"type": "image_url", "image_url": {"url": f"/api/v1/files/{OTHER_ID}/content"}},
+        {"type": "image_url", "image_url": {"url": "https://foreign.example/private-image"}},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,FOREIGN_IMAGE_CONTENT_43"}},
+    ]
+    original = copy.deepcopy(body)
+    result = run(filter_instance.inlet(body, __user__={"id": "employee"}, __request__=SimpleNamespace(),
+                                       __metadata__=meta, __model__=model))
+    assert result["messages"][-1]["content"] == [{"type": "text", "text": SCANNER_QUERY}]
+    assert body == original
+
+
+@pytest.mark.parametrize("role,allowed", [("user", False), ("admin", True)])
+def test_collection_scope_also_obeys_the_users_read_permissions(automatic, monkeypatch, role, allowed):
+    filter_instance, body, model, meta = inlet_context(automatic, monkeypatch, role=role)
+
+    async def no_read_access(*args, **kwargs):
+        return False
+
+    monkeypatch.setattr(sys.modules["open_webui.models.knowledge"].Knowledges, "check_access_by_user_id",
+                        staticmethod(no_read_access))
+    if allowed:
+        result = run(filter_instance.inlet(body, __user__={"id": "employee"}, __request__=SimpleNamespace(),
+                                           __metadata__=meta, __model__=model))
+        assert result["tool_ids"] == ["ai_support"]
+    else:
+        with pytest.raises(ValueError):
+            run(filter_instance.inlet(body, __user__={"id": "employee"}, __request__=SimpleNamespace(),
+                                       __metadata__=meta, __model__=model))
+
+
+@pytest.mark.parametrize("capabilities", [None, {}, {"builtin_tools": None}, {"builtin_tools": True}])
+def test_general_builtins_require_an_explicit_disabled_flag(automatic, monkeypatch, capabilities):
+    filter_instance, body, model, meta = inlet_context(automatic, monkeypatch)
+    model["info"]["meta"]["capabilities"] = capabilities
+    with pytest.raises(ValueError):
+        run(filter_instance.inlet(body, __user__={"id": "employee"}, __request__=SimpleNamespace(),
+                                   __metadata__=meta, __model__=model))
+
+
+def test_internal_note_chat_cannot_add_context_after_the_scope_gate(automatic, monkeypatch):
+    filter_instance, body, model, meta = inlet_context(
+        automatic, monkeypatch, chat_meta={"internal": True, "type": "note"}
+    )
+    with pytest.raises(ValueError):
+        run(filter_instance.inlet(body, __user__={"id": "employee"}, __request__=SimpleNamespace(),
+                                   __metadata__=meta, __model__=model))
+
+
+@pytest.mark.parametrize("chat_meta", [{"internal": False, "type": "note"}, {"internal": True, "type": "chat"}])
+def test_ordinary_chat_metadata_does_not_trigger_the_internal_note_gate(automatic, monkeypatch, chat_meta):
+    filter_instance, body, model, meta = inlet_context(automatic, monkeypatch, chat_meta=chat_meta)
+    result = run(filter_instance.inlet(body, __user__={"id": "employee"}, __request__=SimpleNamespace(),
+                                       __metadata__=meta, __model__=model))
+    assert result["tool_ids"] == ["ai_support"]
+
+
+def test_model_default_skills_cannot_add_external_system_context(automatic, monkeypatch):
+    filter_instance, body, model, meta = inlet_context(automatic, monkeypatch)
+    model["info"]["meta"]["skillIds"] = ["foreign-knowledge-skill"]
+    with pytest.raises(ValueError):
+        run(filter_instance.inlet(body, __user__={"id": "employee"}, __request__=SimpleNamespace(),
+                                   __metadata__=meta, __model__=model))
+
+
+@pytest.mark.parametrize("multimodal", [False, True])
+def test_skill_mentions_stay_plain_user_text_without_changing_saved_history(automatic, monkeypatch, multimodal):
+    filter_instance, body, model, meta = inlet_context(automatic, monkeypatch)
+    text = SCANNER_QUERY + " <$foreign-skill> </other-skill>"
+    body["messages"] = [
+        {"role": "assistant", "content": "Предыдущее сообщение <$history-skill> </history-skill>"},
+        {"role": "user", "content": [{"type": "text", "text": text}] if multimodal else text},
+    ]
+    original = copy.deepcopy(body)
+    result = run(filter_instance.inlet(body, __user__={"id": "employee"}, __request__=SimpleNamespace(),
+                                       __metadata__=meta, __model__=model))
+    encoded = json.dumps(result["messages"], ensure_ascii=False)
+    assert "<$" not in encoded and "</" not in encoded
+    assert "foreign-skill" in encoded and "other-skill" in encoded and "history-skill" in encoded
+    assert body == original and result["skill_ids"] == []
+
+
 @pytest.mark.parametrize("failure", ["not_owned", "pending", "kb_exec", "model_tools", "unsafe_builtin"])
 def test_inlet_rejects_unowned_or_executable_context_before_generation(automatic, monkeypatch, failure):
     filter_instance, body, model, meta = inlet_context(
@@ -1466,7 +1728,7 @@ def test_inlet_rejects_unowned_or_executable_context_before_generation(automatic
     if failure == "model_tools":
         body["tools"] = [{"type": "function", "function": {"name": "execute_command"}}]
     elif failure == "unsafe_builtin":
-        model["info"]["meta"]["builtinTools"]["chats"] = True
+        model["info"]["meta"]["capabilities"]["builtin_tools"] = True
     with pytest.raises(ValueError):
         run(filter_instance.inlet(body, __user__={"id": "employee"}, __request__=SimpleNamespace(),
                                    __metadata__=meta, __model__=model))
@@ -1595,15 +1857,11 @@ def test_completed_refusal_accepts_a_later_message_without_a_toolkit_on_the_refu
     assert not response.get("error") and response["content"] != automatic.REFUSAL
 
 
-@pytest.mark.parametrize("scope", ["other_model", "backend", "internal", "api", "temporary", "channel"])
+@pytest.mark.parametrize("scope", ["other_model", "api", "temporary", "channel"])
 def test_inlet_skips_unrelated_or_backend_requests(automatic, monkeypatch, scope):
     filter_instance, body, model, meta = inlet_context(automatic, monkeypatch, owned=False, kb_exec=True)
     if scope == "other_model":
         model["id"] = "unrelated-model"
-    elif scope == "backend":
-        meta["task"] = "json-schema"
-    elif scope == "internal":
-        meta["internal"] = True
     elif scope == "api":
         meta.pop("session_id")
     elif scope == "temporary":
@@ -1612,3 +1870,15 @@ def test_inlet_skips_unrelated_or_backend_requests(automatic, monkeypatch, scope
         meta["chat_id"] = "channel:warehouse"
     assert run(filter_instance.inlet(body, __user__={"id": "employee"}, __request__=SimpleNamespace(),
                                       __metadata__=meta, __model__=model)) is body
+
+
+@pytest.mark.parametrize("flag,value", [("task", "json-schema"), ("internal", True)])
+def test_saved_ui_task_flags_cannot_bypass_knowledge_scope(automatic, monkeypatch, flag, value):
+    filter_instance, body, model, meta = inlet_context(automatic, monkeypatch)
+    meta[flag] = value
+    body["files"] = [{"type": "collection", "id": OTHER_KNOWLEDGE_ID}]
+    meta["folder_knowledge"] = [{"type": "collection", "id": OTHER_KNOWLEDGE_ID}]
+    result = run(filter_instance.inlet(body, __user__={"id": "employee"}, __request__=SimpleNamespace(),
+                                       __metadata__=meta, __model__=model))
+    assert result["files"] == [] and meta["folder_knowledge"] == []
+    assert result["tool_ids"] == ["ai_support"]
