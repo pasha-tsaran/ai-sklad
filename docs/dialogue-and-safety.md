@@ -51,7 +51,7 @@ Workspace Tool фотографий и административный Filter. 
 
 1. Обновите существующую административную функцию кодом
    [automatic_instruction_images.py](../integrations/openwebui/automatic_instruction_images.py).
-   В заголовке должна быть версия **0.5.0**. Также обновите доверенный Tool до
+   В заголовке должна быть версия **0.5.1**. Также обновите доверенный Tool до
    версии **0.3.0** по [инструкции ограничения источников](approved-knowledge-scope.md).
 2. Сохраните профиль с полным системным промптом из
    [openwebui-system-prompt.txt](prompts/openwebui-system-prompt.txt).

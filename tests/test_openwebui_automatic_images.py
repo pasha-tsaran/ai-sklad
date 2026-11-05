@@ -83,6 +83,12 @@ def citation(file_id=DOC_ID, filename="33_Supermag — операции.docx"):
 
 SCANNER_QUERY = "В 1С адрес сканера неверный. Как настроить адрес сканера?"
 SCANNER_FILENAME = "33_1С — адрес сканера.docx"
+OBSERVED_SCANNER_ID = "6f768431-86be-4a8e-8cb8-72154d80735a"
+SCANNER_SETUP_REQUEST = (
+    "Работаю в 1С АДРЕС версии 1.0.53. Нужно настроить сканер штрихкодов для моего рабочего места. "
+    "Драйвер уже установлен. Я плохо разбираюсь в настройках. С чего начать?"
+)
+SCANNER_SETUP_FILENAME = "33_Сканер штрихкодов в базе АДРЕС.docx"
 
 
 def search_chunk(file_id=DOC_ID, filename=SCANNER_FILENAME, content=None, **extra):
@@ -288,6 +294,91 @@ def test_model_without_any_tool_calls_is_forced_through_search_read_and_photo_de
     assert final_text(message) == message["content"]
     statuses = [event["data"] for event in state.events if event["type"] == "status"]
     assert statuses and statuses[0]["done"] is False and statuses[-1]["done"] is True
+
+
+@pytest.mark.parametrize("fallback_status", ["ok", "unavailable"])
+def test_successful_native_scoped_search_is_read_without_repeating_a_longer_query(
+        automatic, monkeypatch, fallback_status):
+    steps = ["Откройте меню «Операции» и выберите «Обработка…».", "Выберите «Настройка ТО» и нажмите «ОК»."]
+    captions = ["В меню «Операции» выделен пункт «Обработка…».", "В списке обработок выделена «Настройка ТО»."]
+    doc = document(file_id=OBSERVED_SCANNER_ID, filename=SCANNER_SETUP_FILENAME, captions=captions)
+    doc["content"] = "Настройка сканера штрихкодов в 1С АДРЕС 1.0.53.\n\n" + "\n\n".join(
+        f"{number}. {step}" for number, step in enumerate(steps, 1)
+    ) + "\n\nФотографии и пояснения"
+    state = RuntimeState({OBSERVED_SCANNER_ID: doc})
+    state.search_result = {"status": fallback_status, "chunks": []}
+    current = answer(read=False, content="Подходящей инструкции по настройке сканера нет.")
+    current["output"][:0] = native_pair(
+        automatic.SEARCH_TOOL, {"query": "сканер штрихкодов АДРЕС", "count": 5},
+        {"status": "ok", "knowledge_ids": [KNOWLEDGE_ID], "chunks": [search_chunk(
+            file_id=OBSERVED_SCANNER_ID, filename=SCANNER_SETUP_FILENAME, content=doc["content"],
+        )]}, call_id="native_scanner_search",
+    )
+    body = chat_body(messages=[{"id": "user-1", "role": "user", "content": SCANNER_SETUP_REQUEST}, current])
+    result = apply_filter(automatic, monkeypatch, state, body)
+    message = result["messages"][-1]
+    assert state.searches == [] and state.reads == [OBSERVED_SCANNER_ID]
+    assert state.shows == [(OBSERVED_SCANNER_ID, "1,2", 0)] and len(file_events(state)) == 1
+    assert all(step in message["content"] for step in steps)
+    assert all(caption in message["content"] for caption in captions)
+    assert "Подходящей инструкции" not in message["content"]
+    photos = image_results(automatic, message)[0]
+    assert photos["source"] == doc["source"] and len(photos["images"]) == 2
+    for image in photos["images"]:
+        embed = f"![Иллюстрация {image['number']}](/api/v1/files/{image['file_id']}/content)"
+        assert message["content"].index(image["caption"]) < message["content"].index(embed)
+    assert final_text(message) == message["content"]
+    assert len([name for name, _, _ in automatic.tool_results(message) if name == automatic.SEARCH_TOOL]) == 1
+
+
+@pytest.mark.parametrize("invalid", ["foreign_scope", "mixed_scope", "missing_scope", "wrong_tool", "unpaired"])
+def test_untrusted_native_search_is_not_reused_as_an_approved_source(automatic, monkeypatch, invalid):
+    state = RuntimeState({OBSERVED_SCANNER_ID: document(file_id=OBSERVED_SCANNER_ID,
+                                                       filename=SCANNER_SETUP_FILENAME)})
+    proof = {"status": "ok", "knowledge_ids": [KNOWLEDGE_ID], "chunks": [search_chunk(
+        file_id=OBSERVED_SCANNER_ID, filename=SCANNER_SETUP_FILENAME,
+    )]}
+    if invalid == "foreign_scope":
+        proof["knowledge_ids"] = [OTHER_KNOWLEDGE_ID]
+    elif invalid == "mixed_scope":
+        proof["knowledge_ids"] = [KNOWLEDGE_ID, OTHER_KNOWLEDGE_ID]
+    elif invalid == "missing_scope":
+        proof.pop("knowledge_ids")
+    current = answer(read=False, content="Откройте «Сервис» и измените настройки сканера.")
+    current["output"][:0] = native_pair(
+        "query_knowledge_files" if invalid == "wrong_tool" else automatic.SEARCH_TOOL,
+        {"query": "сканер штрихкодов АДРЕС"}, proof, call_id="native_scanner_search",
+    )
+    if invalid == "unpaired":
+        current["output"][1]["call_id"] = "another_call"
+    body = chat_body(messages=[{"id": "user-1", "role": "user", "content": SCANNER_SETUP_REQUEST}, current])
+    result = apply_filter(automatic, monkeypatch, state, body)
+    assert state.searches == [SCANNER_SETUP_REQUEST]
+    assert not state.reads and not state.shows and not file_events(state)
+    assert_no_unverified_steps(result, body)
+    assert "«Сервис»" not in result["messages"][-1]["content"]
+
+
+@pytest.mark.parametrize("kind", ["ambiguous", "unrelated"])
+def test_native_search_without_a_clear_relevant_document_does_not_choose_an_arbitrary_hit(
+        automatic, monkeypatch, kind):
+    chunks = [search_chunk(file_id=OBSERVED_SCANNER_ID, filename=SCANNER_SETUP_FILENAME)]
+    if kind == "ambiguous":
+        chunks.append(search_chunk(file_id=OTHER_ID, filename="44_Сканер штрихкодов в базе АДРЕС.docx"))
+    else:
+        chunks = [search_chunk(file_id=OTHER_ID, filename="05_Acrobat — печать PDF.docx",
+                               content="Печать PDF с изображениями в Acrobat.")]
+    state = RuntimeState()
+    current = answer(read=False, content="Откройте «Сервис» и измените настройки сканера.")
+    current["output"][:0] = native_pair(
+        automatic.SEARCH_TOOL, {"query": "сканер штрихкодов АДРЕС"},
+        {"status": "ok", "knowledge_ids": [KNOWLEDGE_ID], "chunks": chunks}, call_id="native_scanner_search",
+    )
+    body = chat_body(messages=[{"id": "user-1", "role": "user", "content": SCANNER_SETUP_REQUEST}, current])
+    result = apply_filter(automatic, monkeypatch, state, body)
+    assert state.searches == [SCANNER_SETUP_REQUEST]
+    assert not state.reads and not state.shows and not file_events(state)
+    assert_no_unverified_steps(result, body)
 
 
 @pytest.mark.parametrize("failure", ["empty", "unavailable", "weak", "ambiguous", "exception"])

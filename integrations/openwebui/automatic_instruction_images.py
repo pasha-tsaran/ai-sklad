@@ -3,7 +3,7 @@ title: AI Support — фотографии к ответу автоматиче�
 author: AI Support
 description: Автоматически прикладывает фотографии утверждённой инструкции и продолжает её по шагам.
 required_open_webui_version: 0.11.0
-version: 0.5.0
+version: 0.5.1
 """
 
 # Install as an admin Function (Filter), scoped to ai-support, not as a Tool.
@@ -302,6 +302,30 @@ def choose_search_source(query, chunks):
     if not ranked or (len(ranked) > 1 and ranked[0][0] - ranked[1][0] < 2):
         return None
     return ranked[0][1]
+
+
+def searched_source(message, query, allowed_knowledge_ids):
+    """Reuse this reply's scoped search before issuing a less precise duplicate.
+
+    Search excerpts only nominate a candidate. The approved reader still checks
+    current collection membership, access and the complete source before display.
+    Never treat the Filter's compact sources-only trace as retrieved evidence.
+    """
+    allowed = _knowledge_ids(allowed_knowledge_ids)
+    if not allowed:
+        return None
+    chunks = []
+    for name, _, result in tool_results(message):
+        if name != SEARCH_TOOL or not isinstance(result, dict) or result.get("status") != "ok" or "error" in result:
+            continue
+        scope = _knowledge_ids(result.get("knowledge_ids"))
+        found = result.get("chunks")
+        if not scope or set(scope) != set(allowed) or not isinstance(found, list):
+            continue
+        chunks.extend(found)
+        if len(chunks) > 32:
+            return None  # Fall back to fresh bounded search rather than hiding ambiguity.
+    return choose_search_source(query, chunks)
 
 
 def problem_query(messages, user_entries):
@@ -972,6 +996,8 @@ class Filter:
             pinned = clarification or (advance and flow.get("has_more"))
             file_id = (previous[2].get("source", {}).get("file_id") if pinned else
                        existing[1].get("source", {}).get("file_id") if existing else selected_source(current))
+            if not _uuid(file_id):
+                file_id = searched_source(current, query, self.valves.allowed_knowledge_ids)
             search_trace = None
             if not _uuid(file_id):
                 if len(search_terms(query)) < 2:
