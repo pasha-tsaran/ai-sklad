@@ -13,7 +13,7 @@ from app.models import Delivery, Escalation, Feedback, Incident, Job, Message, M
 from app.models.talk import TalkAccount, TalkInbox, TalkRoom
 from app.schemas.contracts import AnalysisResult, DialogueResult
 from app.services.chat.talk_dialogue import (
-    BACK_TO_BOT, CHANGED, CLARIFY_QUESTIONS, ESCALATION_MENU, FORM_HELP, INTAKE_QUESTIONS,
+    BACK_TO_BOT, CHANGED, CLARIFY_QUESTIONS, ESCALATION_MENU, FORM_CARD_HEADER, INTAKE_QUESTIONS,
     RESUME_GUIDE, UNAVAILABLE, process_one,
 )
 from app.services.llm.mock import MockLLM
@@ -596,7 +596,8 @@ def test_feedback_during_form_keeps_the_form_and_does_not_restart_alternative_gu
     talk.incoming(message, 3)
     talk.process(knowledge)
     state = talk.snapshot()
-    assert assistants(state)[-1] == (INTAKE_QUESTIONS["account_holder_name"], None)
+    assert assistants(state)[-1][0].startswith(FORM_CARD_HEADER)
+    assert INTAKE_QUESTIONS["computer_name"] in assistants(state)[-1][0]
     assert state["incident"].pending_action == "COLLECT_ESCALATION_DETAILS"
     assert len(state["attempts"]) == 1 and len(knowledge.searches) == searches
 
@@ -779,7 +780,7 @@ def test_form_is_requested_only_after_positive_menu_choice_and_can_still_be_canc
     talk.incoming(choice, 2)
     talk.process()
     state = talk.snapshot()
-    assert assistants(state)[-1] == (FORM_HELP, None) and state["flow"]["escalation"]["stage"] == "FORM"
+    assert assistants(state)[-1][0].startswith(FORM_CARD_HEADER) and state["flow"]["escalation"]["stage"] == "FORM"
     assert state["incident"].pending_action == "COLLECT_ESCALATION_DETAILS"
     with talk.env.factory() as session:
         assert session.scalar(select(func.count()).select_from(Escalation)) == 0
@@ -993,7 +994,7 @@ def test_scattered_intake_keeps_collected_fields_and_asks_only_the_next_missing_
     assert assistants(state)[-1] == (INTAKE_QUESTIONS["subject"], None)
     assert state["flow"]["escalation"]["intake_fields"]["computer_name"] == "terminal76-sk"
     assert state["flow"]["escalation"]["intake_requested_field"] == "subject"
-    assert all(text != FORM_HELP for text, _ in assistants(state)[2:])
+    assert all(not text.startswith(FORM_CARD_HEADER) for text, _ in assistants(state)[2:])
     talk.incoming("Уменьшить громкость на проводном сканере ШК", 5)
     talk.process(knowledge, model)
     state = talk.snapshot()
@@ -1048,13 +1049,18 @@ def test_missing_name_answer_is_assigned_only_after_the_backend_actually_asked_f
 
     monkeypatch.setattr(engine, "parse_intake", record)
     model, knowledge = NoGeneration(), Knowledge()
-    for sequence, content in enumerate(["оператор", "Готово", "Павел"], 1):
+    for sequence, content in enumerate(["оператор", "Готово", "terminal76-sk", "Павел"], 1):
         talk.incoming(content, sequence)
         talk.process(knowledge, model)
     state = talk.snapshot()
-    assert observed == [("Павел", {}, "account_holder_name")]
-    assert state["flow"]["escalation"]["intake_fields"] == {"account_holder_name": "Павел"}
-    assert assistants(state)[-1] == (INTAKE_QUESTIONS["account_login"], None) and not model.calls
+    assert observed == [
+        ("terminal76-sk", {"account_login": "employee"}, "computer_name"),
+        ("Павел", {"account_login": "employee", "computer_name": "terminal76-sk"}, "account_holder_name"),
+    ]
+    assert state["flow"]["escalation"]["intake_fields"] == {
+        "account_holder_name": "Павел", "account_login": "employee", "computer_name": "terminal76-sk",
+    }
+    assert assistants(state)[-1] == (INTAKE_QUESTIONS["subject"], None) and not model.calls
 
 
 @pytest.mark.parametrize("legacy", [False, True])
@@ -1084,3 +1090,118 @@ def test_cancelling_natural_intake_without_an_earlier_problem_never_searches_per
         talk.incoming(content, sequence)
         talk.process(knowledge, model)
     assert not knowledge.searches and not knowledge.reads and model.calls == ["extract_escalation"]
+
+
+def _profile(talk, **extra):
+    with talk.env.factory() as session, session.begin():
+        room = session.get(TalkRoom, talk.room_id)
+        room.profile = {"nextcloud_user_id": room.employee_id,
+                        "nextcloud_display_name": "Павел Царан", "identity_source": "nextcloud_participants", **extra}
+
+
+def test_operator_card_uses_trusted_employee_profile_and_asks_only_for_unknown_workstation(talk):
+    _profile(talk)
+    model, knowledge = NoGeneration(), Knowledge()
+    for sequence, content in enumerate(["оператор", "1"], 1):
+        talk.incoming(content, sequence)
+        talk.process(knowledge, model)
+    state = talk.snapshot()
+    card = assistants(state)[-1][0]
+    assert card.startswith(FORM_CARD_HEADER)
+    for text in ["ФИО: Павел Царан", "Логин: employee", "Компьютер: Не определён", INTAKE_QUESTIONS["computer_name"]]:
+        assert text in card
+    assert card.count("?") == 1 and "Как вас зовут" not in card and "рабочий логин?" not in card
+    assert state["flow"]["escalation"]["intake_fields"] == {
+        "account_holder_name": "Павел Царан", "account_login": "employee",
+    }
+    assert state["flow"]["escalation"]["intake_requested_field"] == "computer_name"
+    assert not model.calls and not knowledge.searches
+
+
+def test_profile_card_then_confirmed_workstation_requires_only_problem_text_and_creates_draft(talk):
+    talk.settings.mail_backend, talk.settings.support_email = "mailto", "operator@example.net"
+    _profile(talk)
+    model, knowledge = NoGeneration(), Knowledge()
+    for sequence, content in enumerate(["оператор", "1", "terminal76-sk"], 1):
+        talk.incoming(content, sequence)
+        talk.process(knowledge, model)
+    state = talk.snapshot()
+    assert assistants(state)[-1] == (INTAKE_QUESTIONS["subject"], None)
+    assert state["flow"]["escalation"]["intake_fields"] == {
+        "account_holder_name": "Павел Царан", "account_login": "employee", "computer_name": "terminal76-sk",
+    }
+    with talk.env.factory() as session:
+        room = session.get(TalkRoom, talk.room_id)
+        assert room.profile["device_name"] == "terminal76-sk" and room.profile["device_incident_id"] == state["incident"].id
+    talk.incoming("Уменьшить громкость проводного сканера ШК", 4)
+    talk.process(knowledge, model)
+    state = talk.snapshot()
+    assert state["incident"].state == "ESCALATED" and not model.calls and not knowledge.searches
+    with talk.env.factory() as session:
+        details = session.scalar(select(Escalation)).details
+        assert details["account_holder_name"] == "Павел Царан" and details["account_login"] == "employee"
+        assert details["computer_name"] == "terminal76-sk" and details["subject"] == "Уменьшить громкость проводного сканера ШК"
+
+
+def test_workstation_confirmed_in_current_incident_is_shown_without_asking_for_it_again(talk):
+    model, knowledge = NoGeneration(), Knowledge()
+    talk.incoming("Привет")
+    talk.process(knowledge, model)
+    current = talk.snapshot()["incident"].id
+    _profile(talk, device_name="terminal76-sk", device_incident_id=current)
+    for sequence, content in enumerate(["оператор", "1"], 2):
+        talk.incoming(content, sequence)
+        talk.process(knowledge, model)
+    state = talk.snapshot()
+    card = assistants(state)[-1][0]
+    assert "Компьютер: terminal76-sk" in card and INTAKE_QUESTIONS["subject"] in card
+    assert INTAKE_QUESTIONS["computer_name"] not in card
+    assert state["flow"]["escalation"]["intake_requested_field"] == "subject"
+    assert not model.calls and not knowledge.searches
+
+
+def test_previous_incident_workstation_is_never_reused_or_offered_when_employee_changes_workplaces(talk):
+    talk.settings.mail_backend, talk.settings.support_email = "mailto", "operator@example.net"
+    _profile(talk)
+    model, knowledge = NoGeneration(), Knowledge()
+    for sequence, content in enumerate([
+        "оператор", "1", "terminal76-sk", "Настроить сканер штрихкодов", "Продолжить с ботом", "оператор", "1",
+    ], 1):
+        talk.incoming(content, sequence)
+        talk.process(knowledge, model)
+    state = talk.snapshot()
+    card = assistants(state)[-1][0]
+    assert "Компьютер: Не определён" in card and "terminal76-sk" not in card
+    assert INTAKE_QUESTIONS["computer_name"] in card and "computer_name" not in state["flow"]["escalation"]["intake_fields"]
+    assert not model.calls and not knowledge.searches
+    with talk.env.factory() as session:
+        room = session.get(TalkRoom, talk.room_id)
+        assert room.profile["device_incident_id"] != state["incident"].id
+
+
+def test_explicit_workstation_correction_updates_only_current_incident_mapping(talk):
+    _profile(talk)
+    model, knowledge = NoGeneration(), Knowledge()
+    for sequence, content in enumerate(["оператор", "1", "terminal76-sk", "Компьютер: terminal77-sk"], 1):
+        talk.incoming(content, sequence)
+        talk.process(knowledge, model)
+    state = talk.snapshot()
+    assert state["flow"]["escalation"]["intake_fields"]["computer_name"] == "terminal77-sk"
+    with talk.env.factory() as session:
+        room = session.get(TalkRoom, talk.room_id)
+        assert room.profile["device_name"] == "terminal77-sk" and room.profile["device_incident_id"] == state["incident"].id
+        assert room.profile["nextcloud_user_id"] == "employee" and room.profile["nextcloud_display_name"] == "Павел Царан"
+    assert not model.calls and not knowledge.searches
+
+
+def test_profile_card_never_uses_server_hostname_or_foreign_display_identity_as_employee_data(talk):
+    _profile(talk, nextcloud_user_id="another-employee", nextcloud_display_name="Чужой Пользователь",
+             actorDisplayName="Системный Администратор", server_hostname="SkladTechBot", computer_name="SkladTechBot")
+    model, knowledge = NoGeneration(), Knowledge()
+    for sequence, content in enumerate(["оператор", "1"], 1):
+        talk.incoming(content, sequence)
+        talk.process(knowledge, model)
+    card = assistants(talk.snapshot())[-1][0]
+    assert "Чужой Пользователь" not in card and "Системный Администратор" not in card and "SkladTechBot" not in card
+    assert "Логин: employee" in card and "Компьютер: Не определён" in card
+    assert not model.calls and not knowledge.searches

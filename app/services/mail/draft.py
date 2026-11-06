@@ -40,10 +40,10 @@ def _content(email, recipient):
 
 
 def make_mailto(email: dict, recipient: str) -> str | None:
-    """Return a complete UTF-8 mailto URI, or None when an EML file is required.
+    """Return a complete UTF-8 mailto URI, or None when a shorter link is needed.
 
     Only the configured recipient argument is used. A caller may supply a compact
-    body here and keep the full transcript for make_eml; nothing is truncated.
+    body here and keep the full letter in its visible preview; nothing is truncated.
     RFC 6068 body line breaks are encoded as CRLF. URI length is conservatively
     bounded for mail clients that cannot open long links from Talk.
     """

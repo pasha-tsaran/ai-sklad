@@ -8,7 +8,7 @@ from app.core.logging import configure_logging, event
 from app.db import get_engine
 
 configure_logging()
-app = FastAPI(title="ai-support", version="0.3.2", description="Grounded support, personal Talk chats and mail drafts")
+app = FastAPI(title="ai-support", version="0.3.3", description="Grounded support, personal Talk chats and mail drafts")
 app.include_router(router)
 app.include_router(talk_router)
 

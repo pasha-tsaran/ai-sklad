@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from sqlalchemy import select
 
 from app.models.talk import TalkAccount, TalkInbox, TalkRoom
+from app.services.chat.channel_profile import update_nextcloud_profile
 from app.services.nextcloud.account import AccountClient, AccountError, sequence
 
 MAX_INBOUND_CHARS = 8000
@@ -104,7 +105,14 @@ def poll_once(factory, settings, client=None):
             continue
         # The independently fetched room/roster, never this discovery summary, is authoritative.
         try:
-            validated = client.validate_room(token, expected_employee=existing[1] if existing else None)
+            # Reuse that same validated roster for optional display metadata.
+            # A profile endpoint must never add network latency before durable ingress.
+            observed_profile = None
+            expected = existing[1] if existing else None
+            if callable(getattr(client, "validate_room_with_profile", None)):
+                validated, observed_profile = client.validate_room_with_profile(token, expected_employee=expected)
+            else:
+                validated = client.validate_room(token, expected_employee=expected)
             if (validated.get("type") != 1 or validated.get("service_id") != service
                     or validated.get("token") != token):
                 raise AccountError("room_not_private")
@@ -145,6 +153,8 @@ def poll_once(factory, settings, client=None):
                 room = session.scalar(select(TalkRoom).where(TalkRoom.id == room_id).with_for_update())
                 if room.cursor != cursor or room.employee_id != employee:
                     continue  # Another poll committed first; never advance over unseen messages.
+                if observed_profile and any(_text(message, employee, service, activated) is not None for message in messages):
+                    update_nextcloud_profile(room, observed_profile)
                 for message in messages:
                     remote_sequence = sequence(message["id"])
                     content = _text(message, employee, service, activated)

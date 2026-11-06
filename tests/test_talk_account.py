@@ -416,6 +416,11 @@ def test_talk_account_migration_matches_models_and_downgrades_cleanly(tmp_path):
     spec = importlib.util.spec_from_file_location("talk_account_migration", path)
     migration = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(migration)
+    profile_spec = importlib.util.spec_from_file_location(
+        "talk_profile_progress_migration", path.with_name("0006_talk_profile_progress.py"),
+    )
+    profile_migration = importlib.util.module_from_spec(profile_spec)
+    profile_spec.loader.exec_module(profile_migration)
     engine = create_engine("sqlite:///" + str(tmp_path / "migration.db"))
     old_tables = [table for table in Base.metadata.sorted_tables if not table.name.startswith("talk_")]
     with engine.begin() as connection:
@@ -427,8 +432,10 @@ def test_talk_account_migration_matches_models_and_downgrades_cleanly(tmp_path):
         context = MigrationContext.configure(connection)
         with Operations.context(context):
             migration.upgrade()
+            profile_migration.upgrade()
         assert compare_metadata(context, Base.metadata) == []
         with Operations.context(context):
+            profile_migration.downgrade()
             migration.downgrade()
         assert all(not name.startswith("talk_") for name in connection.dialect.get_table_names(connection))
         assert not {"provenance", "account_id"}.intersection(

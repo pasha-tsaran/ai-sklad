@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, JSON, String, Text, UniqueConstraint
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, DateTime, ForeignKey, Index, JSON, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.entities import Base, Entity, now
@@ -25,6 +25,7 @@ class TalkRoom(Entity, Base):
     cursor: Mapped[int] = mapped_column(BigInteger, default=0)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     flow: Mapped[dict] = mapped_column(JSON, default=dict)
+    profile: Mapped[dict] = mapped_column(JSON, default=dict, server_default=text("'{}'"))
     incident_id: Mapped[str | None] = mapped_column(ForeignKey("incidents.id"))
     status: Mapped[str] = mapped_column(String(32), default="ACTIVE")
     error_code: Mapped[str | None] = mapped_column(String(100))
@@ -48,3 +49,4 @@ class TalkInbox(Entity, Base):
         CheckConstraint("status IN ('PENDING','RUNNING','DONE','FAILED','IGNORED')"),
         Index("ix_talk_inbox_status_sequence", "status", "remote_sequence"),
     )
+    progress: Mapped[dict] = mapped_column(JSON, default=dict, server_default=text("'{}'"))

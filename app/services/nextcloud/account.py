@@ -9,6 +9,7 @@ https://nextcloud-talk.readthedocs.io/en/stable/chat/
 import hashlib
 import json
 import re
+import unicodedata
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from urllib.parse import quote, urlsplit
@@ -18,6 +19,7 @@ import httpx
 MAX_RESPONSE_BYTES = 4_000_000
 MAX_IMAGE_BYTES = 8_000_000
 MAX_SEQUENCE = 2**63 - 1
+PROGRESS_MESSAGE = "Готовлю ответ…"
 _TOKEN = re.compile(r"[a-z0-9]{4,30}")
 
 
@@ -38,6 +40,16 @@ def sequence(value, *, allow_zero=False):
     return result
 
 
+def _employee_profile(checked, people):
+    """Extract only the already validated roster identity without I/O or caching."""
+    person = next(item for item in people if item["actorId"] == checked["employee_id"])
+    name = person.get("displayName")
+    if (not isinstance(name, str) or len(name) > 255
+            or any(unicodedata.category(char) == "Cc" for char in name)):
+        name = ""
+    return {"user_id": checked["employee_id"], "display_name": name.strip()}
+
+
 class AccountClient:
     def __init__(self, settings, transport=None):
         self.settings, self.transport = settings, transport
@@ -52,6 +64,7 @@ class AccountClient:
             raise AccountError("account_credentials_missing")
         self._uid = None
         self._employees = {}
+        self._features = None
         self.server_time = None
 
     def _request(self, method, path, *, ocs=True, acceptable=(200, 201), **kwargs):
@@ -74,7 +87,7 @@ class AccountClient:
             return None, headers, status
         try:
             envelope = json.loads(data)["ocs"]
-            if envelope["meta"]["statuscode"] not in {100, 200, 201}:
+            if envelope["meta"]["statuscode"] not in {100, 200, 201, 202}:
                 raise AccountError("nextcloud_ocs_error")
             return envelope["data"], headers, status
         except (KeyError, TypeError, ValueError) as exc:
@@ -111,7 +124,7 @@ class AccountClient:
             raise AccountError("invalid_room_list")
         return data
 
-    def validate_room(self, token, expected_employee=None):
+    def _private_room(self, token, expected_employee=None):
         encoded = self._token(token)
         uid = self.identity()
         path = "/ocs/v2.php/apps/spreed/api/v4/room/" + encoded
@@ -141,7 +154,95 @@ class AccountClient:
         if expected_employee is not None and employee != expected_employee:
             raise AccountError("room_employee_changed")
         self._employees[token] = employee
-        return {"token": token, "type": 1, "employee_id": employee, "service_id": uid}
+        return {"token": token, "type": 1, "employee_id": employee, "service_id": uid}, people
+
+    def validate_room(self, token, expected_employee=None):
+        return self._private_room(token, expected_employee)[0]
+
+    def validate_room_with_profile(self, token, expected_employee=None):
+        """Return room authorization and profile from the same fresh roster read."""
+        checked, people = self._private_room(token, expected_employee)
+        return checked, _employee_profile(checked, people)
+
+    def get_employee_profile(self, room, expected_employee=None):
+        """Read only the authenticated personal-room identity, never workstation data.
+
+        Nextcloud UID/displayName are not proof of a Windows login, Windows full
+        name or computer hostname. A missing display name stays empty.
+        """
+        checked, people = self._private_room(room, expected_employee)
+        return _employee_profile(checked, people)
+
+    def _talk_features(self):
+        if self._features is None:
+            data, _, _ = self._request("GET", "/ocs/v2.php/cloud/capabilities")
+            try:
+                features = data["capabilities"]["spreed"]["features"]
+            except (KeyError, TypeError):
+                raise AccountError("invalid_talk_capabilities") from None
+            if (not isinstance(features, list) or len(features) > 1_000
+                    or any(not isinstance(item, str) or len(item) > 128 for item in features)):
+                raise AccountError("invalid_talk_capabilities")
+            self._features = frozenset(features)
+        return self._features
+
+    def supports_progress_cleanup(self):
+        """Do not post a temporary indicator unless the server can remove or edit it."""
+        try:
+            return bool(self._talk_features() & {"delete-messages", "edit-messages"})
+        except Exception:
+            # Optional progress must never prevent an actual support reply.
+            return False
+
+    def _progress_target(self, room, message_id, expected_employee):
+        # Only a bound employee conversation and this exact service-authored marker
+        # can be changed. Even moderator credentials cannot edit another message.
+        if not isinstance(expected_employee, str) or not expected_employee:
+            raise AccountError("progress_employee_missing")
+        number = sequence(message_id)
+        checked = self.validate_room(room, expected_employee=expected_employee)
+        data, _, status = self._request(
+            "GET", "/ocs/v2.php/apps/spreed/api/v1/chat/" + self._token(room), acceptable=(200, 304),
+            params={"lookIntoFuture": 1, "lastKnownMessageId": number, "limit": 1, "timeout": 0,
+                    "includeLastKnown": 1, "setReadMarker": 0, "noStatusUpdate": 1,
+                    "markNotificationsAsRead": 0},
+        )
+        if status != 200 or not isinstance(data, list) or len(data) != 1:
+            raise AccountError("progress_message_unavailable")
+        target = data[0]
+        if (not isinstance(target, dict) or sequence(target.get("id")) != number
+                or target.get("token") != room or target.get("actorType") != "users"
+                or target.get("actorId") != checked["service_id"]
+                or target.get("messageType") != "comment" or target.get("systemMessage")
+                or target.get("message") != PROGRESS_MESSAGE):
+            raise AccountError("progress_message_unavailable")
+        return number
+
+    def _change_progress(self, method, room, message_id, expected_employee, *, content=None):
+        try:
+            capability = "delete-messages" if method == "DELETE" else "edit-messages"
+            if capability not in self._talk_features():
+                return False
+            number = self._progress_target(room, message_id, expected_employee)
+            # Roster changes after reading the marker must not turn into a write.
+            self.validate_room(room, expected_employee=expected_employee)
+            arguments = {} if method == "DELETE" else {"json": {"message": content}}
+            self._request(method, "/ocs/v2.php/apps/spreed/api/v1/chat/" + self._token(room)
+                          + "/" + str(number), acceptable=(200, 202), **arguments)
+            return True
+        except Exception:
+            # Includes network ambiguity: no automatic retry, no repeated marker.
+            return False
+
+    def delete_message(self, room, message_id, *, expected_employee=None):
+        """Best-effort removal of our exact temporary progress marker, never history."""
+        return self._change_progress("DELETE", room, message_id, expected_employee)
+
+    def edit_message(self, room, message_id, content, *, expected_employee=None):
+        """Replace only our progress marker when deletion is unavailable or denied."""
+        if content != "Обработка завершена.":
+            return False
+        return self._change_progress("PUT", room, message_id, expected_employee, content=content)
 
     def messages(self, token, cursor, limit=None):
         encoded = self._token(token)

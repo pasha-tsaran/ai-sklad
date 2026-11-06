@@ -15,6 +15,8 @@ from app.models import (
 from app.models.talk import TalkAccount, TalkInbox, TalkRoom
 from app.schemas.contracts import AnalysisResult, DialogueResult, EscalationDetails
 from app.services.chat.audit import audit
+from app.services.chat.channel_profile import channel_profile, remember_computer
+from app.services.nextcloud.progress import start_progress
 from app.services.chat.memory import load_context, remember_resolution
 from app.services.chat.messages import append_message
 from app.services.chat.policies import FORM_ACTION, MAX_ATTEMPTS, TERMINAL_STATES, direct_intent
@@ -32,9 +34,7 @@ from integrations.openwebui.automatic_instruction_images import (
 
 UNAVAILABLE = "Сейчас не удалось проверить базу знаний. Повторите вопрос немного позже или напишите «оператор»."
 CHANGED = "Инструкция изменилась или доступ к ней недоступен. Продолжение приостановлено до проверки актуального источника."
-FORM_HELP = ("Напишите как вас зовут, ваш рабочий логин, имя компьютера и суть проблемы — "
-             "можно своими словами, без подписей полей.\n\n"
-             "Чтобы продолжить с ботом без оформления письма, напишите «Отмена» или «2».")
+FORM_CARD_HEADER = "Данные профиля Nextcloud"
 ESCALATION_MENU = ("Как продолжим?\n1 — оформить письмо в техническую поддержку.\n"
                    "2 — продолжить диалог с ботом.\n\nМожно ответить цифрой или словами. Заявка пока не отправлена.")
 RESUME_GUIDE = ("Продолжим с ботом с того же шага. Заявка не отправлена. "
@@ -44,7 +44,7 @@ INTAKE_QUESTIONS = {
     "account_holder_name": "Как вас зовут?",
     "account_login": "Какой у вас рабочий логин?",
     "computer_name": "Как называется ваш рабочий компьютер?",
-    "subject": "В чём нужна помощь? Кратко опишите проблему.",
+    "subject": "Кратко опишите, с чем нужна помощь. Если нужно, добавьте подробности.",
     "additional_info": "Напишите дополнительное описание короче — до 2000 символов.",
 }
 CLARIFY_QUESTIONS = {
@@ -70,6 +70,7 @@ class Turn:
     analysis: AnalysisResult | None = None
     details: EscalationDetails | None = None
     resume: dict | None = None
+    confirmed_computer: str | None = None
 
 
 class _TimedProxy:
@@ -100,18 +101,51 @@ def _report_timing(metadata, started, route, block_count, error_code=None):
         pass  # Diagnostics never change the stored employee reply.
 
 
-def _intake_turn(message, flow, llm):
+def _prefill_intake(flow, context):
     updated = copy.deepcopy(flow)
     escalation = updated.get("escalation", {})
     fields = copy.deepcopy(escalation.get("intake_fields", {}))
+    if not escalation.get("profile_prefilled"):
+        profile = context.get("channel_profile", {})
+        for key in ("account_holder_name", "account_login", "computer_name"):
+            value = profile.get(key)
+            if key not in fields and isinstance(value, str) and value.strip():
+                fields[key] = value.strip()
+        escalation = {**escalation, "profile_prefilled": True}
+        if not fields.get("computer_name"):
+            escalation["intake_requested_field"] = "computer_name"
+    updated["escalation"] = {**escalation, "intake_fields": fields}
+    return updated
+
+
+def _profile_form_request(flow, context):
+    updated = _prefill_intake(flow, context)
+    fields = updated["escalation"]["intake_fields"]
+    prompted = _intake_prompt(updated)
+    card = (FORM_CARD_HEADER + "\n"
+            + "ФИО: " + fields.get("account_holder_name", "Не определено") + "\n"
+            + "Логин: " + fields.get("account_login", "Не определён") + "\n"
+            + "Компьютер: " + fields.get("computer_name", "Не определён"))
+    text = (card + "\n\n" + prompted.blocks[0][0]
+            + "\n\nЕсли данные неверны, напишите исправление. Чтобы вернуться к боту, напишите «Отмена» или «2».")
+    return Turn("FORM_REQUEST", [(text, None)], flow=prompted.flow)
+
+
+def _intake_turn(message, flow, llm, context):
+    updated = _prefill_intake(flow, context)
+    escalation = updated["escalation"]
+    fields = copy.deepcopy(escalation["intake_fields"])
     result = parse_intake(message, fields, llm, requested_field=escalation.get("intake_requested_field"))
+    computer = result.fields.get("computer_name")
+    current_computer = context.get("channel_profile", {}).get("computer_name")
+    confirmed = computer if computer and (computer != fields.get("computer_name") or computer != current_computer) else None
     if result.details is not None:
-        return Turn("FORM", details=result.details)
+        return Turn("FORM", details=result.details, confirmed_computer=confirmed)
     missing = next((key for key in result.missing if key in INTAKE_QUESTIONS), None)
     updated["escalation"] = {**escalation, "stage": "FORM", "intake_fields": result.fields,
                              "intake_requested_field": missing}
     question = INTAKE_QUESTIONS[missing] if missing else "В чём нужна помощь? Кратко опишите проблему."
-    return Turn("REPLY", [(question, None)], flow=updated)
+    return Turn("REPLY", [(question, None)], flow=updated, confirmed_computer=confirmed)
 
 
 def _intake_prompt(flow):
@@ -119,7 +153,7 @@ def _intake_prompt(flow):
     escalation = updated.get("escalation", {})
     fields = escalation.get("intake_fields", {})
     missing = escalation.get("intake_requested_field")
-    if missing not in INTAKE_QUESTIONS:
+    if missing not in INTAKE_QUESTIONS or fields.get(missing):
         missing = next((key for key in INTAKE_QUESTIONS if key != "additional_info" and not fields.get(key)), "subject")
     updated["escalation"] = {**escalation, "stage": "FORM", "intake_requested_field": missing}
     return Turn("REPLY", [(INTAKE_QUESTIONS[missing], None)], flow=updated)
@@ -334,16 +368,17 @@ def _turn(message, flow, context, previous_pending, llm, knowledge, settings):
         if choice == "RESUME":
             return _resume_turn(flow, context, llm, knowledge)
         if choice == "FORM_REQUEST" or intent == "HUMAN":
-            if flow.get("escalation", {}).get("intake_fields"):
+            if flow.get("escalation", {}).get("profile_prefilled"):
                 return _intake_prompt(flow)
-            return Turn("FORM_REQUEST", [(FORM_HELP, None)])
+            return _profile_form_request(flow, context)
         if intent == "FEEDBACK" or is_confirmation(message):
-            return _intake_prompt(flow)
+            return (_intake_prompt(flow) if flow.get("escalation", {}).get("profile_prefilled")
+                    else _profile_form_request(flow, context))
         if reply := _simple_social(message):
             return Turn("REPLY", [(reply, None)])
         # Everything else here is employee data for the pending letter. It must
         # not be classified as chat or used to search for another instruction.
-        return _intake_turn(message, flow, llm)
+        return _intake_turn(message, flow, llm, context)
     if _return_to_bot(message):
         if flow.get("source"):
             return Turn("REPLY", [("Продолжим с ботом. Напишите, что не получается на текущем шаге, "
@@ -459,8 +494,10 @@ def _claim(factory, settings, account_id):
             room.flow = {key: value for key, value in (room.flow or {}).items() if key != "_processing"}
         previous = {"pending": incident.pending_action, "result": incident.result, "state": incident.state}
         inbox.status, inbox.tries, inbox.error_code = "RUNNING", inbox.tries + 1, None
+        start_progress(inbox)
         incident.pending_action, incident.version = "PROCESSING", incident.version + 1
         context = load_context(session, incident, settings)
+        context["channel_profile"] = channel_profile(room, incident.id)
         flow = copy.deepcopy(room.flow or {})
         room.flow = {**flow, "_processing": {"inbox_id": inbox.id, "tries": inbox.tries, "previous": previous}}
         return {"inbox_id": inbox.id, "room_id": room.id, "incident_id": incident.id, "version": incident.version,
@@ -536,6 +573,8 @@ def _finish(factory, turn, claimed, llm, settings):
         incident.result = claimed["previous"]["result"]
         room.flow = claimed["flow"]
         append_message(session, incident.id, "user", claimed["message"], "RECEIVED")
+        if turn.confirmed_computer:
+            remember_computer(room, incident.id, turn.confirmed_computer)
         pending = _attempt(session, incident)
         if turn.action in {"GUIDE", "RETRY_GUIDE"}:
             if turn.action == "RETRY_GUIDE" and pending:
@@ -601,7 +640,7 @@ def _finish(factory, turn, claimed, llm, settings):
         elif turn.action == "NO_KNOWLEDGE":
             room.flow = _offer_escalation(session, incident, "NO_KNOWLEDGE", turn.flow or room.flow, claimed["context"])
         elif turn.action == "FORM_REQUEST":
-            flow = copy.deepcopy(room.flow)
+            flow = copy.deepcopy(turn.flow if turn.flow is not None else room.flow)
             escalation = flow.get("escalation", {})
             flow["escalation"] = {**escalation, "stage": "FORM"}
             room.flow = flow

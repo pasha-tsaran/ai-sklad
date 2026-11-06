@@ -2,8 +2,6 @@
 
 import json
 import re
-from email import policy
-from email.parser import BytesParser
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -11,7 +9,7 @@ from sqlalchemy import func, select
 
 from app import talk_worker
 from app.core.config import Settings, get_settings
-from app.models import Delivery, Escalation, Job, MessageAttachment
+from app.models import Delivery, Escalation, Job, Message, MessageAttachment
 from app.services.rag.talk import TalkKnowledge
 from app.services.mail.draft import make_mailto
 from app.workers.handlers import run_one
@@ -48,43 +46,63 @@ def test_mailto_configuration_needs_only_real_configured_recipient_and_no_smtp_c
 def test_complete_private_form_creates_exact_mail_draft_and_never_queues_smtp(talk, extra):
     talk.settings.mail_backend, talk.settings.support_email = "mailto", "operator@example.net"
     knowledge = Knowledge()
-    for sequence, content in enumerate([
-        QUESTION, "оператор", "1",
-        "ФИО: Иванов Иван Иванович\nЛогин: ivanov\nКомпьютер: WS-001\n"
-        "Тема: Сканер не работает\nОписание: " + extra,
-    ], 1):
+    for sequence, content in enumerate([QUESTION, "оператор", "1"], 1):
         talk.incoming(content, sequence)
         assert talk.process(knowledge)
     with talk.env.factory() as session:
+        original_photos = {row.id: (row.data, row.content_type, row.caption, row.sha256)
+                           for row in session.scalars(select(MessageAttachment))}
+        source_tags = {row.message_id: (row.account_id, row.provenance)
+                       for row in session.scalars(select(Delivery))}
+    assert original_photos
+    talk.incoming("ФИО: Иванов Иван Иванович\nЛогин: ivanov\nКомпьютер: WS-001\n"
+                  "Тема: Сканер не работает\nОписание: " + extra, 4)
+    assert talk.process(knowledge)
+    with talk.env.factory() as session:
         escalation = session.scalar(select(Escalation))
         assert escalation.status == "DRAFT" and escalation.sent_at is None
+        assert escalation.email["subject"] == "[AI-Support] Сканер не работает"
+        assert escalation.incident_id not in escalation.email["subject"]
+        assert escalation.id not in escalation.email["subject"]
         assert session.scalar(select(func.count()).select_from(Job).where(Job.kind == "SEND_MAIL")) == 0
         drafts = session.scalars(select(MessageAttachment).where(MessageAttachment.content_type == "message/rfc822")).all()
-        assert len(drafts) == 1
-        parsed = BytesParser(policy=policy.default).parsebytes(drafts[0].data)
-        assert parsed["To"] == "operator@example.net" and parsed["X-Unsent"] == "1"
-        assert parsed["From"] is None and "Сканер не работает" in str(parsed["Subject"])
-        body = parsed.get_content()
+        assert drafts == []
+        assert {row.id: (row.data, row.content_type, row.caption, row.sha256)
+                for row in session.scalars(select(MessageAttachment))} == original_photos
+        deliveries = {row.message_id: row for row in session.scalars(select(Delivery))}
+        assert all((deliveries[key].account_id, deliveries[key].provenance) == value
+                   for key, value in source_tags.items())
+        body = escalation.email["body"]
         for expected in ["Иванов Иван Иванович", "ivanov", "WS-001", extra, QUESTION]:
             assert expected in body
-        delivery = session.scalar(select(Delivery).where(Delivery.message_id == drafts[0].message_id))
+        preview_message = session.scalar(select(Message).where(
+            Message.content.startswith("Подготовлено письмо для технической поддержки."),
+        ))
+        delivery = deliveries[preview_message.id]
         assert delivery.account_id == talk.account_id and delivery.provenance is None
         expected_link = make_mailto(escalation.email, "operator@example.net")
     replies = [text for role, text, photo in talk.snapshot()["messages"] if role == "assistant"]
     assert any("Подготовлено письмо для технической поддержки." in text and "Кому: operator@example.net" in text for text in replies)
     assert not any("Письмо поставлено в очередь" in text for text in replies)
     text = next(text for text in replies if "Подготовлено письмо для технической поддержки." in text)
-    link = re.search(r"\[Открыть письмо в почте\]\((mailto:[^)]+)\)", text)
+    rendered = re.search(r"(`{3,})\n(.*?)\n\1", text, re.S)
+    assert rendered and rendered.group(2) + "\n" == (
+        "Кому: operator@example.net\nТема: [AI-Support] Сканер не работает\n\n" + body
+    )
+    link = re.search(r"\[[^\]]+\]\((mailto:[^)]+)\)", text)
+    assert link is not None
+    uri = urlsplit(link.group(1))
+    assert uri.path == "operator@example.net"
+    fields = parse_qs(uri.query, keep_blank_values=True)
+    assert fields["subject"] == ["[AI-Support] Сканер не работает"]
     if expected_link:
-        assert link is not None
-        uri = urlsplit(link.group(1))
-        assert uri.path == "operator@example.net"
-        fields = parse_qs(uri.query)
+        assert link.group(1) == expected_link
         for expected in ["Иванов Иван Иванович", "ivanov", "WS-001", extra]:
             assert expected in fields["body"][0]
         assert QUESTION in fields["body"][0]
     else:
-        assert link is None  # Long form stays complete in EML instead of being truncated into a URI.
+        assert fields["body"] == [""]
+        assert "Письмо длинное: скопируйте текст письма выше" in text
 
 
 def test_cancel_before_form_does_not_create_any_mail_artifact_or_send_job(talk):

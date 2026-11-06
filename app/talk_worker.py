@@ -17,6 +17,7 @@ from app.services.llm.openwebui import OpenWebUILLM
 from app.services.nextcloud.account import AccountClient, AccountError
 from app.services.nextcloud.delivery import deliver_one
 from app.services.nextcloud.poller import poll_once
+from app.services.nextcloud.progress import recover_progress, tick_progress
 
 LOCK_ID = 73412063  # Separate from the main worker and read-only PostgreSQL lock test.
 
@@ -87,6 +88,7 @@ def run(settings, *, once=False):
         if not guard.scalar(text("SELECT pg_try_advisory_lock(:key)"), {"key": LOCK_ID}):
             raise RuntimeError("TalkAccountWorkerAlreadyRunning")
         recover(factory, settings, service_id)
+        recover_progress(factory, settings, service_id)
         event("talk.started", mode="account", private_only=True, llm=llm.name)
         if once:
             poll_once(factory, settings)
@@ -98,8 +100,9 @@ def run(settings, *, once=False):
                     break
             return
         # Slow model calls cannot pause room discovery or the preceding text/photo deliveries.
-        with ThreadPoolExecutor(max_workers=2, thread_name_prefix="talk") as pool:
-            polling = processing = None
+        progress_client = AccountClient(settings)
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="talk") as pool:
+            polling = processing = progressing = None
             next_poll = 0.0
             while True:
                 guard.execute(text("SELECT 1"))  # Exit if the singleton lock's session is lost.
@@ -116,12 +119,20 @@ def run(settings, *, once=False):
                     except Exception as exc:
                         event("talk.process_error", error_code=error_code(exc))
                     processing = None
+                if progressing is not None and progressing.done():
+                    try:
+                        progressing.result()
+                    except Exception:
+                        pass  # Optional status updates never stop support delivery.
+                    progressing = None
                 if polling is None and time.monotonic() >= next_poll:
                     polling = pool.submit(poll_once, factory, settings)
                 if processing is None:
                     account_id = current_account(factory, settings, service_id)
                     if account_id:
                         processing = pool.submit(process_one, factory, settings, llm, account_id=account_id)
+                if progressing is None:
+                    progressing = pool.submit(tick_progress, factory, settings, progress_client)
                 deliver_one(factory, settings, delivery_client)
                 time.sleep(0.5)
 

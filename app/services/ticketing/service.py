@@ -1,4 +1,5 @@
 import json
+import unicodedata
 from datetime import timezone
 
 from fastapi import HTTPException
@@ -8,9 +9,8 @@ from app.models import Escalation, Message, SolutionAttempt, new_id, now
 from app.services.chat.audit import audit
 from app.services.chat.policies import FORM_ACTION
 from app.services.chat.service import add_user_message, enqueue, get_owned, messenger
-from app.services.mail.draft import make_eml, make_mailto
+from app.services.mail.draft import make_mailto
 from app.services.mail.presentation import letter_preview
-from app.services.rag.documents import Illustration
 
 
 def collect_details(session, user_id, incident_id, details, settings):
@@ -57,7 +57,7 @@ def collect_details(session, user_id, incident_id, details, settings):
         details=data,
         email={
             "to": settings.support_email,
-            "subject": f"[AI-Support {incident.id}] {details.subject}",
+            "subject": f"[AI-Support] {details.subject}",
             "message_id": f"<{escalation_id}@ai-support.local>",
             "body": body,
         },
@@ -77,9 +77,14 @@ def collect_details(session, user_id, incident_id, details, settings):
             f"Компьютер: {details.computer_name}\nТема: {details.subject}\n"
             f"Описание: {details.additional_info}\n"
         )
+        # Inbound chat can contain invisible control characters that mail clients
+        # cannot represent. Keep the original report in history and its readable
+        # words/line breaks in the draft instead of failing the whole intake.
+        problem = "".join(char if unicodedata.category(char) != "Cc" or char in "\r\n\t" else " "
+                          for char in (incident.description or ""))
         draft = {**escalation.email, "body": (
             entered_fields
-            + (f"\nИсходная проблема:\n{incident.description}\n" if incident.description else "")
+            + (f"\nИсходная проблема:\n{problem}\n" if problem else "")
         )}
         escalation.email = draft
         link = make_mailto(draft, settings.support_email)
@@ -89,15 +94,22 @@ def collect_details(session, user_id, incident_id, details, settings):
         )
         if link:
             explanation += "\n\n[Открыть письмо в почте](" + link + ")"
+        else:
+            # Some mail clients reject long URIs. Preserve the whole letter in
+            # the visible preview rather than silently shortening it or sending a file.
+            link = make_mailto({**draft, "body": ""}, settings.support_email)
+            if link:
+                explanation += ("\n\n[Открыть почту](" + link + ")\n"
+                                "Письмо длинное: скопируйте текст письма выше в открывшееся окно почты.")
+            else:
+                link = make_mailto({"subject": "[AI-Support]", "body": ""}, settings.support_email)
+                explanation += ("\n\n[Открыть почту](" + link + ")\n"
+                                "Скопируйте полную тему и текст письма выше в открывшееся окно почты.")
         explanation += (
-            "\n\nПроверьте письмо и отправьте его из своей почтовой программы. "
-            "Файл письма .eml придёт отдельным сообщением — его тоже можно открыть в почте.\n"
+            "\n\nНажмите ссылку, проверьте письмо и отправьте его из своей почтовой программы.\n"
             "Чтобы вернуться к боту, напишите «Продолжить с ботом»."
         )
-        messenger.send_blocks(session, incident.id, [
-            (explanation, Illustration("support-request.eml", "Письмо для технической поддержки", "message/rfc822",
-                                       make_eml(draft, settings.support_email))),
-        ])
+        messenger.send_blocks(session, incident.id, [(explanation, None)])
         escalation.status = "DRAFT"
         audit(session, incident.id, "escalation.draft_prepared", escalation_id=escalation.id)
         return {"incident_id": incident.id, "escalation_id": escalation.id, "operation_id": None,
