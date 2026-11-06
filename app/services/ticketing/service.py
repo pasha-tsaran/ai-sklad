@@ -8,6 +8,8 @@ from app.models import Escalation, Message, SolutionAttempt, new_id, now
 from app.services.chat.audit import audit
 from app.services.chat.policies import FORM_ACTION
 from app.services.chat.service import add_user_message, enqueue, get_owned, messenger
+from app.services.mail.draft import make_eml, make_mailto
+from app.services.rag.documents import Illustration
 
 
 def collect_details(session, user_id, incident_id, details, settings):
@@ -66,6 +68,39 @@ def collect_details(session, user_id, incident_id, details, settings):
     incident.result = "ESCALATE"
     incident.closed_at = now()
     incident.version += 1
+    if settings.mail_backend == "mailto":
+        # Complete user-entered fields go to the employee's own mail client.
+        # This mode never queues SMTP or claims the employee pressed Send.
+        entered_fields = (
+            f"ФИО: {details.account_holder_name}\nЛогин: {details.account_login}\n"
+            f"Компьютер: {details.computer_name}\nТема: {details.subject}\n"
+            f"Описание: {details.additional_info}\n"
+        )
+        draft = {**escalation.email, "body": (
+            entered_fields
+            + (f"\nИсходная проблема:\n{incident.description}\n" if incident.description else "")
+        )}
+        link = make_mailto({**draft, "body": entered_fields}, settings.support_email)
+        explanation = (
+            "Черновик письма подготовлен. Получатель: " + settings.support_email + ".\n"
+            "Откройте письмо в своей почтовой программе, проверьте данные и нажмите «Отправить». "
+            "Пока письмо не отправлено."
+        )
+        if link:
+            explanation += "\n\n[Открыть письмо](" + link + ")"
+        explanation += (
+            "\n\nТакже подготовлен файл support-request-….eml со всеми данными и исходной проблемой для отдельного сообщения. "
+            "Если ссылка не открывает почту, откройте этот файл в своей почтовой программе.\n"
+            "Чтобы вернуться к боту, напишите «Продолжить с ботом»."
+        )
+        messenger.send_blocks(session, incident.id, [
+            (explanation, Illustration("support-request.eml", "Черновик письма в поддержку", "message/rfc822",
+                                       make_eml(draft, settings.support_email))),
+        ])
+        escalation.status = "DRAFT"
+        audit(session, incident.id, "escalation.draft_prepared", escalation_id=escalation.id)
+        return {"incident_id": incident.id, "escalation_id": escalation.id, "operation_id": None,
+                "draft_prepared": True, "mail_sent": False}
     job = enqueue(session, incident, "SEND_MAIL")
     messenger.send(
         session,

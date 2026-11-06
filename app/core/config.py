@@ -29,7 +29,7 @@ class Settings(BaseSettings):
     nextcloud_files_username: str = ""
     nextcloud_files_app_password: SecretStr = SecretStr("")
     integration_timeout_seconds: float = Field(default=20, gt=0, le=120)
-    mail_backend: Literal["mock", "smtp"] = "mock"
+    mail_backend: Literal["mock", "smtp", "mailto"] = "mock"
     smtp_host: str = ""
     smtp_port: int = Field(default=587, ge=1, le=65535)
     smtp_security: Literal["starttls", "ssl"] = "starttls"
@@ -81,6 +81,14 @@ class Settings(BaseSettings):
             for address in (self.smtp_from, self.support_email):
                 if "@" not in address or any(c in address for c in "\r\n,;"):
                     raise ValueError("Configure a single valid mailbox address")
+        if self.mail_backend == "mailto":
+            from app.services.mail.draft import validate_recipient
+
+            validate_recipient(self.support_email)
+            if self.support_email.casefold().endswith(".invalid"):
+                raise ValueError("Mail drafts require a real SUPPORT_EMAIL recipient")
+            if self.nextcloud_backend == "talk":
+                raise ValueError("Mail drafts require account-mode Talk or the local API")
         return self
 
 

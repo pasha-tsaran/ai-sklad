@@ -252,8 +252,11 @@ def deliver_one(factory, settings, client=None):
 
                 if not TalkKnowledge(settings).is_current(provenance):
                     raise ValueError("ApprovedInstructionChanged")
-            remote_id = (sender.send_image(room, content, message_id, attachment, expected_employee=expected_employee)
-                         if attachment else sender.send(room, content, message_id, expected_employee=expected_employee))
+            if attachment:
+                method = sender.send_file if attachment.content_type == "message/rfc822" else sender.send_image
+                remote_id = method(room, content, message_id, attachment, expected_employee=expected_employee)
+            else:
+                remote_id = sender.send(room, content, message_id, expected_employee=expected_employee)
         else:
             sender = client or TalkClient(settings)
             remote_id = (sender.send_image(room, content, message_id, attachment) if attachment

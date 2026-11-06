@@ -192,12 +192,26 @@ class AccountClient:
                 or attachment.content_type != "image/png"
                 or hashlib.sha256(raw).hexdigest() != attachment.sha256):
             raise AccountError("invalid_illustration_snapshot")
+        return self._share_attachment(room, content, message_id, attachment, checked, ".png")
+
+    def send_file(self, room, content, message_id, attachment, *, expected_employee=None):
+        """Share only a server-generated immutable mail draft in the same private DM."""
+        checked = self.validate_room(room, expected_employee=expected_employee)
+        raw = attachment.data
+        if (not isinstance(raw, bytes) or not raw or len(raw) > 2_000_000
+                or attachment.content_type != "message/rfc822" or not attachment.filename.endswith(".eml")
+                or hashlib.sha256(raw).hexdigest() != attachment.sha256):
+            raise AccountError("invalid_mail_draft_snapshot")
+        return self._share_attachment(room, content, message_id, attachment, checked, ".eml")
+
+    def _share_attachment(self, room, content, message_id, attachment, checked, extension):
+        raw = attachment.data
         folder = "AI-Support-" + hashlib.sha256(room.encode()).hexdigest()[:24]
-        filename = hashlib.sha256(message_id.encode()).hexdigest() + ".png"
+        filename = ("support-request-" if extension == ".eml" else "") + hashlib.sha256(message_id.encode()).hexdigest() + extension
         dav = "/remote.php/dav/files/" + quote(checked["service_id"], safe="") + "/" + folder
         self._request("MKCOL", dav, ocs=False, acceptable=(201, 405))
         self._request("PUT", dav + "/" + filename, ocs=False, acceptable=(201, 204), content=raw,
-                      headers={"Content-Type": "image/png"})
+                      headers={"Content-Type": attachment.content_type})
         # Sharing reveals the file. Recheck after upload, immediately before that POST.
         self.validate_room(room, expected_employee=checked["employee_id"])
         data, _, _ = self._request("POST", "/ocs/v2.php/apps/files_sharing/api/v1/shares",

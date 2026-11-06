@@ -18,7 +18,8 @@ FILENAME = "05_Acrobat — PDF с картинками не печатается
 QUERY = "Acrobat PDF с картинками не печатается"
 
 
-def provider(*, data=None, filename=FILENAME, chunks=None, retrieval_status=200, revoked=False, query_results=None):
+def provider(*, data=None, filename=FILENAME, chunks=None, retrieval_status=200, revoked=False, query_results=None,
+             paginated=False, metadata_only=False):
     data = data if data is not None else instruction(["Нажмите «Дополнительно» и включите «Печатать как изображение»."])
     state = {"data": data, "files": [{"id": DOC, "filename": filename}], "collections": 0, "calls": []}
 
@@ -28,10 +29,15 @@ def provider(*, data=None, filename=FILENAME, chunks=None, retrieval_status=200,
         assert request.url.host == "webui.example.invalid"
         if request.url.path == "/api/v1/knowledge/" + KB:
             state["collections"] += 1
-            return httpx.Response(200, json={"files": [] if revoked and state["collections"] > 1 else state["files"]})
+            files = None if paginated else [{"id": DOC, "meta": {}}] if metadata_only else state["files"]
+            return httpx.Response(200, json={"files": [] if revoked and state["collections"] > 1 else files})
+        if request.url.path == "/api/v1/knowledge/" + KB + "/files":
+            return httpx.Response(200, json={"items": state["files"], "total": len(state["files"]),
+                                             "directories": [], "breadcrumbs": []})
         if request.url.path == "/api/v1/retrieval/query/collection":
             payload = json.loads(request.content)
             assert payload["collection_names"] == [KB] and payload["k"] == 8
+            assert payload["hybrid"] is False
             if retrieval_status != 200:
                 return httpx.Response(retrieval_status, json={"error": "temporary"})
             found = chunks if chunks is not None else [(DOC, "Acrobat PDF с картинками не печатается: печать как изображение.")]
@@ -62,6 +68,31 @@ def test_native_scoped_retrieval_reads_the_same_docx_text_and_pixels_as_webui_to
                                             "sha256": hashlib.sha256(state["data"]).hexdigest()}
     assert approved.candidate.source["original_sha256"] == approved.document["source"]["sha256"]
     assert all("/chat/completions" not in str(request.url) for request in state["calls"])
+
+
+@pytest.mark.parametrize("mode", ["files-null", "metadata-only-list"])
+def test_real_v011_metadata_uses_scoped_file_listing_and_still_returns_original_photos(mode):
+    knowledge, state = provider(paginated=mode == "files-null", metadata_only=mode == "metadata-only-list")
+    approved = knowledge.search(QUERY)
+    assert approved.document["source"]["filename"] == FILENAME and len(approved.illustrations) == 1
+    expected = read_docx_images(state["data"])[0]
+    assert approved.illustrations[1].data == expected.data
+    assert sum(request.url.path.endswith("/files") for request in state["calls"]) == 2
+    assert knowledge.check(QUERY) == {"status": "ok", "read_only": True, "knowledge_collections": 1,
+                                  "approved_files": 1, "instruction_found": True, "illustrations": 1}
+
+
+def test_retrieval_http_failure_reports_safe_stage_and_status_without_private_response(caplog):
+    knowledge, _ = provider(retrieval_status=403)
+    with caplog.at_level("INFO", logger="ai-support"):
+        with pytest.raises(KnowledgeUnavailable) as captured:
+            knowledge.search(QUERY)
+    assert (captured.value.code, captured.value.stage, captured.value.http_status) == ("HTTPError", "retrieval", 403)
+    fields = next(record.fields for record in caplog.records if record.message == "talk.knowledge_error")
+    assert fields == {"stage": "retrieval", "error_code": "HTTPError", "http_status": 403}
+    assert "test-key" not in str(fields) and "temporary" not in str(fields) and QUERY not in str(fields)
+    assert knowledge.check() == {"status": "error", "read_only": True, "stage": "retrieval",
+                                  "error_code": "HTTPError", "http_status": 403}
 
 
 def test_explicit_original_read_checks_approved_membership_before_and_after():

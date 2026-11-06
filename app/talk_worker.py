@@ -129,12 +129,19 @@ def run(settings, *, once=False):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Personal Nextcloud Talk account connector")
     parser.add_argument("--check", action="store_true", help="Check account and private rooms without sending")
+    parser.add_argument("--check-knowledge", action="store_true", help="Read approved knowledge and photos without sending")
     parser.add_argument("--once", action="store_true", help="Run one real poll/process/delivery cycle")
     args = parser.parse_args(argv)
     configure_logging()
     try:
         settings = get_settings()
-        if args.check:
+        if args.check_knowledge:
+            from app.services.rag.talk import TalkKnowledge
+
+            result = TalkKnowledge(settings).check()
+            print(json.dumps(result, ensure_ascii=False))
+            return 0 if result["status"] == "ok" else 1
+        elif args.check:
             print(json.dumps(check_connection(settings), ensure_ascii=False))
         else:
             run(settings, once=args.once)

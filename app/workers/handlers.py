@@ -386,6 +386,8 @@ def clarify(factory, job_id, llm, settings):
 
 
 def send_mail(factory, job_id, llm, settings):
+    if settings.mail_backend == "mailto":
+        return  # This mode never submits old queued mail, even through a direct caller.
     with factory() as session:
         job = session.get(Job, job_id)
         escalation = session.scalar(select(Escalation).where(Escalation.incident_id == job.incident_id))
@@ -441,9 +443,11 @@ def send_mail(factory, job_id, llm, settings):
 def run_one(factory, llm, settings):
     """One job; caller must hold the singleton worker lock in production."""
     with factory() as session, session.begin():
+        query = select(Job).where(Job.status == "PENDING")
+        if settings.mail_backend == "mailto":
+            query = query.where(Job.kind != "SEND_MAIL")
         job = session.scalar(
-            select(Job)
-            .where(Job.status == "PENDING")
+            query
             .order_by(Job.created_at, Job.id)
             .limit(1)
             .with_for_update(skip_locked=True)

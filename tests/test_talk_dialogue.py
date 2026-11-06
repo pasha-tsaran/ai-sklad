@@ -12,7 +12,9 @@ from app.core.config import Settings
 from app.models import Delivery, Escalation, Feedback, Incident, Job, Message, MessageAttachment, SolutionAttempt, now
 from app.models.talk import TalkAccount, TalkInbox, TalkRoom
 from app.schemas.contracts import AnalysisResult, DialogueResult
-from app.services.chat.talk_dialogue import CHANGED, CLARIFY_QUESTIONS, FORM_HELP, UNAVAILABLE, process_one
+from app.services.chat.talk_dialogue import (
+    BACK_TO_BOT, CHANGED, CLARIFY_QUESTIONS, ESCALATION_MENU, FORM_HELP, RESUME_GUIDE, UNAVAILABLE, process_one,
+)
 from app.services.llm.mock import MockLLM
 from app.services.rag.documents import Illustration
 from app.services.rag.interface import Candidate
@@ -485,7 +487,7 @@ def test_one_factual_clarification_preserves_original_problem_for_short_hp_answe
     talk.incoming("HP", 2)
     talk.process(knowledge, model)
     state = talk.snapshot()
-    assert model.inputs[-1] == original + "\nHP"
+    assert model.inputs == [original]  # The clarification now finds its source without another generation.
     assert knowledge.searches[-1][2] == original + "\nHP"
     assert len(state["attempts"]) == 1 and state["flow"]["query"] == original + "\nHP"
     assert state["incident"].description == original + "\nHP"
@@ -527,8 +529,8 @@ def test_per_turn_timing_reports_stages_without_query_or_identity(talk, monkeypa
     talk.process()
     name, timing = logged[-1]
     assert name == "talk.turn_completed" and timing["total_ms"] >= 0
-    assert timing["stage_calls"]["model_api"] == 1
-    assert all(timing["timings_ms"][stage] >= 0 for stage in ("model_api", "search", "verify", "route", "persist"))
+    assert timing["stage_calls"].get("model_api", 0) == 0
+    assert all(timing["timings_ms"][stage] >= 0 for stage in ("search", "verify", "route", "persist"))
     assert set(timing) == {"total_ms", "route", "timings_ms", "stage_calls", "block_count", "error_code"}
     assert QUESTION not in str(timing) and "employee" not in str(timing) and DOC not in str(timing)
 
@@ -601,7 +603,7 @@ def test_greeting_during_form_is_still_conversational_and_preserves_form(talk):
     talk.incoming("Как дела?", 2)
     talk.process()
     state = talk.snapshot()
-    assert "Как проходит" in assistants(state)[-1][0]
+    assert "Готов помочь" in assistants(state)[-1][0]
     assert state["incident"].pending_action == "COLLECT_ESCALATION_DETAILS"
 
 
@@ -635,3 +637,282 @@ def test_request_for_next_photos_continues_only_the_saved_remaining_group(talk):
     talk.incoming("Покажи следующие фото", 3)
     talk.process(knowledge)
     assert sum(picture is not None for _, picture in assistants(talk.snapshot())) == count
+
+
+class NoGeneration(MockLLM):
+    def __init__(self):
+        self.calls = []
+
+    def dialogue(self, *args):
+        self.calls.append("dialogue")
+        raise AssertionError("No model call is needed for this message")
+
+    def analyze_context(self, *args):
+        self.calls.append("analyze_context")
+        raise AssertionError("No model call is needed for this message")
+
+
+@pytest.mark.parametrize("message", ["Привет!", "Здравствуйте", "Добрый день", "Доброе утро!",
+                                     "Спасибо", "Большое спасибо!", "Как дела?"])
+def test_simple_greetings_and_thanks_are_fast_local_replies_without_generation_or_knowledge(talk, message):
+    model, knowledge = NoGeneration(), Knowledge()
+    talk.incoming(message)
+    talk.process(knowledge, model)
+    state = talk.snapshot()
+    assert len(assistants(state)) == 1 and not state["attempts"] and state["flow"] == {}
+    assert not model.calls and not knowledge.searches and not knowledge.reads and not knowledge.checks
+    assert state["incident"].pending_action is None and state["incident"].description == ""
+
+
+@pytest.mark.parametrize("message", ["Привет!", "Спасибо большое", "Как у тебя дела?"])
+def test_fast_social_reply_preserves_the_pending_instruction_and_support_description(talk, message):
+    model, knowledge = NoGeneration(), Knowledge()
+    talk.incoming(QUESTION)
+    talk.process(knowledge, model)
+    before = talk.snapshot()
+    talk.incoming(message, 2)
+    talk.process(knowledge, model)
+    after = talk.snapshot()
+    assert after["flow"] == before["flow"] and after["incident"].description == QUESTION
+    assert after["attempts"][0].id == before["attempts"][0].id
+    assert after["attempts"][0].status == "WAITING_FEEDBACK" and after["incident"].failed_attempts == 0
+    assert not model.calls and len(knowledge.searches) == 1
+
+
+def test_greeting_plus_full_technical_question_is_not_misclassified_as_a_greeting(talk):
+    model, knowledge = NoGeneration(), Knowledge()
+    talk.incoming("Здравствуйте! " + QUESTION)
+    talk.process(knowledge, model)
+    state = talk.snapshot()
+    assert len(state["attempts"]) == 1 and not model.calls
+    assert knowledge.searches[0][0] == "Здравствуйте! " + QUESTION
+    assert sum(picture is not None for _, picture in assistants(state)) == 6
+
+
+def test_direct_approved_search_precedes_analysis_and_fallback_ranks_the_actual_problem(talk):
+    class Fallback(Knowledge):
+        def search(self, query, excluded=(), fallback_query=None):
+            self.searches.append((query, tuple(excluded), fallback_query))
+            return self.documents[0] if query == "Сканер АДРЕС настройка" else None
+
+    class Reformulate(MockLLM):
+        calls = []
+
+        def analyze_context(self, message, context):
+            self.calls.append(message)
+            return AnalysisResult(intent="REPORT_PROBLEM", search_query="Сканер АДРЕС настройка")
+
+    model, knowledge = Reformulate(), Fallback()
+    talk.incoming(QUESTION)
+    talk.process(knowledge, model)
+    assert model.calls == [QUESTION]
+    assert knowledge.searches == [(QUESTION, (), QUESTION), ("Сканер АДРЕС настройка", (), QUESTION)]
+    assert len(talk.snapshot()["attempts"]) == 1
+
+
+def test_same_analysis_query_is_not_searched_twice_after_a_genuine_empty_result(talk):
+    knowledge = Knowledge()
+    knowledge.missing = True
+    talk.incoming(QUESTION)
+    talk.process(knowledge)
+    assert knowledge.searches == [(QUESTION, (), QUESTION)]
+    assert talk.snapshot()["flow"]["clarification_query"] == QUESTION
+
+
+def test_operator_offers_safe_choices_and_preserves_waiting_attempt_until_form_submission(talk):
+    knowledge, model = Knowledge(), NoGeneration()
+    talk.incoming(QUESTION)
+    talk.process(knowledge, model)
+    before = talk.snapshot()
+    talk.incoming("оператор", 2)
+    talk.process(knowledge, model)
+    state = talk.snapshot()
+    assert assistants(state)[-1] == (ESCALATION_MENU, None)
+    assert "|" not in assistants(state)[-1][0] and "1 —" in assistants(state)[-1][0] and "2 —" in assistants(state)[-1][0]
+    assert state["flow"]["escalation"]["resume"]["flow"] == before["flow"]
+    assert state["attempts"][0].status == "WAITING_FEEDBACK" and state["incident"].description == QUESTION
+    assert not model.calls and len(knowledge.searches) == 1
+    with talk.env.factory() as session:
+        assert session.scalar(select(func.count()).select_from(Escalation)) == 0
+        assert session.scalar(select(func.count()).select_from(Job).where(Job.kind == "SEND_MAIL")) == 0
+
+
+@pytest.mark.parametrize("message", ["Отмена", "Не хочу отправлять. Помоги ты мне", "продолжить диалог с ботом",
+                                     "2", "Назад"])
+def test_declining_escalation_restores_current_guide_and_paging_without_a_new_attempt_or_mail(talk, message):
+    knowledge, model = Knowledge(), NoGeneration()
+    talk.incoming(QUESTION)
+    talk.process(knowledge, model)
+    before = talk.snapshot()
+    talk.incoming("оператор", 2)
+    talk.process(knowledge, model)
+    talk.incoming(message, 3)
+    talk.process(knowledge, model)
+    state = talk.snapshot()
+    assert assistants(state)[-1] == (RESUME_GUIDE, None)
+    assert state["flow"] == before["flow"] and state["incident"].pending_action is None
+    assert state["incident"].state == "WAITING_FEEDBACK" and state["incident"].escalation_reason is None
+    assert state["attempts"][0].id == before["attempts"][0].id and state["attempts"][0].status == "WAITING_FEEDBACK"
+    assert len(knowledge.searches) == 1 and knowledge.reads == [DOC] and not model.calls
+    with talk.env.factory() as session:
+        assert session.scalar(select(func.count()).select_from(Escalation)) == 0
+        assert session.scalar(select(func.count()).select_from(Job).where(Job.kind == "SEND_MAIL")) == 0
+    talk.incoming("Готово", 4)
+    talk.process(knowledge, model)
+    after = talk.snapshot()
+    assert len(after["attempts"]) == 1 and not after["flow"]["has_more"]
+    assert sum(picture is not None for _, picture in assistants(after)) == 8
+
+
+@pytest.mark.parametrize("choice", ["1", "оформить письмо в поддержку", "Оставить заявку"])
+def test_form_is_requested_only_after_positive_menu_choice_and_can_still_be_cancelled(talk, choice):
+    talk.incoming("оператор")
+    talk.process()
+    talk.incoming(choice, 2)
+    talk.process()
+    state = talk.snapshot()
+    assert assistants(state)[-1] == (FORM_HELP, None) and state["flow"]["escalation"]["stage"] == "FORM"
+    assert state["incident"].pending_action == "COLLECT_ESCALATION_DETAILS"
+    with talk.env.factory() as session:
+        assert session.scalar(select(func.count()).select_from(Escalation)) == 0
+    talk.incoming("Отмена", 3)
+    talk.process()
+    state = talk.snapshot()
+    assert state["incident"].pending_action is None and state["flow"] == {}
+    assert "Опишите, с чем нужна помощь" in assistants(state)[-1][0]
+
+
+@pytest.mark.parametrize("change", ["hash", "revoked", "unavailable"])
+def test_cancel_does_not_restore_a_changed_or_unapproved_instruction(talk, change):
+    knowledge = Knowledge()
+    talk.incoming(QUESTION)
+    talk.process(knowledge)
+    talk.incoming("оператор", 2)
+    talk.process(knowledge)
+    before = talk.snapshot()
+    if change == "hash":
+        knowledge.documents[0].document["source"]["sha256"] = "b" * 64
+    elif change == "revoked":
+        knowledge.current = False
+    else:
+        knowledge.unavailable = True
+    talk.incoming("Отмена", 3)
+    talk.process(knowledge)
+    state = talk.snapshot()
+    assert state["incident"].pending_action is None and "source" not in state["flow"]
+    assert state["attempts"][0].status == "UNASSESSED"
+    assert sum(picture is not None for _, picture in assistants(state)) == 6
+    assert len(state["messages"]) == len(before["messages"]) + 2
+    assert (UNAVAILABLE if change == "unavailable" else CHANGED) in assistants(state)[-1][0]
+
+
+def test_unavailable_question_survives_operator_and_continue_without_searching_the_word_operator(talk):
+    knowledge, model = Knowledge(), NoGeneration()
+    knowledge.unavailable = True
+    talk.incoming(QUESTION)
+    talk.process(knowledge, model)
+    initial = talk.snapshot()
+    assert initial["flow"]["clarification_query"] == QUESTION and initial["incident"].description == QUESTION
+    assert not model.calls
+    talk.incoming("оператор", 2)
+    talk.process(knowledge, model)
+    knowledge.unavailable = False
+    talk.incoming("Не хочу отправлять. Помоги ты мне", 3)
+    talk.process(knowledge, model)
+    state = talk.snapshot()
+    assert knowledge.searches == [(QUESTION, (), QUESTION), (QUESTION, (), QUESTION)]
+    assert state["flow"]["query"] == QUESTION and state["incident"].pending_action is None
+    assert len(state["attempts"]) == 1 and not model.calls
+    assert state["incident"].description == QUESTION
+    assert [text for role, text, _ in state["messages"] if role == "user"] == [QUESTION, "оператор", "Не хочу отправлять. Помоги ты мне"]
+
+
+def test_legacy_form_without_resume_state_can_exit_and_retry_the_actual_prior_problem(talk):
+    knowledge = Knowledge()
+    knowledge.unavailable = True
+    talk.incoming(QUESTION)
+    talk.process(knowledge)
+    with talk.env.factory() as session, session.begin():
+        room = session.get(TalkRoom, talk.room_id)
+        room.flow = {}
+        session.get(Incident, room.incident_id).pending_action = "COLLECT_ESCALATION_DETAILS"
+    knowledge.unavailable = False
+    talk.incoming("Отмена", 2)
+    talk.process(knowledge)
+    state = talk.snapshot()
+    assert state["incident"].pending_action is None and len(state["attempts"]) == 1
+    assert knowledge.searches[-1][0] == QUESTION and state["flow"]["query"] == QUESTION
+
+
+@pytest.mark.parametrize("command", ["Продолжить с ботом", "Продолжить диалог с ботом", "Вернуться к боту", "2", "Отмена"])
+def test_return_to_bot_after_completed_draft_asks_for_a_fresh_question_without_model_or_delivery_claim(talk, command):
+    talk.settings.mail_backend, talk.settings.support_email = "mailto", "operator@example.net"
+    knowledge = Knowledge()
+    for sequence, content in enumerate([
+        QUESTION, "оператор", "1",
+        "ФИО: Иванов Иван Иванович\nЛогин: ivanov\nКомпьютер: WS-001\nТема: Сканер не работает",
+    ], 1):
+        talk.incoming(content, sequence)
+        talk.process(knowledge)
+    before = talk.snapshot()
+    assert before["incident"].state == "ESCALATED"
+    searches, reads, checks = len(knowledge.searches), len(knowledge.reads), len(knowledge.checks)
+    model = NoGeneration()
+    talk.incoming(command, 5)
+    talk.process(knowledge, model)
+    state = talk.snapshot()
+    assert assistants(state) == [(BACK_TO_BOT, None)] and state["flow"] == {} and not state["attempts"]
+    assert state["incident"].id != before["incident"].id and state["incident"].pending_action is None
+    assert not model.calls and (len(knowledge.searches), len(knowledge.reads), len(knowledge.checks)) == (searches, reads, checks)
+    assert "отправлен" not in assistants(state)[0][0] and "не отправлен" not in assistants(state)[0][0]
+    with talk.env.factory() as session:
+        assert session.get(Incident, before["incident"].id).state == "ESCALATED"
+        escalation = session.scalar(select(Escalation))
+        assert escalation.status == "DRAFT" and escalation.sent_at is None
+        assert session.scalar(select(func.count()).select_from(Escalation)) == 1
+        assert session.scalar(select(func.count()).select_from(Job).where(Job.kind == "SEND_MAIL")) == 0
+
+
+@pytest.mark.parametrize("command", ["Продолжить с ботом", "Вернуться к боту", "2", "Отмена"])
+def test_explicit_global_bot_return_preserves_active_guide_and_never_treats_it_as_a_search(talk, command):
+    knowledge, model = Knowledge(), NoGeneration()
+    talk.incoming(QUESTION)
+    talk.process(knowledge, model)
+    before = talk.snapshot()
+    talk.incoming(command, 2)
+    talk.process(knowledge, model)
+    state = talk.snapshot()
+    assert state["flow"] == before["flow"] and state["incident"].state == "WAITING_FEEDBACK"
+    assert state["attempts"][0].id == before["attempts"][0].id and state["attempts"][0].status == "WAITING_FEEDBACK"
+    assert len(assistants(state)) == len(assistants(before)) + 1 and "текущем шаге" in assistants(state)[-1][0]
+    assert not model.calls and len(knowledge.searches) == 1 and not knowledge.reads
+
+
+def test_bare_continue_still_advances_the_current_photos_instead_of_resetting_the_dialogue(talk):
+    knowledge, model = Knowledge(), NoGeneration()
+    talk.incoming(QUESTION)
+    talk.process(knowledge, model)
+    talk.incoming("Продолжить", 2)
+    talk.process(knowledge, model)
+    state = talk.snapshot()
+    assert not state["flow"]["has_more"] and state["flow"]["shown"] == [7, 8]
+    assert len(state["attempts"]) == 1 and sum(picture is not None for _, picture in assistants(state)) == 8
+    assert knowledge.reads == [DOC] and not model.calls
+
+
+def test_return_to_bot_after_resolution_does_not_reopen_the_resolved_incident(talk):
+    knowledge = Knowledge()
+    talk.incoming(QUESTION)
+    talk.process(knowledge)
+    talk.incoming("Помогло", 2)
+    talk.process(knowledge)
+    previous = talk.snapshot()
+    assert previous["incident"].state == "RESOLVED"
+    model = NoGeneration()
+    talk.incoming("Продолжить с ботом", 3)
+    talk.process(knowledge, model)
+    state = talk.snapshot()
+    assert state["incident"].id != previous["incident"].id and assistants(state) == [(BACK_TO_BOT, None)]
+    assert not model.calls and len(knowledge.searches) == 1
+    with talk.env.factory() as session:
+        assert session.get(Incident, previous["incident"].id).state == "RESOLVED"

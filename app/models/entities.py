@@ -220,7 +220,7 @@ class Delivery(Entity, Base):
 
 
 class MessageAttachment(Entity, Base):
-    """Immutable original illustration snapshot, one captioned photo per message."""
+    """Immutable original illustration or generated mail draft, one attachment per message."""
 
     __tablename__ = "message_attachments"
     message_id: Mapped[str] = mapped_column(ForeignKey("messages.id"), unique=True)

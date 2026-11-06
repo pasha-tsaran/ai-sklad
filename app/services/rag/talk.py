@@ -2,20 +2,54 @@
 
 import hashlib
 import json
+from contextlib import contextmanager
 from dataclasses import dataclass
 from urllib.parse import quote
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 import httpx
 
+from app.core.logging import event
 from app.services.rag.documents import Illustration, read_xlsx
 from app.services.rag.interface import Candidate
+from app.services.rag.knowledge_files import KnowledgeFilesError, list_knowledge_files
 from integrations.openwebui.approved_instruction_images import MAX_SOURCE_BYTES, MAX_TEXT_CHARS, read_docx_images, read_docx_text
 from integrations.openwebui.automatic_instruction_images import choose_search_source
 
 
 class KnowledgeUnavailable(ValueError):
     """A source or retrieval service could not be checked safely."""
+
+    def __init__(self, code, stage=None, http_status=None):
+        self.code = code if isinstance(code, str) and code.isascii() and code.replace("_", "").isalnum() else "KnowledgeError"
+        self.stage, self.http_status = stage, http_status
+        super().__init__(self.code)
+
+
+@contextmanager
+def knowledge_stage(stage):
+    try:
+        yield
+    except KnowledgeUnavailable as error:
+        error.stage = error.stage or stage
+        raise
+    except httpx.HTTPStatusError as error:
+        raise KnowledgeUnavailable("HTTPError", stage, error.response.status_code) from None
+    except httpx.TimeoutException:
+        raise KnowledgeUnavailable("RequestTimedOut", stage) from None
+    except httpx.RequestError:
+        raise KnowledgeUnavailable("RequestFailed", stage) from None
+    except KnowledgeFilesError as error:
+        raise KnowledgeUnavailable(str(error), stage) from None
+    except Exception as error:
+        raise KnowledgeUnavailable(type(error).__name__, stage) from None
+
+
+def report_failure(error):
+    try:
+        event("talk.knowledge_error", stage=error.stage, error_code=error.code, http_status=error.http_status)
+    except Exception:
+        pass  # Observability must never expose source contents or change the reply.
 
 
 @dataclass(frozen=True)
@@ -56,26 +90,36 @@ class TalkKnowledge:
             raise KnowledgeUnavailable("KnowledgeScopeNotConfigured")
         files = {}
         for collection in ids:
-            response = client.get(self.base + "/api/v1/knowledge/" + quote(collection, safe=""))
-            response.raise_for_status()
-            body = response.json()
-            if not isinstance(body, dict) or not isinstance(body.get("files"), list):
-                raise KnowledgeUnavailable("InvalidKnowledgeResponse")
-            if (body.get("meta") or {}).get("source") == "external":
-                raise KnowledgeUnavailable("ExternalKnowledgeNotApproved")
-            for item in body["files"]:
+            with knowledge_stage("knowledge_metadata"):
+                response = client.get(self.base + "/api/v1/knowledge/" + quote(collection, safe=""))
+                response.raise_for_status()
+                body = response.json()
+                if not isinstance(body, dict) or body.get("id", collection) != collection:
+                    raise KnowledgeUnavailable("InvalidKnowledgeResponse")
+                if (body.get("meta") or {}).get("source") == "external":
+                    raise KnowledgeUnavailable("ExternalKnowledgeNotApproved")
+                items = body.get("files")
+                if items is not None and not isinstance(items, list):
+                    raise KnowledgeUnavailable("InvalidKnowledgeResponse")
+            if items is None or any(isinstance(item, dict) and "filename" not in item for item in items):
+                # Open WebUI 0.11 GET metadata returns files:null. Fetch its
+                # scoped paginated file API, including files in subdirectories.
+                with knowledge_stage("knowledge_files"):
+                    items = list_knowledge_files(client, self.base, collection)
+            for item in items:
                 if isinstance(item, dict) and _employee_file(item):
                     files[item["id"]] = {**item, "knowledge_id": collection}
         return files
 
     def _original(self, client, file_id, suffix="content"):
         data = bytearray()
-        with client.stream("GET", self.base + "/api/v1/files/" + file_id + "/" + suffix) as response:
-            response.raise_for_status()
-            for block in response.iter_bytes():
-                data.extend(block)
-                if len(data) > min(self.settings.knowledge_max_file_bytes, MAX_SOURCE_BYTES):
-                    raise KnowledgeUnavailable("KnowledgeFileTooLarge")
+        with knowledge_stage("extracted_text" if suffix == "data/content" else "original_file"):
+            with client.stream("GET", self.base + "/api/v1/files/" + file_id + "/" + suffix) as response:
+                response.raise_for_status()
+                for block in response.iter_bytes():
+                    data.extend(block)
+                    if len(data) > min(self.settings.knowledge_max_file_bytes, MAX_SOURCE_BYTES):
+                        raise KnowledgeUnavailable("KnowledgeFileTooLarge")
         return bytes(data)
 
     def _read(self, client, file_id, files):
@@ -95,7 +139,8 @@ class TalkKnowledge:
         if extracted_pdf:
             pass
         elif filename.casefold().endswith(".docx"):
-            content, pictures = read_docx_text(original), read_docx_images(original)
+            with knowledge_stage("parse_document"):
+                content, pictures = read_docx_text(original), read_docx_images(original)
         elif filename.casefold().endswith(".xlsx"):
             content = read_xlsx(original)
         else:
@@ -134,10 +179,13 @@ class TalkKnowledge:
         try:
             with self._client() as client:
                 return self._read(client, file_id, self._files(client))
-        except KnowledgeUnavailable:
+        except KnowledgeUnavailable as error:
+            report_failure(error)
             raise
         except Exception as error:
-            raise KnowledgeUnavailable(type(error).__name__) from None
+            failure = KnowledgeUnavailable(type(error).__name__, "read")
+            report_failure(failure)
+            raise failure from None
 
     def search(self, query, excluded=(), fallback_query=None):
         """Use the native scoped search, never an autonomous model/tool selection."""
@@ -149,11 +197,13 @@ class TalkKnowledge:
                 queries = list(dict.fromkeys(q[:6000] for q in (query, fallback_query) if isinstance(q, str) and q.strip()))
                 problem = fallback_query if isinstance(fallback_query, str) and fallback_query.strip() else query
                 for text in queries[:2]:
-                    response = client.post(self.base + "/api/v1/retrieval/query/collection", json={
-                        "collection_names": list(self.settings.openwebui_knowledge_ids), "query": text, "k": 8,
-                    })
-                    response.raise_for_status()
-                    body = response.json()
+                    with knowledge_stage("retrieval"):
+                        response = client.post(self.base + "/api/v1/retrieval/query/collection", json={
+                            "collection_names": list(self.settings.openwebui_knowledge_ids), "query": text, "k": 8,
+                            "hybrid": False,
+                        })
+                        response.raise_for_status()
+                        body = response.json()
                     documents, metadata = body.get("documents"), body.get("metadatas")
                     if documents == [] and metadata == []:
                         continue
@@ -170,10 +220,13 @@ class TalkKnowledge:
                     if selected:
                         return self._read(client, selected, files)
                 return None
-        except KnowledgeUnavailable:
+        except KnowledgeUnavailable as error:
+            report_failure(error)
             raise
         except Exception as error:
-            raise KnowledgeUnavailable(type(error).__name__) from None
+            failure = KnowledgeUnavailable(type(error).__name__, "search")
+            report_failure(failure)
+            raise failure from None
 
     def is_current(self, source):
         if not isinstance(source, dict):
@@ -183,3 +236,17 @@ class TalkKnowledge:
             return current.document["source"] == source
         except KnowledgeUnavailable:
             return False
+
+    def check(self, query="Настройка сканера штрихкодов в 1С АДРЕС 1.0.53"):
+        """Read-only end-to-end check of scoped membership, search and original photos."""
+        try:
+            with self._client() as client:
+                count = len(self._files(client))
+            approved = self.search(query)
+            return {"status": "ok", "read_only": True,
+                    "knowledge_collections": len(self.settings.openwebui_knowledge_ids), "approved_files": count,
+                    "instruction_found": approved is not None,
+                    "illustrations": len(approved.illustrations) if approved else 0}
+        except KnowledgeUnavailable as error:
+            return {"status": "error", "read_only": True, "stage": error.stage,
+                    "error_code": error.code, "http_status": error.http_status}
