@@ -6,13 +6,13 @@ ENV PATH="/srv/ai-support/.venv/bin:$PATH"
 WORKDIR /srv/ai-support
 COPY pyproject.toml uv.lock ./
 COPY app ./app
+COPY integrations ./integrations
 RUN uv sync --frozen --no-dev --extra test --no-editable && useradd --uid 10001 --create-home support
 COPY alembic.ini ./
 COPY migrations ./migrations
 COPY sample_knowledge ./sample_knowledge
 COPY tests ./tests
 COPY scripts ./scripts
-COPY integrations ./integrations
 # Git checkout permissions can be restrictive (for example after umask 077).
 # Keep sources root-owned, but readable by the unprivileged runtime user.
 RUN chmod -R a+rX app migrations sample_knowledge tests scripts integrations && chmod a+r alembic.ini pyproject.toml uv.lock

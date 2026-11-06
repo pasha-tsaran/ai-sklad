@@ -26,13 +26,15 @@ def main():
             raise RuntimeError("Only one worker is supported in this MVP")
         with factory() as session, session.begin():
             session.execute(update(Job).where(Job.status == "RUNNING").values(status="PENDING"))
-            session.execute(update(Delivery).where(Delivery.status == "SENDING").values(status="UNKNOWN"))
+            if settings.nextcloud_backend != "account":
+                session.execute(update(Delivery).where(Delivery.status == "SENDING").values(status="UNKNOWN"))
             session.execute(update(Escalation).where(Escalation.status == "SENDING").values(status="UNKNOWN"))
-            session.execute(
-                update(Message)
-                .where(Message.id.in_(select(Delivery.message_id).where(Delivery.status == "UNKNOWN")))
-                .values(delivery_status="UNKNOWN")
-            )
+            if settings.nextcloud_backend != "account":
+                session.execute(
+                    update(Message)
+                    .where(Message.id.in_(select(Delivery.message_id).where(Delivery.status == "UNKNOWN")))
+                    .values(delivery_status="UNKNOWN")
+                )
         event(
             "worker.started", llm=llm.name, mail=settings.mail_backend, nextcloud=settings.nextcloud_backend
         )
@@ -40,7 +42,8 @@ def main():
             # Stop on connection loss instead of silently continuing without the lock.
             guard.execute(text("SELECT 1"))
             run_one(factory, llm, settings)
-            deliver_one(factory, settings)
+            if settings.nextcloud_backend != "account":
+                deliver_one(factory, settings)
             time.sleep(1)
 
 

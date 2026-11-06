@@ -59,7 +59,8 @@ def test_knowledge_missing_or_revoked(selected, revoked):
     assert OpenWebUIKnowledge(remote_settings(), transport).search("принтер", set()) == []
 
 
-@pytest.mark.parametrize("selected,content", [("invented", "text"), ("file-1", ""), ("file-1", "a" * 20001)])
+@pytest.mark.parametrize("selected,content", [("invented", "text"), ("file-1", ""), ("file-1", "a" * 200001)],
+                         ids=["foreign-file", "empty", "over-text-limit"])
 def test_knowledge_rejects_invalid_sources(selected, content):
     transport, _ = knowledge_transport(selected, content)
     with pytest.raises(ValueError):

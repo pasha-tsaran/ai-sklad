@@ -16,10 +16,14 @@ x-app: &app
     SEED_DEMO_KNOWLEDGE: ${SEED_DEMO_KNOWLEDGE:-false}
     KNOWLEDGE_BACKEND: ${KNOWLEDGE_BACKEND:-openwebui}
     OPENWEBUI_KNOWLEDGE_IDS: ${OPENWEBUI_KNOWLEDGE_IDS:-[]}
-    KNOWLEDGE_MAX_CHARS: ${KNOWLEDGE_MAX_CHARS:-20000}
-    KNOWLEDGE_MAX_FILE_BYTES: ${KNOWLEDGE_MAX_FILE_BYTES:-25000000}
+    KNOWLEDGE_MAX_CHARS: ${KNOWLEDGE_MAX_CHARS:-200000}
+    KNOWLEDGE_MAX_FILE_BYTES: ${KNOWLEDGE_MAX_FILE_BYTES:-30000000}
     NEXTCLOUD_BACKEND: ${NEXTCLOUD_BACKEND:-mock}
     NEXTCLOUD_BASE_URL: ${NEXTCLOUD_BASE_URL:-}
+    NEXTCLOUD_USERNAME: ${NEXTCLOUD_USERNAME:-}
+    NEXTCLOUD_APP_PASSWORD: ${NEXTCLOUD_APP_PASSWORD:-}
+    NEXTCLOUD_POLL_INTERVAL_SECONDS: ${NEXTCLOUD_POLL_INTERVAL_SECONDS:-3}
+    NEXTCLOUD_BATCH_SIZE: ${NEXTCLOUD_BATCH_SIZE:-100}
     NEXTCLOUD_BOT_SECRET: ${NEXTCLOUD_BOT_SECRET:-}
     NEXTCLOUD_ALLOWED_ROOMS: ${NEXTCLOUD_ALLOWED_ROOMS:-[]}
     NEXTCLOUD_FILES_USERNAME: ${NEXTCLOUD_FILES_USERNAME:-}
@@ -76,6 +80,15 @@ services:
   worker:
     <<: *app
     command: [python, -m, app.workers.main]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  talk:
+    <<: *app
+    profiles: [talk]
+    command: [python, -m, app.talk_worker]
     depends_on:
       migrate:
         condition: service_completed_successfully

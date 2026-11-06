@@ -20,6 +20,7 @@ from app.models.entities import (
     new_id,
     now,
 )
+from app.models.talk import TalkAccount, TalkInbox, TalkRoom
 
 __all__ = [
     "AuditEvent",
@@ -39,6 +40,9 @@ __all__ = [
     "ResolutionMemory",
     "Solution",
     "SolutionAttempt",
+    "TalkAccount",
+    "TalkInbox",
+    "TalkRoom",
     "User",
     "new_id",
     "now",

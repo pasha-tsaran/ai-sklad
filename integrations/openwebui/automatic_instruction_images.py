@@ -608,29 +608,40 @@ def procedure_image_groups(document, images):
     return [groups[image["number"]] for image in images]
 
 
-def render_steps(document, images, has_more, clarification=False):
-    parts = []
+def instruction_blocks(document, images, has_more, clarification=False):
+    """Channel-neutral source text/photo pairs; WebUI and Talk share the same words."""
+    blocks = []
     notes = _source_notes(document)
     if notes:
-        parts.append(notes)
+        blocks.append((notes, None))
     groups = [[] for image in images] if clarification else procedure_image_groups(document, images)
     step_number = 1
     for index, (image, steps) in enumerate(zip(images, groups), 1):
-        if not _uuid(image.get("file_id")):
-            raise ValueError("An inline illustration requires its real private file UUID")
-        parts.append(f"**Шаг {index}**")
+        parts = [f"**Шаг {index}**"]
         if steps:
             parts.append("\n".join(f"{number}. {step}" for number, step in enumerate(steps, step_number)))
             step_number += len(steps)
         if not any(_normal(image["caption"]) == _normal(step) for step in steps):
             parts.append(image["caption"])
-        parts.append(f"![Иллюстрация {image['number']}](/api/v1/files/{image['file_id']}/content)")
+        blocks.append(("\n\n".join(parts), image))
     if clarification:
-        parts.append("Удалось найти этот пункт?")
+        prompt = "Удалось найти этот пункт?"
     elif has_more:
-        parts.append("Когда выполните эти шаги, напишите «Готово» — покажу продолжение.")
+        prompt = "Когда выполните эти шаги, напишите «Готово» — покажу продолжение."
     else:
-        parts.append("Удалось выполнить эти действия?")
+        prompt = "Удалось выполнить эти действия?"
+    blocks.append((prompt, None))
+    return blocks
+
+
+def render_steps(document, images, has_more, clarification=False):
+    parts = []
+    for content, image in instruction_blocks(document, images, has_more, clarification):
+        parts.append(content)
+        if image is not None:
+            if not _uuid(image.get("file_id")):
+                raise ValueError("An inline illustration requires its real private file UUID")
+            parts.append(f"![Иллюстрация {image['number']}](/api/v1/files/{image['file_id']}/content)")
     return "\n\n".join(parts)
 
 

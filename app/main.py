@@ -8,7 +8,7 @@ from app.core.logging import configure_logging, event
 from app.db import get_engine
 
 configure_logging()
-app = FastAPI(title="ai-support", version="0.2.0", description="Open WebUI knowledge, Talk bot and SMTP")
+app = FastAPI(title="ai-support", version="0.3.0", description="Grounded support, personal Talk chats and SMTP")
 app.include_router(router)
 app.include_router(talk_router)
 
@@ -47,6 +47,11 @@ def ready():
         if settings.knowledge_backend == "openwebui"
         else True,
         "demo_knowledge": settings.seed_demo_knowledge,
-        "talk_images_configured": bool(settings.nextcloud_files_username)
-        and bool(settings.nextcloud_files_app_password.get_secret_value()),
+        "talk_images_configured": (bool(settings.nextcloud_username)
+                                   and bool(settings.nextcloud_app_password.get_secret_value()))
+        if settings.nextcloud_backend == "account" else
+        (bool(settings.nextcloud_files_username) and bool(settings.nextcloud_files_app_password.get_secret_value())),
+        "talk_account_configured": settings.nextcloud_backend == "account" and bool(settings.nextcloud_username)
+        and bool(settings.nextcloud_app_password.get_secret_value()),
+        "talk_private_only": settings.nextcloud_backend == "account",
     }

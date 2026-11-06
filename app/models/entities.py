@@ -215,6 +215,8 @@ class Delivery(Entity, Base):
     tries: Mapped[int] = mapped_column(Integer, default=0)
     error_code: Mapped[str | None] = mapped_column(String(100))
     remote_id: Mapped[str | None] = mapped_column(String(100))
+    provenance: Mapped[dict | None] = mapped_column(JSON)
+    account_id: Mapped[str | None] = mapped_column(String(36), index=True)
 
 
 class MessageAttachment(Entity, Base):

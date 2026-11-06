@@ -10,8 +10,18 @@ from app.models import Base
 
 def test_additive_migration_preserves_conversation(tmp_path):
     # Construct the prior schema from the unchanged model fields, then apply the actual migration.
-    old = MetaData()
+    expected = MetaData()
     for table in Base.metadata.sorted_tables:
+        table.to_metadata(expected)
+    # 0005 adds these outbox fields; this test checks 0002's original contract.
+    deliveries = expected.tables["deliveries"]
+    for index in list(deliveries.indexes):
+        if index.name == "ix_deliveries_account_id":
+            deliveries.indexes.remove(index)
+    for name in ("provenance", "account_id"):
+        deliveries._columns.remove(deliveries.c[name])
+    old = MetaData()
+    for table in expected.sorted_tables:
         if table.name != "deliveries":
             table.to_metadata(old)
     old.tables["conversations"]._columns.remove(old.tables["conversations"].c.room_token)
@@ -37,5 +47,5 @@ def test_additive_migration_preserves_conversation(tmp_path):
         with Operations.context(context):
             migration.upgrade()
         assert conn.scalar(text("SELECT user_id FROM conversations WHERE id='c'")) == "u"
-        assert compare_metadata(context, Base.metadata) == []
+        assert compare_metadata(context, expected) == []
     engine.dispose()

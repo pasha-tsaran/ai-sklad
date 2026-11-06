@@ -7,3 +7,5 @@ __pycache__
 pytest-cache-files-*
 *.egg-info
 .ruff_cache
+build
+dist

@@ -1,12 +1,13 @@
 from functools import lru_cache
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore", hide_input_in_errors=True)
     database_url: str = "postgresql+psycopg://support:local-demo-db@localhost:5432/support"
     api_token: SecretStr = SecretStr("local-demo-token")
     llm_backend: Literal["mock", "openwebui"] = "mock"
@@ -15,10 +16,14 @@ class Settings(BaseSettings):
     openwebui_model: str = "ai-support"
     knowledge_backend: Literal["openwebui", "demo"] = "openwebui"
     openwebui_knowledge_ids: list[str] = Field(default_factory=list)
-    knowledge_max_chars: int = Field(default=20000, ge=1000, le=24000)
-    knowledge_max_file_bytes: int = Field(default=25_000_000, ge=1000, le=50_000_000)
-    nextcloud_backend: Literal["mock", "talk"] = "mock"
+    knowledge_max_chars: int = Field(default=200000, ge=1000, le=200000)
+    knowledge_max_file_bytes: int = Field(default=30_000_000, ge=1000, le=50_000_000)
+    nextcloud_backend: Literal["mock", "talk", "account"] = "mock"
     nextcloud_base_url: str = ""
+    nextcloud_username: str = ""
+    nextcloud_app_password: SecretStr = SecretStr("")
+    nextcloud_poll_interval_seconds: float = Field(default=3, ge=1, le=60)
+    nextcloud_batch_size: int = Field(default=100, ge=1, le=100)
     nextcloud_bot_secret: SecretStr = SecretStr("")
     nextcloud_allowed_rooms: list[str] = Field(default_factory=list)
     nextcloud_files_username: str = ""
@@ -58,6 +63,16 @@ class Settings(BaseSettings):
                 or not self.nextcloud_allowed_rooms
             ):
                 raise ValueError("Talk requires HTTPS URL, >=32 character secret and allowed rooms")
+        if self.nextcloud_backend == "account":
+            parsed = urlsplit(self.nextcloud_base_url)
+            if (parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password
+                    or parsed.query or parsed.fragment or any(c.isspace() for c in self.nextcloud_base_url)):
+                raise ValueError("Talk account requires an HTTPS URL without credentials, query or fragment")
+            if (not self.nextcloud_username.strip() or len(self.nextcloud_username) > 255
+                    or any(ord(c) < 32 for c in self.nextcloud_username)
+                    or not self.nextcloud_app_password.get_secret_value()
+                    or any(c in self.nextcloud_app_password.get_secret_value() for c in "\r\n")):
+                raise ValueError("Talk account requires a login and a separate app password")
         if bool(self.nextcloud_files_username) != bool(self.nextcloud_files_app_password.get_secret_value()):
             raise ValueError("Nextcloud attachments require both files username and app password")
         if self.mail_backend == "smtp":
