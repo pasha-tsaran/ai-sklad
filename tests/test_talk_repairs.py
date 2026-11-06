@@ -73,8 +73,11 @@ def test_complete_private_form_creates_exact_mail_draft_and_never_queues_smtp(ta
         assert all((deliveries[key].account_id, deliveries[key].provenance) == value
                    for key, value in source_tags.items())
         body = escalation.email["body"]
-        for expected in ["Иванов Иван Иванович", "WS-001", extra, QUESTION]:
+        for expected in ["Иванов Иван Иванович", "WS-001", extra]:
             assert expected in body
+        assert body == extra + "\n\nФИО: Иванов Иван Иванович\nКомпьютер: WS-001\n"
+        assert QUESTION not in body and "Исходная проблема:" not in body
+        assert "Тема:" not in body and "Описание:" not in body
         assert "Логин:" not in body and "account_login" not in body and "ivanov" not in body
         preview_message = session.scalar(select(Message).where(
             Message.content.startswith("Подготовлено письмо для технической поддержки."),
@@ -101,7 +104,7 @@ def test_complete_private_form_creates_exact_mail_draft_and_never_queues_smtp(ta
         for expected in ["Иванов Иван Иванович", "WS-001", extra]:
             assert expected in fields["body"][0]
         assert "Логин:" not in fields["body"][0] and "ivanov" not in fields["body"][0]
-        assert QUESTION in fields["body"][0]
+        assert fields["body"][0].replace("\r\n", "\n") == body and QUESTION not in fields["body"][0]
     else:
         assert fields["body"] == [""]
         assert "Письмо длинное: скопируйте текст письма выше" in text
@@ -116,6 +119,39 @@ def test_cancel_before_form_does_not_create_any_mail_artifact_or_send_job(talk):
         assert session.scalar(select(Escalation)) is None
         assert session.scalar(select(Job).where(Job.kind == "SEND_MAIL")) is None
         assert session.scalar(select(MessageAttachment).where(MessageAttachment.content_type == "message/rfc822")) is None
+
+
+def test_guided_talk_letter_asks_explicit_topic_then_main_text_without_automatic_report_fallback(talk):
+    talk.settings.mail_backend, talk.settings.support_email = "mailto", "operator@example.net"
+    for sequence, content in enumerate([
+        "оператор", "1", "ФИО: Павел Царан\nКомпьютер: WS-001", "Уменьшить громкость сканера",
+    ], 1):
+        talk.incoming(content, sequence)
+        assert talk.process(Knowledge())
+    with talk.env.factory() as session:
+        assert session.scalar(select(Escalation)) is None
+    state = talk.snapshot()
+    assert state["flow"]["escalation"]["intake_requested_field"] == "additional_info"
+    description = "После сканирования громкий звуковой сигнал.\nНужно сделать звук тише."
+    talk.incoming(description, 5)
+    assert talk.process(Knowledge())
+    with talk.env.factory() as session:
+        escalation = session.scalar(select(Escalation))
+        assert escalation.status == "DRAFT" and escalation.sent_at is None
+        assert escalation.email["subject"] == "[AI-Support] Уменьшить громкость сканера"
+        assert escalation.email["body"] == description + "\n\nФИО: Павел Царан\nКомпьютер: WS-001\n"
+        assert "оператор" not in escalation.email["body"] and "Исходная проблема:" not in escalation.email["body"]
+        assert "Тема:" not in escalation.email["body"] and "Описание:" not in escalation.email["body"]
+        assert session.scalar(select(MessageAttachment)) is None
+        assert session.scalar(select(Job).where(Job.kind == "SEND_MAIL")) is None
+        preview = session.scalar(select(Message.content).where(Message.content.startswith("Подготовлено письмо")))
+        assert "своего почтового ящика" in preview
+        link = re.search(r"\[Открыть письмо в почте\]\((mailto:[^)]+)\)", preview)
+        assert link is not None
+        parsed = urlsplit(link.group(1))
+        fields = parse_qs(parsed.query)
+        assert parsed.path == "operator@example.net" and fields["subject"] == [escalation.email["subject"]]
+        assert fields["body"][0].replace("\r\n", "\n") == escalation.email["body"]
 
 
 def test_switch_to_drafts_pauses_an_old_send_mail_job_without_model_or_mail_calls(env, monkeypatch):

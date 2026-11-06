@@ -36,10 +36,15 @@ _KNOWN_TOKEN = re.compile(
     r"sk-(?:proj-|ant-)?[A-Za-z0-9_-]{16,}|"
     r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,})\b"
 )
+_DEVICE_TOKEN = re.compile(r"(?i)(#token=|ai-support://collect/)[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])")
+
+
+def redact_device_tokens(value):
+    return _DEVICE_TOKEN.sub(r"\1[REDACTED]", str(value or ""))
 
 
 def _redact(value):
-    text = _SECRET_LABEL.sub(r"\1[REDACTED]", str(value or ""))
+    text = _SECRET_LABEL.sub(r"\1[REDACTED]", redact_device_tokens(value))
     text = _BEARER.sub("Bearer [REDACTED]", text)
     return _KNOWN_TOKEN.sub("[REDACTED]", text)
 

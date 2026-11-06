@@ -421,8 +421,14 @@ def test_talk_account_migration_matches_models_and_downgrades_cleanly(tmp_path):
     )
     profile_migration = importlib.util.module_from_spec(profile_spec)
     profile_spec.loader.exec_module(profile_migration)
+    device_spec = importlib.util.spec_from_file_location(
+        "device_collection_migration", path.with_name("0007_device_collection.py"),
+    )
+    device_migration = importlib.util.module_from_spec(device_spec)
+    device_spec.loader.exec_module(device_migration)
     engine = create_engine("sqlite:///" + str(tmp_path / "migration.db"))
-    old_tables = [table for table in Base.metadata.sorted_tables if not table.name.startswith("talk_")]
+    old_tables = [table for table in Base.metadata.sorted_tables
+                  if not table.name.startswith("talk_") and table.name != "device_collections"]
     with engine.begin() as connection:
         Base.metadata.create_all(connection, tables=old_tables)
         # Reproduce the actual 0004 schema, before the account outbox tags exist.
@@ -433,11 +439,14 @@ def test_talk_account_migration_matches_models_and_downgrades_cleanly(tmp_path):
         with Operations.context(context):
             migration.upgrade()
             profile_migration.upgrade()
+            device_migration.upgrade()
         assert compare_metadata(context, Base.metadata) == []
         with Operations.context(context):
+            device_migration.downgrade()
             profile_migration.downgrade()
             migration.downgrade()
         assert all(not name.startswith("talk_") for name in connection.dialect.get_table_names(connection))
+        assert "device_collections" not in connection.dialect.get_table_names(connection)
         assert not {"provenance", "account_id"}.intersection(
             column["name"] for column in connection.dialect.get_columns(connection, "deliveries")
         )

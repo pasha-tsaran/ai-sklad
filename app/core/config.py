@@ -24,6 +24,7 @@ class Settings(BaseSettings):
     nextcloud_app_password: SecretStr = SecretStr("")
     nextcloud_poll_interval_seconds: float = Field(default=3, ge=1, le=60)
     nextcloud_batch_size: int = Field(default=100, ge=1, le=100)
+    device_collection_base_url: str = ""
     nextcloud_bot_secret: SecretStr = SecretStr("")
     nextcloud_allowed_rooms: list[str] = Field(default_factory=list)
     nextcloud_files_username: str = ""
@@ -73,6 +74,14 @@ class Settings(BaseSettings):
                     or not self.nextcloud_app_password.get_secret_value()
                     or any(c in self.nextcloud_app_password.get_secret_value() for c in "\r\n")):
                 raise ValueError("Talk account requires a login and a separate app password")
+        if self.device_collection_base_url:
+            base = urlsplit(self.device_collection_base_url)
+            if (self.nextcloud_backend != "account" or len(self.device_collection_base_url) > 2048
+                    or base.scheme != "https" or not base.hostname or base.username or base.password
+                    or base.query or base.fragment or "\\" in self.device_collection_base_url
+                    or any(c.isspace() or ord(c) < 32 for c in self.device_collection_base_url)
+                    or any(part in {".", ".."} for part in base.path.split("/"))):
+                raise ValueError("Device collection requires an account-mode HTTPS API base URL")
         if bool(self.nextcloud_files_username) != bool(self.nextcloud_files_app_password.get_secret_value()):
             raise ValueError("Nextcloud attachments require both files username and app password")
         if self.mail_backend == "smtp":

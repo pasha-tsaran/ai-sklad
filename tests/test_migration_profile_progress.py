@@ -23,8 +23,12 @@ def _migration():
 
 @pytest.mark.parametrize("status", ["PENDING", "FAILED"])
 def test_profile_progress_migration_preserves_existing_private_queue_and_roundtrips(tmp_path, status):
-    previous = MetaData()
+    expected = MetaData()
     for table in Base.metadata.sorted_tables:
+        if table.name != "device_collections":
+            table.to_metadata(expected)
+    previous = MetaData()
+    for table in expected.sorted_tables:
         table.to_metadata(previous)
     previous.tables["talk_rooms"]._columns.remove(previous.tables["talk_rooms"].c.profile)
     previous.tables["talk_inbox"]._columns.remove(previous.tables["talk_inbox"].c.progress)
@@ -77,7 +81,8 @@ def test_profile_progress_migration_preserves_existing_private_queue_and_roundtr
             context = MigrationContext.configure(connection)
             with Operations.context(context):
                 migration.upgrade()
-            assert compare_metadata(context, Base.metadata) == []
+            assert compare_metadata(context, expected) == []
+            assert "device_collections" not in inspect(connection).get_table_names()
             assert_legacy_rows("old")
             assert_empty_defaults("old")
             # Raw SQL omits the new fields: defaults must also work for writers
@@ -102,7 +107,7 @@ def test_profile_progress_migration_preserves_existing_private_queue_and_roundtr
             assert_legacy_rows("new")
             with Operations.context(context):
                 migration.upgrade()
-            assert compare_metadata(context, Base.metadata) == []
+            assert compare_metadata(context, expected) == []
             for suffix in ("old", "new"):
                 assert_empty_defaults(suffix)
                 assert_legacy_rows(suffix)

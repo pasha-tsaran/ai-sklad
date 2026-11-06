@@ -81,9 +81,9 @@ def _valid(field, value):
         return None
 
 
-def _result(fields, invalid=(), *, allow_completion=True):
+def _result(fields, invalid=(), *, allow_completion=True, require_description=False):
     missing = [field for field in REQUIRED_FIELDS if field not in fields]
-    if "additional_info" in invalid:
+    if "additional_info" in invalid or require_description and not fields.get("additional_info", "").strip():
         missing.append("additional_info")
     details = None
     if not missing and allow_completion:
@@ -166,8 +166,8 @@ def _evidenced(field, value, message):
     return False
 
 
-def parse_intake(message, pending_fields, llm, *, requested_field=None):
-    """Collect only observed employee spans; return one ordered list of missing fields."""
+def parse_intake(message, pending_fields, llm, *, requested_field=None, require_description=False):
+    """Collect observed spans; Talk requires an independent description, older callers need not."""
     fields = {}
     if isinstance(pending_fields, dict):
         for field in FIELDS:
@@ -175,10 +175,20 @@ def parse_intake(message, pending_fields, llm, *, requested_field=None):
             if value is not None:
                 fields[field] = value
     if not isinstance(message, str) or not message.strip() or len(message) > MAX_MESSAGE_CHARS:
-        result = _result(fields, allow_completion=False)
+        result = _result(fields, allow_completion=False, require_description=require_description)
         return result if result.missing else IntakeResult(None, fields, ["additional_info"])
     message = message.strip()
     labeled, invalid, structured = _labels(message)
+    # A reply to the description question is the body itself. Keep its complete
+    # wording/line breaks; do not ask a model to summarize or infer its topic.
+    if requested_field == "additional_info" and (not labeled or not structured or (
+            set(labeled) == {"subject"} and message.partition(":")[0].strip().casefold() == "проблема")):
+        value = _valid("additional_info", message)
+        if value is not None and value:
+            fields["additional_info"] = value
+            return _result(fields, require_description=require_description)
+        fields.pop("additional_info", None)
+        return _result(fields, ["additional_info"], require_description=require_description)
     ordered = _ordered_lines(message) if not labeled else None
     observed = labeled if labeled else ordered or {}
     for field, raw in observed.items():
@@ -189,36 +199,47 @@ def parse_intake(message, pending_fields, llm, *, requested_field=None):
         else:
             fields[field] = value
     if structured or ordered is not None:
-        return _result(fields, invalid)
+        return _result(fields, invalid, require_description=require_description)
 
     missing = [field for field in REQUIRED_FIELDS if field not in fields]
+    if require_description and not fields.get("additional_info", "").strip():
+        missing.append("additional_info")
     target = requested_field if requested_field in FIELDS else missing[0] if len(missing) == 1 else None
+    if require_description and target == "subject" and not labeled:
+        value = _valid("subject", message)
+        if value is not None:
+            fields["subject"] = value
+            return _result(fields, invalid, require_description=True)
+        fields.pop("subject", None)
+        return _result(fields, [*invalid, "subject"], require_description=True)
     if target and "\n" not in message and len(message.split()) <= 30 and not labeled:
         value = _valid(target, message)
         if value is not None:
             fields[target] = value
             invalid.discard(target)
-            return _result(fields, invalid)
+            return _result(fields, invalid, require_description=require_description)
     if not missing and "additional_info" not in invalid:
-        return _result(fields)
+        return _result(fields, require_description=require_description)
 
     try:
         raw = llm.extract_escalation(message, {"pending_fields": dict(fields), "missing_fields": missing,
                                                 "requested_field": requested_field if requested_field in FIELDS else None})
         extraction = EscalationExtraction.model_validate(raw).model_dump()
     except Exception:
-        return _result(fields, invalid)
+        return _result(fields, invalid, require_description=require_description)
     for field, raw in extraction.items():
+        if require_description and field == "additional_info":
+            continue  # Only a separate observed description completes Talk intake.
         value = _valid(field, raw)
         if value is not None and _evidenced(field, value, message) and field not in invalid:
             fields[field] = value
     # Keep the complete original problem, not a model's shortened paraphrase.
     # Explicit label/ordered forms already keep their original description above.
-    if "subject" in fields and (start := _PROBLEM_START.search(message)):
+    if not require_description and "subject" in fields and (start := _PROBLEM_START.search(message)):
         problem = message[start.start():].strip()
         if _valid("additional_info", problem) is not None:
             fields["additional_info"] = problem
         else:
             fields.pop("additional_info", None)
             invalid.add("additional_info")
-    return _result(fields, invalid)
+    return _result(fields, invalid, require_description=require_description)

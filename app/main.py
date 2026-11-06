@@ -3,14 +3,16 @@ from sqlalchemy import text
 
 from app.api.routes import router
 from app.api.talk import router as talk_router
+from app.api.device import router as device_router
 from app.core.config import get_settings
 from app.core.logging import configure_logging, event
 from app.db import get_engine
 
 configure_logging()
-app = FastAPI(title="ai-support", version="0.3.4", description="Grounded support, personal Talk chats and mail drafts")
+app = FastAPI(title="ai-support", version="0.3.5", description="Grounded support, personal Talk chats and mail drafts")
 app.include_router(router)
 app.include_router(talk_router)
+app.include_router(device_router)
 
 
 @app.middleware("http")
@@ -54,4 +56,5 @@ def ready():
         "talk_account_configured": settings.nextcloud_backend == "account" and bool(settings.nextcloud_username)
         and bool(settings.nextcloud_app_password.get_secret_value()),
         "talk_private_only": settings.nextcloud_backend == "account",
+        "device_collection_configured": bool(settings.device_collection_base_url),
     }

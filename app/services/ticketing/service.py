@@ -1,6 +1,5 @@
 import json
 import re
-import unicodedata
 from datetime import timezone
 
 from fastapi import HTTPException
@@ -8,6 +7,7 @@ from sqlalchemy import select
 
 from app.models import Escalation, Message, SolutionAttempt, new_id, now
 from app.services.chat.audit import audit
+from app.services.chat.memory import redact_device_tokens
 from app.services.chat.policies import FORM_ACTION
 from app.services.chat.service import add_user_message, enqueue, get_owned, messenger
 from app.services.mail.draft import make_mailto
@@ -16,6 +16,7 @@ from app.services.mail.presentation import letter_preview
 
 def _letter_text(content):
     """Omit the retired login field from letter copies, keeping private history intact."""
+    content = redact_device_tokens(content)
     prefix = "Данные заявки: "
     if content.startswith(prefix):
         try:
@@ -91,19 +92,11 @@ def collect_details(session, user_id, incident_id, details, settings):
     if settings.mail_backend == "mailto":
         # Complete user-entered fields go to the employee's own mail client.
         # This mode never queues SMTP or claims the employee pressed Send.
-        entered_fields = (
-            f"ФИО: {details.account_holder_name}\n"
-            f"Компьютер: {details.computer_name}\nТема: {details.subject}\n"
-            f"Описание: {details.additional_info}\n"
-        )
-        # Inbound chat can contain invisible control characters that mail clients
-        # cannot represent. Keep the original report in history and its readable
-        # words/line breaks in the draft instead of failing the whole intake.
-        problem = "".join(char if unicodedata.category(char) != "Cc" or char in "\r\n\t" else " "
-                          for char in _letter_text(incident.description or ""))
+        # The employee's explicit description is the main letter text. The topic
+        # belongs only to Subject; an old chat report isn't a substitute for it.
+        footer = f"ФИО: {details.account_holder_name}\nКомпьютер: {details.computer_name}\n"
         draft = {**escalation.email, "body": (
-            entered_fields
-            + (f"\nИсходная проблема:\n{problem}\n" if problem else "")
+            (details.additional_info + "\n\n" if details.additional_info else "") + footer
         )}
         escalation.email = draft
         link = make_mailto(draft, settings.support_email)
@@ -125,7 +118,7 @@ def collect_details(session, user_id, incident_id, details, settings):
                 explanation += ("\n\n[Открыть почту](" + link + ")\n"
                                 "Скопируйте полную тему и текст письма выше в открывшееся окно почты.")
         explanation += (
-            "\n\nНажмите ссылку, проверьте письмо и отправьте его из своей почтовой программы.\n"
+            "\n\nНажмите ссылку, проверьте письмо и отправьте его из своего почтового ящика.\n"
             "Чтобы вернуться к боту, напишите «Продолжить с ботом»."
         )
         messenger.send_blocks(session, incident.id, [(explanation, None)])

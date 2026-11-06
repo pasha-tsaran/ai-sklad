@@ -21,12 +21,14 @@ from app.models.entities import (
     now,
 )
 from app.models.talk import TalkAccount, TalkInbox, TalkRoom
+from app.models.device import DeviceCollection
 
 __all__ = [
     "AuditEvent",
     "Base",
     "Conversation",
     "Delivery",
+    "DeviceCollection",
     "Escalation",
     "Feedback",
     "Incident",

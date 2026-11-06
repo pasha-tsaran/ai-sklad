@@ -43,8 +43,8 @@ BACK_TO_BOT = "Продолжим с ботом. Опишите, с каким �
 INTAKE_QUESTIONS = {
     "account_holder_name": "Как вас зовут?",
     "computer_name": "Как называется ваш рабочий компьютер?",
-    "subject": "Кратко опишите, с чем нужна помощь. Если нужно, добавьте подробности.",
-    "additional_info": "Напишите дополнительное описание короче — до 2000 символов.",
+    "subject": "Укажите тему письма.",
+    "additional_info": "Опишите проблему: что происходит и какая помощь нужна.",
 }
 CLARIFY_QUESTIONS = {
     "DEVICE_MODEL": "Какое устройство не работает? Напишите его название и модель, если она указана на корпусе.",
@@ -145,7 +145,10 @@ def _intake_turn(message, flow, llm, context):
     updated = _prefill_intake(flow, context)
     escalation = updated["escalation"]
     fields = copy.deepcopy(escalation["intake_fields"])
-    result = parse_intake(message, fields, llm, requested_field=escalation.get("intake_requested_field"))
+    requested = escalation.get("intake_requested_field")
+    if fields.get("subject") and not fields.get("additional_info", "").strip() and requested in {None, "subject"}:
+        requested = "additional_info"  # Upgrade a partially collected pre-0.3.5 form.
+    result = parse_intake(message, fields, llm, requested_field=requested, require_description=True)
     collected, missing_fields, details = dict(result.fields), list(result.missing), result.details
     if "account_login" not in collected and (login := _internal_login(context)):
         collected["account_login"] = login
@@ -155,12 +158,16 @@ def _intake_turn(message, flow, llm, context):
     computer = collected.get("computer_name")
     current_computer = context.get("channel_profile", {}).get("computer_name")
     confirmed = computer if computer and (computer != fields.get("computer_name") or computer != current_computer) else None
-    if details is not None:
+    if details is not None and details.additional_info.strip():
         return Turn("FORM", details=details, confirmed_computer=confirmed)
+    if not collected.get("additional_info", "").strip() and "additional_info" not in missing_fields:
+        missing_fields.append("additional_info")
     missing = next((key for key in missing_fields if key in INTAKE_QUESTIONS), None)
     updated["escalation"] = {**escalation, "stage": "FORM", "intake_fields": collected,
                              "intake_requested_field": missing}
     question = INTAKE_QUESTIONS[missing] if missing else "В чём нужна помощь? Кратко опишите проблему."
+    if missing == "additional_info" and len(message.strip()) > 2000:
+        question += " Описание должно быть не длиннее 2000 символов."
     return Turn("REPLY", [(question, None)], flow=updated, confirmed_computer=confirmed)
 
 
@@ -170,7 +177,7 @@ def _intake_prompt(flow):
     fields = escalation.get("intake_fields", {})
     missing = escalation.get("intake_requested_field")
     if missing not in INTAKE_QUESTIONS or fields.get(missing):
-        missing = next((key for key in INTAKE_QUESTIONS if key != "additional_info" and not fields.get(key)), "subject")
+        missing = next((key for key in INTAKE_QUESTIONS if not fields.get(key, "").strip()), "additional_info")
     updated["escalation"] = {**escalation, "stage": "FORM", "intake_requested_field": missing}
     return Turn("REPLY", [(INTAKE_QUESTIONS[missing], None)], flow=updated)
 
@@ -203,7 +210,8 @@ def _escalation_choice(message):
     if normalized in {"1", "оставить заявку", "оставить заявку в тп", "оставить заявку в поддержку",
                       "оформить заявку", "оформить обращение", "заявка в поддержку", "передать в поддержку",
                       "отправить заявку", "отправить заявку в поддержку", "техническая поддержка",
-                      "оформить письмо", "оформить письмо в поддержку", "письмо в поддержку"}:
+                      "оформить письмо", "оформить письмо в поддержку", "письмо в поддержку",
+                      "хочу написать тп", "хочу написать в тп", "хочу написать в поддержку", "написать в тп"}:
         return "FORM_REQUEST"
     return None
 
@@ -660,7 +668,23 @@ def _finish(factory, turn, claimed, llm, settings):
             escalation = flow.get("escalation", {})
             flow["escalation"] = {**escalation, "stage": "FORM"}
             room.flow = flow
-            _deliver(session, incident, turn.blocks)
+            if (getattr(settings, "device_collection_base_url", "")
+                    and not escalation.get("intake_fields", {}).get("computer_name")):
+                from app.services.nextcloud.device_collection import issue_collection
+
+                collection_id, link = issue_collection(session, settings, room, incident)
+                room.flow = {**flow, "escalation": {**flow["escalation"], "stage": "DEVICE",
+                                                  "collection_id": collection_id}}
+                _deliver(session, incident, [(
+                    "Определите текущий компьютер для письма в поддержку:\n\n"
+                    + "[Определить текущий компьютер](" + link + ")\n\n"
+                    + "Будет передано только имя компьютера. ФИО берётся из вашего профиля. "
+                    + "Ссылка действует 5 минут.\n"
+                    + "Если автоматический сбор недоступен, напишите имя компьютера здесь. "
+                    + "Чтобы вернуться к боту, напишите «Отмена» или «2».", None,
+                )])
+            else:
+                _deliver(session, incident, turn.blocks)
         elif turn.action == "RESUME":
             room.flow = turn.flow or {}
             incident.pending_action, incident.escalation_reason = None, None

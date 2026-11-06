@@ -213,3 +213,55 @@ def test_partial_identifier_and_case_rewrite_are_not_verbatim_field_values():
     llm = FakeLLM({**COMPLETE, "account_holder_name": "павел", "account_login": "tsaran", "computer_name": "terminal76"})
     result = parse_intake(message, {}, llm)
     assert result.details is None and result.missing == REQUIRED[:3]
+
+
+def test_talk_requires_description_while_legacy_four_field_parser_contract_stays_compatible():
+    message = "Павел\ntsaran\nterminal76-sk\nнастроить сканер ШК"
+    legacy = parse_intake(message, {}, ForbiddenLLM())
+    talk = parse_intake(message, {}, ForbiddenLLM(), require_description=True)
+    assert legacy.details is not None and legacy.details.additional_info == ""
+    assert talk.details is None and talk.fields == COMPLETE and talk.missing == ["additional_info"]
+
+
+def test_talk_subject_is_verbatim_and_does_not_auto_complete_or_copy_it_into_description():
+    pending = {key: COMPLETE[key] for key in REQUIRED[:3]}
+    topic = "УМЕНЬШИТЬ громкость проводного сканера ШК"
+    result = parse_intake(topic, pending, ForbiddenLLM(), requested_field="subject", require_description=True)
+    assert result.details is None and result.fields == {**pending, "subject": topic}
+    assert result.missing == ["additional_info"] and "additional_info" not in result.fields
+
+
+@pytest.mark.parametrize("description", [
+    "Сканер читает код, но слишком громко пищит.\n\nПрошу уменьшить громкость.",
+    "Проблема: сканер не считывает товар.\nОшибка на экране: товар не найден.",
+    "Компьютер: terminal76-sk\nНа экране ничего не меняется после сканирования.",
+    "Сначала код читался.\r\nТеперь при каждом сканировании раздаётся громкий сигнал.",
+])
+def test_requested_talk_description_is_the_complete_independent_multiline_body_without_model(description):
+    pending = copy.deepcopy(COMPLETE)
+    result = parse_intake(description, pending, ForbiddenLLM(), requested_field="additional_info", require_description=True)
+    assert result.details.model_dump() == {**COMPLETE, "additional_info": description}
+    assert result.fields["subject"] == COMPLETE["subject"] and pending == COMPLETE
+
+
+def test_talk_accepts_labelled_topic_and_description_together_when_both_are_explicit():
+    description = "При сканировании код читается.\nНужно убрать громкий звуковой сигнал."
+    result = parse_intake("Тема: Громкость сканера\nОписание: " + description,
+                          {key: COMPLETE[key] for key in REQUIRED[:3]}, ForbiddenLLM(), require_description=True)
+    assert result.details.subject == "Громкость сканера" and result.details.additional_info == description
+
+
+@pytest.mark.parametrize("candidate", ["настроить сканер ШК", "Нужно настроить сканер ШК."])
+def test_talk_does_not_infer_description_from_a_model_topic_or_original_problem_tail(candidate):
+    message = "Меня зовут Павел, логин tsaran, компьютер terminal76-sk. Нужно настроить сканер ШК."
+    llm = FakeLLM({**COMPLETE, "additional_info": candidate})
+    result = parse_intake(message, {}, llm, require_description=True)
+    assert result.details is None and result.fields["subject"] == COMPLETE["subject"]
+    assert result.missing == ["additional_info"] and "additional_info" not in result.fields
+
+
+@pytest.mark.parametrize("description", ["я" * 2001, "\n\t", "Сканер\x85не работает"])
+def test_invalid_requested_talk_description_never_completes_or_uses_a_shorter_model_summary(description):
+    result = parse_intake(description, COMPLETE, ForbiddenLLM(), requested_field="additional_info", require_description=True)
+    assert result.details is None and result.missing == ["additional_info"]
+    assert result.fields == COMPLETE and "additional_info" not in result.fields

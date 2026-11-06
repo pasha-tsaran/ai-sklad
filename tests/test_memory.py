@@ -66,6 +66,23 @@ def message_for(session, incident, sequence, content, role="user"):
     return message
 
 
+def test_device_collection_capabilities_are_redacted_from_recent_and_compacted_model_context(env):
+    token = "D" * 43
+    https = "https://support.example/device/collect#token=" + token
+    protocol = "ai-support://collect/" + token
+    with env.factory() as session, session.begin():
+        incident = incident_for(session)
+        message_for(session, incident, 1, "Определить компьютер: " + https, "assistant")
+        message_for(session, incident, 2, protocol)
+        current = load_context(session, incident, settings(memory_max_messages=4))
+        assert token not in json.dumps(current) and "REDACTED" in json.dumps(current)
+        for number in range(3, 10):
+            message_for(session, incident, number, "Данные обращения " + str(number))
+        compacted = load_context(session, incident, settings(memory_max_messages=2))
+        assert token not in json.dumps(compacted)
+        assert session.scalar(select(Message.content).where(Message.incident_id == incident.id, Message.sequence == 1)) == "Определить компьютер: " + https
+
+
 def confirm_resolution(session, incident, *, helped=True, status="SUCCEEDED", days_ago=0):
     message = message_for(session, incident, 1, "APPROVED-SECRET-TECHNICAL-STEPS", "assistant")
     attempt = SolutionAttempt(

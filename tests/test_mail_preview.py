@@ -29,8 +29,7 @@ def literal_text(preview):
 
 def test_preview_contains_actual_recipient_subject_and_every_letter_field():
     email = {"to": "ignored@example.com", "subject": '[AI-Support] Сканер "ШК"', "body": (
-        "ФИО: Иванов Иван\nКомпьютер: WS-001\n"
-        "Тема: Настройка сканера\nОписание: Не читает код & выдаёт ошибку № 1.\n"
+        "Не читает код & выдаёт ошибку № 1.\n\nФИО: Иванов Иван\nКомпьютер: WS-001\n"
     )}
     before = copy.deepcopy(email)
     preview = letter_preview(email, RECIPIENT)
@@ -72,7 +71,7 @@ def test_letter_preview_queue_keeps_earlier_step_photo_bytes_and_source_tags_unc
     bound = bind(factory)
     image = SimpleNamespace(filename="illustration-01.png", content_type="image/png", data=png(),
                             caption="На снимке показано меню «Операции».")
-    email = {"subject": "Сканер не работает", "body": "ФИО: Иванов\nКомпьютер: WS-001\n"}
+    email = {"subject": "[AI-Support] Сканер не работает", "body": "Не читает код.\n\nФИО: Иванов\nКомпьютер: WS-001\n"}
     preview = "Подготовлено письмо для технической поддержки.\n\n" + letter_preview(email, RECIPIENT)
     with factory() as session, session.begin():
         messenger = RoutedMessenger()
@@ -112,6 +111,8 @@ def test_real_ticket_keeps_full_preview_and_exact_topic_without_attachment_or_sm
         assert escalation.status == "DRAFT" and escalation.email["to"] == RECIPIENT
         body, subject = escalation.email["body"], escalation.email["subject"]
         assert subject == "[AI-Support] " + details["subject"]
+        assert body == (details["additional_info"].strip() + "\n\nФИО: Иванов Иван\nКомпьютер: WS-001\n")
+        assert details["subject"] not in body and "Исходная проблема:" not in body and "Описание:" not in body
         assert request["incident_id"] not in subject and escalation.id not in subject
         assert session.scalar(select(MessageAttachment)) is None
         replies = session.scalars(select(Message.content).where(
@@ -125,6 +126,7 @@ def test_real_ticket_keeps_full_preview_and_exact_topic_without_attachment_or_sm
                 assert field.strip() in rendered.group(2)
         assert "Логин:" not in body and "account_login" not in body and details["account_login"] not in body
         assert "Данные профиля Nextcloud" not in preview
+        assert "отправьте его из своего почтового ящика" in preview and "почтовой программы" not in preview
         link = re.search(r"\[[^\]]+\]\((mailto:[^)]+)\)", preview)
         assert link is not None and len(link.group(1)) <= MAX_MAILTO_CHARS
         parsed = urlsplit(link.group(1))
@@ -160,7 +162,7 @@ def test_mock_mode_remains_explicitly_mock_without_a_real_letter_or_mailto_claim
 
 
 @pytest.mark.parametrize("control", ["\x85", "\x0b", "\x7f"])
-def test_invisible_chat_control_in_original_problem_cannot_poison_a_valid_draft(env, control):
+def test_original_report_is_not_copied_or_substituted_for_explicit_description(env, control):
     configured = get_settings()
     configured.mail_backend, configured.support_email = "mailto", RECIPIENT
     incident_id = env.post("/api/chat", {"message": "оператор"}).json()["incident_id"]
@@ -174,8 +176,57 @@ def test_invisible_chat_control_in_original_problem_cannot_poison_a_valid_draft(
     with env.factory() as session:
         draft = session.scalar(select(Escalation))
         assert draft.status == "DRAFT" and control not in draft.email["body"]
-        assert "Сканер не читает код\nПосле перезапуска тоже." in draft.email["body"]
+        assert draft.email["body"] == "Не читает код.\n\nФИО: Иванов Иван\nКомпьютер: WS-001\n"
+        assert "После перезапуска" not in draft.email["body"] and "Исходная проблема:" not in draft.email["body"]
         assert session.get(Incident, incident_id).description == original
+        assert session.scalar(select(MessageAttachment)) is None
+        assert session.scalar(select(Job).where(Job.kind == "SEND_MAIL")) is None
+
+
+@pytest.mark.parametrize("description", ["", "Первый абзац описания.\nВторой абзац: принтер не отвечает."],
+                         ids=["legacy-empty", "explicit-multiline"])
+def test_mailto_description_and_identity_footer_are_literal_without_old_report_fallback(env, description):
+    configured = get_settings()
+    configured.mail_backend, configured.support_email = "mailto", RECIPIENT
+    incident_id = env.post("/api/chat", {"message": "оператор"}).json()["incident_id"]
+    with env.factory() as session, session.begin():
+        session.get(Incident, incident_id).description = "Хочу написать в ТП"
+    details = {"account_holder_name": "Иванов Иван", "account_login": "legacy-login", "computer_name": "WS-001",
+               "subject": "Явная тема обращения", "additional_info": description}
+    assert env.post(f"/api/incidents/{incident_id}/escalation-details", details).status_code == 202
+    with env.factory() as session:
+        email = session.scalar(select(Escalation)).email
+        assert email["subject"] == "[AI-Support] Явная тема обращения"
+        assert email["body"] == ((description + "\n\n") if description else "") + "ФИО: Иванов Иван\nКомпьютер: WS-001\n"
+        assert "Хочу написать в ТП" not in email["body"] and "legacy-login" not in email["body"]
+        assert "Тема:" not in email["body"] and "Описание:" not in email["body"]
+        assert session.scalar(select(MessageAttachment)) is None
+        assert session.scalar(select(Job).where(Job.kind == "SEND_MAIL")) is None
+
+
+def test_employee_header_looking_lines_stay_in_body_without_changing_recipient_or_subject(env):
+    configured = get_settings()
+    configured.mail_backend, configured.support_email = "mailto", RECIPIENT
+    incident_id = env.post("/api/chat", {"message": "оператор"}).json()["incident_id"]
+    description = "Нужна помощь.\nTo: чужой@example.net\nBcc: hidden@example.net\nSubject: Подмена\nFrom: boss@example.net"
+    details = {"account_holder_name": "Иванов Иван", "account_login": "legacy", "computer_name": "WS-001",
+               "subject": "Сканер не работает", "additional_info": description}
+    assert env.post(f"/api/incidents/{incident_id}/escalation-details", details).status_code == 202
+    with env.factory() as session:
+        email = session.scalar(select(Escalation)).email
+        assert email["to"] == RECIPIENT and email["subject"] == "[AI-Support] Сканер не работает"
+        assert email["body"] == description + "\n\nФИО: Иванов Иван\nКомпьютер: WS-001\n"
+        assert not any(key.casefold() in {"bcc", "cc", "from"} for key in email)
+        previews = session.scalars(select(Message.content).where(Message.role == "assistant")).all()
+        preview = next(text for text in previews if text.startswith("Подготовлено письмо"))
+        rendered = re.search(r"(`{3,})\n(.*?)\n\1", preview, re.S)
+        assert rendered and description in rendered.group(2)
+        link = re.search(r"\[[^\]]+\]\((mailto:[^)]+)\)", preview)
+        parsed = urlsplit(link.group(1))
+        fields = parse_qs(parsed.query, keep_blank_values=True)
+        assert parsed.path == RECIPIENT and fields["subject"] == [email["subject"]]
+        assert set(fields) == {"subject", "body"}
+        assert fields["body"][0].replace("\r\n", "\n") == email["body"]
         assert session.scalar(select(MessageAttachment)) is None
         assert session.scalar(select(Job).where(Job.kind == "SEND_MAIL")) is None
 
