@@ -3,7 +3,7 @@ title: AI Support — фотографии утверждённых инстру
 author: AI Support
 description: Ищет и читает утверждённые инструкции, показывает исходные фотографии DOCX.
 required_open_webui_version: 0.11.0
-version: 0.3.0
+version: 0.3.1
 license: MIT
 """
 
@@ -19,7 +19,9 @@ import re
 import warnings
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
+from time import perf_counter
 from uuid import UUID
 from zipfile import BadZipFile, ZipFile
 
@@ -38,6 +40,29 @@ W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
 A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
 WP = "{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}"
+
+
+def _measure_tool(method):
+    """Preserve the public schema and add elapsed time without logging source data."""
+    @wraps(method)
+    async def measured(*args, **kwargs):
+        try:
+            started = perf_counter()
+        except Exception:
+            started = None
+        result = await method(*args, **kwargs)
+        try:
+            payload = json.loads(result)
+            if isinstance(payload, dict) and started is not None:
+                elapsed = (perf_counter() - started) * 1000
+                if not 0 <= elapsed <= 3_600_000:
+                    return result
+                payload["timing_ms"] = round(elapsed, 3)
+                return json.dumps(payload, ensure_ascii=False)
+        except Exception:
+            pass  # Measurements must not change successful delivery or its error handling.
+        return result
+    return measured
 
 
 class ToolError(ValueError):
@@ -414,6 +439,7 @@ class Tools:
             raise ToolError("not_configured", "Администратор должен указать корректные ID разрешённых баз знаний в Valves инструмента.")
         return list(dict.fromkeys(str(UUID(value)) for value in allowed))
 
+    @_measure_tool
     async def search_approved_instructions(self, query: str, count: int = 8,
                                            __user__=None, __request__=None) -> str:
         """Search only approved collections configured by the administrator.
@@ -487,6 +513,7 @@ class Tools:
             pictures = []
         return runtime, source, signature, original, digest, pictures, allowed
 
+    @_measure_tool
     async def read_approved_instruction(self, file_id: str, __user__=None, __request__=None) -> str:
         """Read a complete approved instruction before helping a user.
 
@@ -519,6 +546,7 @@ class Tools:
                                "message": str(exc) if isinstance(exc, ToolError) else "Не удалось прочитать утверждённую инструкцию."},
                               ensure_ascii=False)
 
+    @_measure_tool
     async def show_instruction_images(
         self, file_id: str, image_numbers: str = "auto", offset: int = 0,
         __user__=None, __request__=None, __event_emitter__=None,

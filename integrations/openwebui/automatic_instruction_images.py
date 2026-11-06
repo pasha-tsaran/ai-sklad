@@ -3,7 +3,7 @@ title: AI Support — фотографии к ответу автоматиче�
 author: AI Support
 description: Автоматически прикладывает фотографии утверждённой инструкции и продолжает её по шагам.
 required_open_webui_version: 0.11.0
-version: 0.5.1
+version: 0.6.0
 """
 
 # Install as an admin Function (Filter), scoped to ai-support, not as a Tool.
@@ -11,7 +11,10 @@ version: 0.5.1
 import copy
 import json
 import logging
+import math
 import re
+from contextlib import contextmanager
+from time import perf_counter
 from typing import Literal
 from uuid import UUID, uuid4
 
@@ -23,7 +26,130 @@ READ_TOOL = "read_approved_instruction"
 SEARCH_TOOL = "search_approved_instructions"
 DIALOGUE_TOOL = "ai_support_dialogue"
 REFUSAL_MARKER = "_ai_support_refusal"
+SCOPE_REFUSAL_MARKER = "_ai_support_scope_refusal"
+TIMING_MARKER = "_ai_support_timing"
+TIMING_TOOL = "ai_support_timings"
 DEFAULT_KNOWLEDGE_IDS = ["85cda3aa-b854-4c26-9948-12da742277ef"]
+DEFAULT_KNOWLEDGE_NAMES = [
+    "AI Support (склад) — инструкции 1 линии технической поддержки",
+    "AI Support (склад)",
+    "AI Support",
+    "ai-support",
+]
+KB_SCOPE_REPLY = (
+    "Я работаю только с утверждённой базой технической поддержки склада. "
+    "Поиск в других базах знаний мне недоступен."
+)
+
+_KB_UUID_TEXT = r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+_KB_PATH = re.compile(
+    r"/(?:workspace/knowledge|api/v1/knowledge)/(" + _KB_UUID_TEXT + r")(?=$|[/?#\s\"'`<>.,;)\]»”}])", re.I
+)
+_KB_TYPED_ID = re.compile(
+    r"\b(?:knowledge_ids?|kb_ids?|"
+    r"баз\w*\s+знаний(?:\s+с)?(?:\s+(?:id|uuid))?|"
+    r"(?:id|uuid|идентификатор)\s+баз\w*\s+знаний)\s*[:=]?\s*"
+    r"(\[[^\]\r\n]{1,1600}\]|[\"'`]?" + _KB_UUID_TEXT + r"[\"'`]?)", re.I
+)
+_KB_REQUEST_START = re.compile(
+    r"^\s*(?:(?:пожалуйста|please)\s*[,!\-]?\s*)?"
+    r"(?:если\s+(?:(?:ее|его|их|инструкции|документа)\s+)?(?:нет|не\s+найдешь)\s*,\s*)?"
+    r"(?:(?:можешь|можете)\s+(?:ли\s+)?(?:(?:ты|вы)\s+)?(?:пожалуйста\s+)?|"
+    r"(?:can|could|would)\s+you\s+(?:please\s+)?|давай(?:те)?\s+)?"
+    r"(?:покажи(?:те)?|показать|найди(?:те)?|найти|поищи(?:те)?|поискать|ищи(?:те)?|"
+    r"выведи(?:те)?|вывести|перечисли(?:те)?|перечислить|прочитай(?:те)?|прочитать|"
+    r"открой(?:те)?|открыть|скачай(?:те)?|скачать|загрузи(?:те)?|загрузить|игнорируй(?:те)?|"
+    r"show|find|list|read|open|search|browse|download|retrieve|ignore|look\s+(?:for|through|in))\b", re.I
+)
+_KB_EXPLANATION_OBJECT = re.compile(
+    r"^\s*(?:мне\s+)?(?:пример\w*|образец\w*|цитат\w*|фраз\w*|объяснен\w*|"
+    r"почему|зачем|как|что\s+(?:значит|означает)|example\w*|quotation\w*|quote\w*|"
+    r"meaning|why|how|what\s+(?:does|means?))\b", re.I
+)
+_KB_PROHIBITIVE_TAIL = re.compile(
+    r"(?:,\s*)?(?:но\s+)?(?:пожалуйста\s+)?"
+    r"(?:не\s+(?:ищи(?:те)?|используй(?:те)?|открывай(?:те)?|показывай(?:те)?)|"
+    r"(?:do\s+not|don't|don’t)\s+(?:search|look|use|open|show))\b.*$", re.I
+)
+_KB_NOUN = r"(?:баз(?:а|ы|е|у|ой|ах|ам|ами)?\s+знани[йя]|knowledge\s+bases?|kbs?)"
+_KB_BROAD_SCOPE = re.compile(
+    r"\b(?:(?:все|всех|всем|друг\w*|остальн\w*|чуж\w*)\s+"
+    r"(?:(?:доступн\w*|существующ\w*|известн\w*)\s+)?" + _KB_NOUN + r"|"
+    r"(?:all|every|other|another)\s+(?:(?:available|accessible|existing)\s+)?" + _KB_NOUN + r"|"
+    r"(?:неподключенн\w*|не\s+подключенн\w*)\s+" + _KB_NOUN + r"|"
+    r"(?:unattached|unconnected)\s+" + _KB_NOUN + r")\b", re.I
+)
+_KB_QUOTED_NAME = re.compile(
+    r"\b(баз(?:а|ы|е|у|ой|ах|ам|ами)(?:\s+знани[йя])?|knowledge\s+base|kb)"
+    r"\s*[«\"“']([^»\"”'\r\n]{1,200})[»\"”']", re.I
+)
+_KB_DOCUMENT_LIST = re.compile(
+    r"\b(?:названия\s+(?:документов|файлов)|список\s+(?:документов|файлов)|"
+    r"документы|документов|documents|files)\b", re.I
+)
+
+
+def _knowledge_name(value):
+    return re.sub(r"[^a-zа-я0-9]+", " ", value.casefold().replace("ё", "е")).strip()
+
+
+def _without_quoted_requests(text):
+    # Preserve quoted collection titles and URLs, but mask complete quoted
+    # requests before sentence splitting, including nested Russian quotations.
+    closers = {"«": "»", "“": "”", '"': '"', "'": "'"}
+    stack, spans = [], []
+    start = 0
+    for index, character in enumerate(text):
+        if character == "'" and index and index + 1 < len(text) and text[index - 1].isalnum() and text[index + 1].isalnum():
+            continue  # English contractions are not quotation boundaries.
+        if stack and character == stack[-1]:
+            stack.pop()
+            if not stack and _KB_REQUEST_START.match(text[start + 1:index]):
+                spans.append((start, index + 1))
+        elif character in closers:
+            if not stack:
+                start = index
+            stack.append(closers[character])
+    for start, end in reversed(spans):
+        text = text[:start] + " " * (end - start) + text[end:]
+    return text
+
+
+def knowledge_scope_reply(message, allowed_knowledge_ids, allowed_knowledge_names=None):
+    """Fast refusal for explicit foreign-KB requests; uncertain prose stays on the scoped path."""
+    if not isinstance(message, str):
+        return None
+    allowed_ids = set(_knowledge_ids(allowed_knowledge_ids) or [])
+    if not allowed_ids:
+        return None
+    names = list(DEFAULT_KNOWLEDGE_NAMES)
+    if isinstance(allowed_knowledge_names, list):
+        names.extend(name for name in allowed_knowledge_names[:20] if isinstance(name, str) and len(name) <= 200)
+    allowed_names = {_knowledge_name(name) for name in names}
+    text = message[:12_000].casefold().replace("ё", "е")
+    # Quoted examples and code are data, not direct requests. A title quoted
+    # inside a direct request remains available for explicit target checking.
+    text = re.sub(r"(?ms)^\s*```[^\n]*\n.*?(?:^\s*```[^\n]*(?:\n|$)|\Z)", "\n", text)
+    text = _without_quoted_requests(text)
+    for clause in re.split(r"(?<=[.!?;])\s+|\n+", text):
+        if len(clause) > 2000 or clause.lstrip().startswith((">", '"', "'", "«", "“", "`")):
+            continue
+        request = _KB_REQUEST_START.match(clause)
+        if not request or _KB_EXPLANATION_OBJECT.match(clause[request.end():]):
+            continue
+        clause = _KB_PROHIBITIVE_TAIL.sub("", clause)
+        target_ids = _KB_PATH.findall(clause)
+        for target in _KB_TYPED_ID.findall(clause):
+            target_ids.extend(re.findall(_KB_UUID_TEXT, target, re.I))
+        if any(str(UUID(target)) not in allowed_ids for target in target_ids):
+            return KB_SCOPE_REPLY
+        if _KB_BROAD_SCOPE.search(clause):
+            return KB_SCOPE_REPLY
+        for noun, title in _KB_QUOTED_NAME.findall(clause):
+            explicit_knowledge = "знани" in noun or noun.startswith(("knowledge", "kb"))
+            if (explicit_knowledge or _KB_DOCUMENT_LIST.search(clause)) and _knowledge_name(title) not in allowed_names:
+                return KB_SCOPE_REPLY
+    return None
 
 
 # Standalone copies of the bounded dialogue policy and redaction from app/services/chat.
@@ -531,6 +657,114 @@ def record_call(message, name, arguments, result):
     ]
 
 
+def _timing_state(metadata):
+    state = metadata.get(TIMING_MARKER) if isinstance(metadata, dict) else None
+    return state if (isinstance(state, dict) and state.get("message_id") == metadata.get("message_id")) else None
+
+
+def _milliseconds(value):
+    return round(value, 3) if type(value) in {int, float} and math.isfinite(value) and 0 <= value <= 3_600_000 else None
+
+
+def _clock():
+    try:
+        value = perf_counter()
+        return value if type(value) in {int, float} and math.isfinite(value) else None
+    except Exception:
+        return None
+
+
+def _timing_log(metadata, event, **values):
+    try:
+        log.info("AI_SUPPORT_TIMING %s", json.dumps({"event": event, "message_id": metadata.get("message_id"),
+                                                   **values}, ensure_ascii=False, allow_nan=False))
+    except Exception:
+        pass  # Diagnostics must never turn a valid reply into a chat error.
+
+
+@contextmanager
+def _measure(metadata, stage):
+    started = _clock()
+    try:
+        yield
+    finally:
+        try:
+            state, finished = _timing_state(metadata), _clock()
+            if state is not None and started is not None and finished is not None:
+                elapsed = _milliseconds((finished - started) * 1000)
+                if elapsed is not None:
+                    state.setdefault("stages_ms", {})[stage] = state.get("stages_ms", {}).get(stage, 0) + elapsed
+                    state.setdefault("stage_calls", {})[stage] = state.get("stage_calls", {}).get(stage, 0) + 1
+        except Exception:
+            pass
+
+
+async def _timed(metadata, stage, awaitable):
+    with _measure(metadata, stage):
+        return await awaitable
+
+
+def _owned_timing(metadata, route=None):
+    state = _timing_state(metadata)
+    if state is not None:
+        state["owned"] = True
+        if route:
+            state["route"] = route
+
+
+def _approved_names(model, knowledge_ids):
+    allowed = set(_knowledge_ids(knowledge_ids) or [])
+    knowledge = (model.get("info", {}).get("meta", {}).get("knowledge") or []) if isinstance(model, dict) else []
+    return [item["name"] for item in knowledge if isinstance(item, dict) and item.get("id") in allowed
+            and isinstance(item.get("name"), str) and len(item["name"]) <= 200]
+
+
+def _timing_message(body, metadata):
+    return next((message for message in reversed(body.get("messages", []))
+                 if message.get("role") == "assistant" and message.get("id") == metadata.get("message_id")), None)
+
+
+def _native_timings(message):
+    timings = {}
+    if not isinstance(message, dict):
+        return timings
+    for name, _, result in tool_results(message):
+        if name not in {SEARCH_TOOL, READ_TOOL, IMAGE_TOOL} or not isinstance(result, dict):
+            continue
+        elapsed = _milliseconds(result.get("timing_ms"))
+        if elapsed is not None:
+            timings[name] = round(timings.get(name, 0) + elapsed, 3)
+    return timings
+
+
+def _finish_timings(body, metadata, outlet_started, native_timings, show):
+    state = _timing_state(metadata)
+    if state is None or not state.get("owned"):
+        return body
+    finished = _clock()
+    outlet_ms = (_milliseconds((finished - outlet_started) * 1000)
+                 if finished is not None and outlet_started is not None else None)
+    inlet_end = state.get("inlet_finished")
+    pipeline_ms = (_milliseconds((outlet_started - inlet_end) * 1000)
+                   if type(inlet_end) in {int, float} and outlet_started is not None else None)
+    inlet_ms = _milliseconds(state.get("inlet_ms"))
+    report = {"version": "0.6.0", "route": state.get("route", "support"),
+              "inlet_ms": inlet_ms, "pipeline_ms": pipeline_ms, "outlet_ms": outlet_ms,
+              "total_ms": round(inlet_ms + pipeline_ms + outlet_ms, 3)
+              if all(value is not None for value in (inlet_ms, pipeline_ms, outlet_ms)) else None,
+              "stages_ms": {key: round(value, 3) for key, value in state.get("stages_ms", {}).items()},
+              "stage_calls": dict(state.get("stage_calls", {})), "native_tools_ms": native_timings,
+              "note": "pipeline_ms включает обработку Open WebUI, модель и Native-инструменты; "
+                      "native_tools_ms входит в этот интервал. null означает, что этап не измерен."}
+    _timing_log(metadata, "completed", **report)
+    message = _timing_message(body, metadata)
+    if not show or message is None or any(name == TIMING_TOOL for name, _, _ in tool_results(message)):
+        return body
+    updated = copy.deepcopy(body)
+    record_call(_timing_message(updated, metadata), TIMING_TOOL, {}, report)
+    return updated
+
+
 def annotate_flow(message, images, flow):
     wanted = [item.get("file_id") for item in images]
     for item in message.get("output", []):
@@ -743,6 +977,8 @@ class _Runtime:
 class Filter:
     class Valves(BaseModel):
         priority: int = 20
+        timing_enabled: bool = Field(default=True, description="Измерять этапы AI Support без записи текста сообщений.")
+        show_timings: bool = Field(default=True, description="Показывать замеры в результате ai_support_timings только администратору.")
         enabled_model_ids: list[str] = Field(default_factory=lambda: ["ai-support"])
         image_tool_id: str = Field(default="", description="Обычно пусто: используется разрешённый инструмент текущего запроса.")
         allowed_tool_ids: list[str] = Field(default_factory=lambda: ["ai_support"],
@@ -754,6 +990,28 @@ class Filter:
         self.valves = self.Valves()
 
     async def inlet(self, body: dict, __user__=None, __request__=None, __metadata__=None, __model__=None) -> dict:
+        metadata = __metadata__ if isinstance(__metadata__, dict) else {}
+        model_id = (__model__.get("id") if isinstance(__model__, dict) else None) or body.get("model")
+        metadata.pop(TIMING_MARKER, None)
+        if (self.valves.timing_enabled and model_id in self.valves.enabled_model_ids
+                and _uuid(metadata.get("chat_id")) and metadata.get("session_id")
+                and metadata.get("message_id") and __request__ and isinstance(__user__, dict) and __user__.get("id")):
+            metadata[TIMING_MARKER] = {"message_id": metadata["message_id"], "inlet_started": _clock()}
+        try:
+            return await self._inlet(body, __user__, __request__, __metadata__, __model__)
+        finally:
+            try:
+                state = _timing_state(metadata)
+                if state is not None:
+                    state["inlet_finished"] = _clock()
+                    state["inlet_ms"] = (_milliseconds((state["inlet_finished"] - state["inlet_started"]) * 1000)
+                                         if state["inlet_finished"] is not None and state["inlet_started"] is not None else None)
+                    _timing_log(metadata, "inlet_completed", inlet_ms=state["inlet_ms"],
+                                route=state.get("route", "support"))
+            except Exception:
+                pass
+
+    async def _inlet(self, body: dict, __user__=None, __request__=None, __metadata__=None, __model__=None) -> dict:
         metadata = __metadata__ if isinstance(__metadata__, dict) else {}
         model = __model__ if isinstance(__model__, dict) else {}
         if (model.get("id") not in self.valves.enabled_model_ids or not _uuid(metadata.get("chat_id"))
@@ -774,6 +1032,7 @@ class Filter:
         if chat_meta.get("internal") is True and chat_meta.get("type") == "note":
             raise ValueError("Для AI Support откройте обычный чат. Чат заметки добавляет посторонний контекст.")
         metadata.pop(REFUSAL_MARKER, None)
+        metadata.pop(SCOPE_REFUSAL_MARKER, None)
         model_meta = model.get("info", {}).get("meta") or {}
         if ((model_meta.get("capabilities") or {}).get("builtin_tools") is not False
                 or model_meta.get("skillIds") or ENABLE_KB_EXEC or body.get("tools")):
@@ -782,6 +1041,9 @@ class Filter:
         messages = body.get("messages") or []
         current = next((item for item in reversed(messages) if item.get("role") == "user"), {})
         refused = refusal_reply(current.get("content", ""))
+        scope_refusal = knowledge_scope_reply(current.get("content", ""), self.valves.allowed_knowledge_ids,
+                                             _approved_names(model, self.valves.allowed_knowledge_ids))
+        refused = refused or scope_refusal
         updated = copy.deepcopy(body)
         allowed = [self.valves.image_tool_id] if self.valves.image_tool_id else self.valves.allowed_tool_ids
         updated["tool_ids"] = [tool_id for tool_id in (updated.get("tool_ids") or []) if tool_id in allowed]
@@ -799,21 +1061,29 @@ class Filter:
             updated["messages"] = [
                 {"role": "system", "content": "Верни дословно текст единственного сообщения пользователя. "
                  "Ответ должен быть коротким, без инструментов и дополнительных действий."},
-                {"role": "user", "content": REFUSAL},
+                {"role": "user", "content": refused},
             ]
             updated["tool_ids"] = []
             updated["tools"] = []
             updated["files"] = []
             updated["features"] = {}
             updated["temperature"] = 0
-            updated["max_tokens"] = 256
+            updated["max_tokens"] = 128 if refused == KB_SCOPE_REPLY else 256
             for name in ("response_format", "options", "format", "stop", "tool_choice", "function_call", "functions"):
                 updated.pop(name, None)
             params = metadata.get("params") if isinstance(metadata.get("params"), dict) else {}
             metadata["params"] = {**params, "function_calling": "legacy"}
             updated["params"] = {"function_calling": "legacy"}
             metadata.update({REFUSAL_MARKER: metadata.get("message_id"), "tool_ids": [], "tools": {},
-                             "files": [], "features": {}, "skill_ids": [], "terminal_id": None})
+                             "files": [], "folder_knowledge": [], "features": {}, "skill_ids": [], "terminal_id": None})
+            if refused == KB_SCOPE_REPLY:
+                metadata[SCOPE_REFUSAL_MARKER] = metadata.get("message_id")
+            state = _timing_state(metadata)
+            if state is not None:
+                state["route"] = "scope_refusal" if refused == KB_SCOPE_REPLY else "protected_refusal"
+            if isinstance(updated.get("metadata"), dict):
+                updated["metadata"].update({key: metadata[key] for key in
+                                           ("files", "folder_knowledge", "tool_servers", "tool_ids", "tools", "features")})
             return updated
 
         from open_webui.models.knowledge import Knowledges
@@ -887,6 +1157,32 @@ class Filter:
                      __event_emitter__=None, __model__=None) -> dict:
         metadata = __metadata__ if isinstance(__metadata__, dict) else {}
         model_id = (__model__.get("id") if isinstance(__model__, dict) else None) or body.get("model")
+        tracked = (self.valves.timing_enabled and model_id in self.valves.enabled_model_ids
+                   and _uuid(metadata.get("chat_id")) and metadata.get("session_id") and metadata.get("message_id")
+                   and isinstance(__user__, dict) and __user__.get("id") and __request__
+                   and callable(__event_emitter__) and not metadata.get("task") and not metadata.get("internal"))
+        if tracked and _timing_state(metadata) is None:
+            metadata[TIMING_MARKER] = {"message_id": metadata["message_id"]}
+        elif not self.valves.timing_enabled:
+            metadata.pop(TIMING_MARKER, None)
+        started = _clock()
+        try:
+            native_timings = _native_timings(_timing_message(body, metadata)) if tracked else {}
+        except Exception:
+            native_timings = {}
+        result = await self._outlet(body, __user__, __request__, __metadata__, __event_emitter__, __model__)
+        if tracked:
+            try:
+                return _finish_timings(result, metadata, started, native_timings,
+                                       self.valves.show_timings and __user__.get("role") == "admin")
+            except Exception:
+                pass
+        return result
+
+    async def _outlet(self, body: dict, __user__=None, __request__=None, __metadata__=None,
+                      __event_emitter__=None, __model__=None) -> dict:
+        metadata = __metadata__ if isinstance(__metadata__, dict) else {}
+        model_id = (__model__.get("id") if isinstance(__model__, dict) else None) or body.get("model")
         if (model_id not in self.valves.enabled_model_ids or not _uuid(metadata.get("chat_id"))
                 or not metadata.get("session_id") or not metadata.get("message_id")
                 or not isinstance(__user__, dict) or not __user__.get("id")
@@ -911,22 +1207,33 @@ class Filter:
         completion = "Проверка инструкции завершена"
         try:
             refused = refusal_reply(user_text)
-            if metadata.get(REFUSAL_MARKER) == metadata["message_id"]:
-                refused = REFUSAL
+            if not refused:
+                if metadata.get(SCOPE_REFUSAL_MARKER) == metadata["message_id"]:
+                    refused = KB_SCOPE_REPLY
+                elif metadata.get(REFUSAL_MARKER) == metadata["message_id"]:
+                    refused = REFUSAL
+                else:
+                    refused = knowledge_scope_reply(user_text, self.valves.allowed_knowledge_ids,
+                                                    _approved_names(__model__, self.valves.allowed_knowledge_ids))
             if refused:
-                if not await runtime.authorize_owner():
+                if not await _timed(metadata, "authorize_owner", runtime.authorize_owner()):
                     return body
+                _owned_timing(metadata, "scope_refusal" if refused == KB_SCOPE_REPLY else "protected_refusal")
                 updated = neutral_response(body, current_index, refused)
-                record_call(updated["messages"][current_index], DIALOGUE_TOOL, {}, {"route": "REFUSE"})
+                record_call(updated["messages"][current_index], DIALOGUE_TOOL, {},
+                            {"route": "REFUSE", **({"reason": "knowledge_scope"} if refused == KB_SCOPE_REPLY else {})})
                 return updated
-            if not await runtime.authorize():
+            authorized = await _timed(metadata, "authorize_tools", runtime.authorize())
+            if getattr(runtime, "owner_authorized", False):
+                _owned_timing(metadata)
+            if not authorized:
                 if getattr(runtime, "owner_authorized", False):
                     # A duplicate old completed endpoint may omit tools. Keep an
                     # already processed delivery only if private PNG proof survives.
                     for name, _, result in tool_results(messages[current_index]):
                         if (name == IMAGE_TOOL and isinstance(result, dict)
                                 and result.get("_ai_support_flow", {}).get("processed")
-                                and await runtime.verify(messages[current_index], result)):
+                                and await _timed(metadata, "verify", runtime.verify(messages[current_index], result))):
                             return body
                     await report_status(__event_emitter__, "Обработчик знаний не подключён к этому чату", True)
                     return neutral_response(body, current_index,
@@ -939,7 +1246,7 @@ class Filter:
             # Render a real manual delivery once; repeated outlet runs do not upload/render twice.
             for name, arguments, result in tool_results(current):
                 if (name == IMAGE_TOOL and isinstance(result, dict) and result.get("displayed") is True
-                        and await runtime.verify(current, result)):
+                        and await _timed(metadata, "verify", runtime.verify(current, result))):
                     if (result.get("_ai_support_flow", {}).get("processed")
                             and result.get("_ai_support_flow", {}).get("layout") == "inline"):
                         return body
@@ -949,18 +1256,20 @@ class Filter:
                     return body
             dialogue_checked = not keep_current and not existing and not requires_support(user_text)
             if dialogue_checked:
-                routed = await runtime.dialogue(user_text, messages[:current_index])
+                routed = await _timed(metadata, "dialogue", runtime.dialogue(user_text, messages[:current_index]))
                 if isinstance(routed, dict):
                     reply = REFUSAL if routed.get("route") == "REFUSE" else (
                         safe_social_reply(routed.get("reply")) if routed.get("route") == "SOCIAL" else None
                     )
                     if reply:
+                        _owned_timing(metadata, "protected_refusal" if routed["route"] == "REFUSE" else "social")
                         updated = neutral_response(body, current_index, reply)
                         record_call(updated["messages"][current_index], DIALOGUE_TOOL, {}, {"route": routed["route"]})
                         return updated
             query = problem_query(messages, user_entries)
             if not keep_current and not search_terms(query) and not has_technical_actions(current.get("content", "")):
                 if dialogue_checked:
+                    _owned_timing(metadata, "social")
                     updated = neutral_response(body, current_index,
                                                "Здравствуйте! Могу помочь с рабочей проблемой или поговорить на обычную тему.")
                     record_call(updated["messages"][current_index], DIALOGUE_TOOL, {}, {"route": "SOCIAL"})
@@ -977,7 +1286,7 @@ class Filter:
                     continue
                 for name, arguments, result in reversed(list(tool_results(message))):
                     if (name == IMAGE_TOOL and isinstance(result, dict) and result.get("displayed") is True
-                            and await runtime.verify(message, result)):
+                            and await _timed(metadata, "verify", runtime.verify(message, result))):
                         previous = (message, arguments, result)
                         break
                 # An intervening answer starts a new flow. Never resume an older unrelated guide.
@@ -1002,7 +1311,7 @@ class Filter:
             if not _uuid(file_id):
                 if len(search_terms(query)) < 2:
                     return missing_source_reply(body, current_index)
-                searched = await runtime.search(query)
+                searched = await _timed(metadata, "search", runtime.search(query))
                 chunks = searched.get("chunks", []) if isinstance(searched, dict) else []
                 available = isinstance(searched, dict) and searched.get("status") == "ok"
                 file_id = choose_search_source(query, chunks) if available else None
@@ -1022,7 +1331,7 @@ class Filter:
                     record_call(updated["messages"][current_index], SEARCH_TOOL,
                                 {"query": query, "count": 8}, search_trace)
                     return updated
-            document = await runtime.read(file_id)
+            document = await _timed(metadata, "read", runtime.read(file_id))
             if (not isinstance(document, dict) or document.get("status") != "ready"
                     or document.get("source", {}).get("file_id") != file_id):
                 if pinned or existing:
@@ -1070,7 +1379,7 @@ class Filter:
                 selection, offset = existing[0].get("image_numbers", "auto"), existing[0].get("offset", 0)
             else:
                 existing = None
-                result = await runtime.show(file_id, selection, offset)
+                result = await _timed(metadata, "photos", runtime.show(file_id, selection, offset))
             if not isinstance(result, dict):
                 return body
             updated = copy.deepcopy(body)
@@ -1111,8 +1420,9 @@ class Filter:
                 annotate_flow(response, result["images"], next_flow)
             else:
                 record_call(response, IMAGE_TOOL, {"file_id": file_id, "image_numbers": selection, "offset": offset}, result)
-            replace_text(response, render_steps(document, result.get("images", []), next_flow["has_more"], clarification))
-            if not await runtime.present_inline(response, result):
+            with _measure(metadata, "render"):
+                replace_text(response, render_steps(document, result.get("images", []), next_flow["has_more"], clarification))
+            if not await _timed(metadata, "persist", runtime.present_inline(response, result)):
                 next_flow["processed"] = False
                 annotate_flow(response, result["images"], next_flow)
                 completion = "Фотографии получены, оформление ответа не сохранено"

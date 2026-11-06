@@ -3,8 +3,10 @@
 import asyncio
 import copy
 import importlib.util
+import inspect
 import io
 import json
+import math
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -954,6 +956,8 @@ def test_search_forces_approved_scope_and_filters_foreign_results_even_for_admin
     result = json.loads(run(image_tool.Tools().search_approved_instructions(
         "Настройка сканера", __user__={"id": "employee", "role": "admin"}, __request__=request,
     )))
+    elapsed = result.pop("timing_ms")
+    assert type(elapsed) in {int, float} and math.isfinite(elapsed) and 0 <= elapsed <= 3_600_000
     assert result == {"status": "ok", "knowledge_ids": [KNOWLEDGE_ID], "chunks": [
         {"content": "Разрешённый результат.", "source": "Сканер.docx", "file_id": SOURCE_ID},
     ]}
@@ -1026,3 +1030,109 @@ def test_search_requires_current_authenticated_request(image_tool, monkeypatch, 
     )))
     assert result["status"] == "error" and result["code"] == "missing_context"
     assert not state.calls and not state.queries and "chunks" not in result
+
+
+@pytest.mark.parametrize("name,parameters", [
+    ("search_approved_instructions", ["self", "query", "count", "__user__", "__request__"]),
+    ("read_approved_instruction", ["self", "file_id", "__user__", "__request__"]),
+    ("show_instruction_images", ["self", "file_id", "image_numbers", "offset", "__user__", "__request__",
+                                 "__event_emitter__", "__metadata__", "__allow_continuation__"]),
+])
+def test_timing_preserves_native_tool_schema_and_documentation(image_tool, name, parameters):
+    method = getattr(image_tool.Tools, name)
+    original = inspect.unwrap(method)
+    signature = inspect.signature(method)
+    assert list(signature.parameters) == parameters
+    assert signature == inspect.signature(original)
+    assert method.__annotations__ == original.__annotations__
+    assert method.__doc__ == original.__doc__ and ":param" in method.__doc__
+    assert method.__name__ == name and inspect.iscoroutinefunction(method)
+    assert not any(parameter.kind in {parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD}
+                   for parameter in signature.parameters.values())
+    public_methods = [attribute for attribute in dir(image_tool.Tools())
+                      if not attribute.startswith("_") and callable(getattr(image_tool.Tools(), attribute))
+                      and not inspect.isclass(getattr(image_tool.Tools(), attribute))]
+    assert sorted(public_methods) == ["read_approved_instruction", "search_approved_instructions",
+                                      "show_instruction_images"]
+
+
+def measured_operation(image_tool, monkeypatch, operation, *, decorated, denied=False):
+    """Compare a real public operation with its original implementation and effects."""
+    tool = image_tool.Tools()
+    method = getattr(tool, operation) if decorated else getattr(image_tool.Tools, operation).__wrapped__
+    if not decorated:
+        method = method.__get__(tool, image_tool.Tools)
+    if operation == "search_approved_instructions":
+        state = scoped_search_store(monkeypatch, permitted=not denied)
+        result = json.loads(run(method("Настройка сканера", __user__={"id": "employee"},
+                                       __request__=SimpleNamespace())))
+        return result, {"queries": len(state.queries), "calls": state.calls}
+
+    runtime = FakeRuntime(image_tool, instruction(("Первая кнопка.", "Вторая кнопка.")))
+    monkeypatch.setattr(image_tool, "_OpenWebUI", lambda: runtime)
+    events = []
+
+    async def emit(event):
+        events.append(event)
+
+    arguments = {"file_id": SOURCE_ID, "__user__": None if denied else {"id": "employee"},
+                 "__request__": SimpleNamespace()}
+    if operation == "show_instruction_images":
+        arguments.update(image_numbers="1,2", __event_emitter__=emit)
+    result = json.loads(run(method(**arguments)))
+    return result, {"authorizations": runtime.authorizations, "uploads": runtime.uploads,
+                    "discarded": runtime.discarded, "events": events}
+
+
+@pytest.mark.parametrize("operation", ["search_approved_instructions", "read_approved_instruction",
+                                       "show_instruction_images"])
+def test_timing_changes_only_metric_and_never_repeats_source_or_photo_delivery(image_tool, monkeypatch, operation):
+    expected, expected_effects = measured_operation(image_tool, monkeypatch, operation, decorated=False)
+    ticks = iter([10, 10.0125])
+    monkeypatch.setattr(image_tool, "perf_counter", lambda: next(ticks))
+    result, effects = measured_operation(image_tool, monkeypatch, operation, decorated=True)
+    assert result.pop("timing_ms") == 12.5
+    assert result == expected and effects == expected_effects
+    if operation == "search_approved_instructions":
+        assert effects["queries"] == 1
+    else:
+        assert len(effects["authorizations"]) == 2
+        assert len(effects["uploads"]) == (2 if operation == "show_instruction_images" else 0)
+        assert len(effects["events"]) == (1 if operation == "show_instruction_images" else 0)
+
+
+@pytest.mark.parametrize("operation", ["search_approved_instructions", "read_approved_instruction",
+                                       "show_instruction_images"])
+@pytest.mark.parametrize("failure", ["start", "end"])
+@pytest.mark.parametrize("denied", [False, True], ids=["success", "denied"])
+def test_failed_timing_clock_preserves_real_operation_and_access_denial(image_tool, monkeypatch,
+                                                                      operation, failure, denied):
+    expected, expected_effects = measured_operation(image_tool, monkeypatch, operation,
+                                                  decorated=False, denied=denied)
+    calls = []
+
+    def clock():
+        calls.append(None)
+        if failure == "start" or len(calls) == 2:
+            raise OSError("Timing clock unavailable")
+        return 10
+
+    monkeypatch.setattr(image_tool, "perf_counter", clock)
+    result, effects = measured_operation(image_tool, monkeypatch, operation, decorated=True, denied=denied)
+    assert "timing_ms" not in result
+    assert result == expected and effects == expected_effects
+    assert len(calls) == (1 if failure == "start" else 2)
+    if denied:
+        assert result["status"] == "error" and not {"content", "source", "chunks", "images"}.intersection(result)
+        assert effects.get("queries", 0) == 0 and effects.get("uploads", []) == []
+
+
+@pytest.mark.parametrize("elapsed", [-1, float("nan"), float("inf"), 3_600_001])
+def test_invalid_elapsed_measurement_cannot_change_access_denial(image_tool, monkeypatch, elapsed):
+    expected, expected_effects = measured_operation(image_tool, monkeypatch, "search_approved_instructions",
+                                                  decorated=False, denied=True)
+    ticks = iter([0, elapsed / 1000])
+    monkeypatch.setattr(image_tool, "perf_counter", lambda: next(ticks))
+    result, effects = measured_operation(image_tool, monkeypatch, "search_approved_instructions",
+                                        decorated=True, denied=True)
+    assert result == expected and effects == expected_effects and "timing_ms" not in result
