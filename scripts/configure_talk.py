@@ -108,7 +108,7 @@ def _closing_quote(value):
     return None
 
 
-def env_records(text):
+def env_records(text, *, replaced_keys=()):
     """Keep unrelated records verbatim, including quoted multiline values."""
     lines = iter(text.splitlines(keepends=True))
     records, critical = [], set()
@@ -134,7 +134,7 @@ def env_records(text):
                 tail = value[end + 1:].strip()
                 if tail and not tail.startswith("#"):
                     raise SetupError(".env содержит неоднозначную запись после кавычек; файл не изменён.")
-        if key in PRESERVED_CRITICAL_KEYS:
+        if key in PRESERVED_CRITICAL_KEYS and key not in replaced_keys:
             if key in critical:
                 raise SetupError(".env содержит повтор критичного параметра; устраните неоднозначность вручную.")
             critical.add(key)
@@ -152,7 +152,7 @@ def _env_path(project_root):
     return path
 
 
-def _read_existing(project_root):
+def _read_existing(project_root, *, replaced_keys=()):
     path = _env_path(project_root)
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     with os.fdopen(descriptor, "rb") as stream:
@@ -164,12 +164,12 @@ def _read_existing(project_root):
         text = data.decode("utf-8")
     except UnicodeDecodeError:
         raise SetupError(".env должен иметь кодировку UTF-8; файл не изменён.") from None
-    return path, data, info, env_records(text)
+    return path, data, info, env_records(text, replaced_keys=replaced_keys)
 
 
 def write_configuration(project_root, configuration):
     updates = configuration.values()
-    path, original, initial, records = _read_existing(project_root)
+    path, original, initial, records = _read_existing(project_root, replaced_keys=updates)
     newline = "\r\n" if b"\r\n" in original else "\n"
     written, output = set(), []
     for key, raw, _ in records:

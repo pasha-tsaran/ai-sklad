@@ -6,7 +6,6 @@ from dataclasses import dataclass, field
 from datetime import timezone
 from uuid import NAMESPACE_URL, uuid5
 
-from pydantic import ValidationError
 from sqlalchemy import select
 
 from app.core.logging import event
@@ -22,6 +21,7 @@ from app.services.chat.policies import FORM_ACTION, MAX_ATTEMPTS, TERMINAL_STATE
 from app.services.chat.service import messenger
 from app.services.rag.openwebui import save_snapshot
 from app.services.rag.talk import ApprovedTalkDocument, KnowledgeUnavailable, TalkKnowledge
+from app.services.ticketing.intake import parse_intake
 from app.services.ticketing.service import collect_details
 from integrations.openwebui.automatic_instruction_images import (
     TIMING_MARKER, _clock, _measure, _milliseconds,
@@ -32,15 +32,21 @@ from integrations.openwebui.automatic_instruction_images import (
 
 UNAVAILABLE = "Сейчас не удалось проверить базу знаний. Повторите вопрос немного позже или напишите «оператор»."
 CHANGED = "Инструкция изменилась или доступ к ней недоступен. Продолжение приостановлено до проверки актуального источника."
-FORM_HELP = ("Отправьте одним сообщением:\nФИО: ...\nЛогин: ...\nКомпьютер: ...\nТема: ...\n"
-             "Описание: ...\n\nЧтобы продолжить с ботом без отправки заявки, напишите «Отмена» или «2».")
+FORM_HELP = ("Напишите как вас зовут, ваш рабочий логин, имя компьютера и суть проблемы — "
+             "можно своими словами, без подписей полей.\n\n"
+             "Чтобы продолжить с ботом без оформления письма, напишите «Отмена» или «2».")
 ESCALATION_MENU = ("Как продолжим?\n1 — оформить письмо в техническую поддержку.\n"
                    "2 — продолжить диалог с ботом.\n\nМожно ответить цифрой или словами. Заявка пока не отправлена.")
 RESUME_GUIDE = ("Продолжим с ботом с того же шага. Заявка не отправлена. "
                 "Напишите, что не получается, или «Готово», если выполнили показанные действия.")
 BACK_TO_BOT = "Продолжим с ботом. Опишите, с каким вопросом нужна помощь."
-FORM_FIELDS = {"фио": "account_holder_name", "логин": "account_login", "компьютер": "computer_name",
-               "тема": "subject", "описание": "additional_info"}
+INTAKE_QUESTIONS = {
+    "account_holder_name": "Как вас зовут?",
+    "account_login": "Какой у вас рабочий логин?",
+    "computer_name": "Как называется ваш рабочий компьютер?",
+    "subject": "В чём нужна помощь? Кратко опишите проблему.",
+    "additional_info": "Напишите дополнительное описание короче — до 2000 символов.",
+}
 CLARIFY_QUESTIONS = {
     "DEVICE_MODEL": "Какое устройство не работает? Напишите его название и модель, если она указана на корпусе.",
     "CONNECTION": "Как устройство подключено: кабелем USB к компьютеру, сетевым кабелем или по Wi-Fi?",
@@ -94,16 +100,29 @@ def _report_timing(metadata, started, route, block_count, error_code=None):
         pass  # Diagnostics never change the stored employee reply.
 
 
-def _form(message):
-    values = {}
-    for line in message.splitlines():
-        name, separator, value = line.partition(":")
-        if separator and name.strip().casefold() in FORM_FIELDS:
-            values[FORM_FIELDS[name.strip().casefold()]] = value.strip()
-    try:
-        return EscalationDetails(**values)
-    except ValidationError:
-        return None
+def _intake_turn(message, flow, llm):
+    updated = copy.deepcopy(flow)
+    escalation = updated.get("escalation", {})
+    fields = copy.deepcopy(escalation.get("intake_fields", {}))
+    result = parse_intake(message, fields, llm, requested_field=escalation.get("intake_requested_field"))
+    if result.details is not None:
+        return Turn("FORM", details=result.details)
+    missing = next((key for key in result.missing if key in INTAKE_QUESTIONS), None)
+    updated["escalation"] = {**escalation, "stage": "FORM", "intake_fields": result.fields,
+                             "intake_requested_field": missing}
+    question = INTAKE_QUESTIONS[missing] if missing else "В чём нужна помощь? Кратко опишите проблему."
+    return Turn("REPLY", [(question, None)], flow=updated)
+
+
+def _intake_prompt(flow):
+    updated = copy.deepcopy(flow)
+    escalation = updated.get("escalation", {})
+    fields = escalation.get("intake_fields", {})
+    missing = escalation.get("intake_requested_field")
+    if missing not in INTAKE_QUESTIONS:
+        missing = next((key for key in INTAKE_QUESTIONS if key != "additional_info" and not fields.get(key)), "subject")
+    updated["escalation"] = {**escalation, "stage": "FORM", "intake_requested_field": missing}
+    return Turn("REPLY", [(INTAKE_QUESTIONS[missing], None)], flow=updated)
 
 
 def _normalized(message):
@@ -154,17 +173,10 @@ def _last_problem(flow, context):
     for value in (flow.get("query"), flow.get("clarification_query")):
         if isinstance(value, str) and value.strip() and not control(value):
             return value.strip()[:6000]
-    for item in reversed(context.get("short_term", {}).get("messages", [])):
-        text = item.get("content", "")
-        if item.get("role") == "user" and requires_support(text) and not control(text) and not _form_fields(text):
-            return text[:6000]
+    # Current reports are kept explicitly in flow. Recent conversation messages
+    # can be intake data, so they are not a fallback source for retrieval queries.
     subject = context.get("incident", {}).get("subject")
     return subject if isinstance(subject, str) and requires_support(subject) and not control(subject) else ""
-
-
-def _form_fields(message):
-    return any(line.partition(":")[0].strip().casefold() in FORM_FIELDS and ":" in line
-               for line in message.splitlines())
 
 
 def _problem_query(message, flow):
@@ -177,7 +189,16 @@ def _problem_query(message, flow):
 def _resume_turn(flow, context, llm, knowledge):
     saved = flow.get("escalation", {}).get("resume", {})
     restored = copy.deepcopy(saved.get("flow", {key: value for key, value in flow.items() if key != "escalation"}))
-    query = _last_problem(restored, context)
+    # An explicit empty problem is significant: personal data collected after
+    # the menu opened must never become a knowledge-search query on cancellation.
+    if "query" in saved:
+        query = saved["query"]
+    elif restored.get("query") or restored.get("clarification_query"):
+        query = _last_problem(restored, context)
+    else:
+        # Older pending forms have no resume query. Their original subject is
+        # safer than recent messages that may already contain intake data.
+        query = _last_problem({}, {"incident": context.get("incident", {})})
     if restored.get("source"):
         try:
             approved = knowledge.read(restored["source"]["file_id"])
@@ -313,12 +334,16 @@ def _turn(message, flow, context, previous_pending, llm, knowledge, settings):
         if choice == "RESUME":
             return _resume_turn(flow, context, llm, knowledge)
         if choice == "FORM_REQUEST" or intent == "HUMAN":
+            if flow.get("escalation", {}).get("intake_fields"):
+                return _intake_prompt(flow)
             return Turn("FORM_REQUEST", [(FORM_HELP, None)])
         if intent == "FEEDBACK" or is_confirmation(message):
-            return Turn("REPLY", [(FORM_HELP, None)])
-        if _form_fields(message):
-            details = _form(message)
-            return Turn("FORM", details=details) if details else Turn("REPLY", [(FORM_HELP, None)])
+            return _intake_prompt(flow)
+        if reply := _simple_social(message):
+            return Turn("REPLY", [(reply, None)])
+        # Everything else here is employee data for the pending letter. It must
+        # not be classified as chat or used to search for another instruction.
+        return _intake_turn(message, flow, llm)
     if _return_to_bot(message):
         if flow.get("source"):
             return Turn("REPLY", [("Продолжим с ботом. Напишите, что не получается на текущем шаге, "
@@ -359,9 +384,6 @@ def _turn(message, flow, context, previous_pending, llm, knowledge, settings):
                 return Turn("REPLY", [(reply, None)])
         except Exception:
             pass
-    if previous_pending == FORM_ACTION:
-        details = _form(message)
-        return Turn("FORM", details=details) if details else Turn("REPLY", [(FORM_HELP, None)])
     try:
         return _support_turn(message, flow, context, llm, knowledge)
     except KnowledgeUnavailable:
@@ -472,7 +494,8 @@ def _offer_escalation(session, incident, reason, flow, context):
             saved_flow = {"clarification_query": problem, "excluded": saved_flow.get("excluded", [])} if problem else {}
         resume = {"flow": saved_flow, "state": incident.state if pending else "DIAGNOSING",
                   "result": incident.result if pending else None}
-    problem = _last_problem(resume["flow"], context)
+    problem = resume["query"] if "query" in resume else _last_problem(resume["flow"], context)
+    resume["query"] = problem
     if problem:
         incident.description = problem[-8000:]
     incident.state, incident.pending_action = "DIAGNOSING", FORM_ACTION
@@ -621,7 +644,8 @@ def process_one(factory, settings, llm, knowledge=None, *, account_id=None):
         return True
     metadata = {"message_id": claimed["inbox_id"],
                 TIMING_MARKER: {"message_id": claimed["inbox_id"], "stages_ms": {}, "stage_calls": {}}}
-    timed_llm = _TimedProxy(llm, metadata, {"dialogue": "model_api", "analyze_context": "model_api"})
+    timed_llm = _TimedProxy(llm, metadata, {"dialogue": "model_api", "analyze_context": "model_api",
+                                           "extract_escalation": "model_api"})
     timed_knowledge = _TimedProxy(knowledge or TalkKnowledge(settings), metadata,
                                   {"search": "search", "read": "read", "is_current": "verify"})
     try:

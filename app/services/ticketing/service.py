@@ -9,6 +9,7 @@ from app.services.chat.audit import audit
 from app.services.chat.policies import FORM_ACTION
 from app.services.chat.service import add_user_message, enqueue, get_owned, messenger
 from app.services.mail.draft import make_eml, make_mailto
+from app.services.mail.presentation import letter_preview
 from app.services.rag.documents import Illustration
 
 
@@ -80,21 +81,21 @@ def collect_details(session, user_id, incident_id, details, settings):
             entered_fields
             + (f"\nИсходная проблема:\n{incident.description}\n" if incident.description else "")
         )}
-        link = make_mailto({**draft, "body": entered_fields}, settings.support_email)
+        escalation.email = draft
+        link = make_mailto(draft, settings.support_email)
         explanation = (
-            "Черновик письма подготовлен. Получатель: " + settings.support_email + ".\n"
-            "Откройте письмо в своей почтовой программе, проверьте данные и нажмите «Отправить». "
-            "Пока письмо не отправлено."
+            "Подготовлено письмо для технической поддержки.\n\n"
+            + letter_preview(draft, settings.support_email)
         )
         if link:
-            explanation += "\n\n[Открыть письмо](" + link + ")"
+            explanation += "\n\n[Открыть письмо в почте](" + link + ")"
         explanation += (
-            "\n\nТакже подготовлен файл support-request-….eml со всеми данными и исходной проблемой для отдельного сообщения. "
-            "Если ссылка не открывает почту, откройте этот файл в своей почтовой программе.\n"
+            "\n\nПроверьте письмо и отправьте его из своей почтовой программы. "
+            "Файл письма .eml придёт отдельным сообщением — его тоже можно открыть в почте.\n"
             "Чтобы вернуться к боту, напишите «Продолжить с ботом»."
         )
         messenger.send_blocks(session, incident.id, [
-            (explanation, Illustration("support-request.eml", "Черновик письма в поддержку", "message/rfc822",
+            (explanation, Illustration("support-request.eml", "Письмо для технической поддержки", "message/rfc822",
                                        make_eml(draft, settings.support_email))),
         ])
         escalation.status = "DRAFT"

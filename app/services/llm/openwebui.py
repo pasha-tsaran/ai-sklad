@@ -2,9 +2,9 @@ import httpx
 from langchain_core.runnables import RunnableLambda
 from langsmith import tracing_context
 
-from app.schemas.contracts import AnalysisResult, AnswerResult, DialogueResult, FollowupResult, SummaryResult
+from app.schemas.contracts import AnalysisResult, AnswerResult, DialogueResult, EscalationExtraction, FollowupResult, SummaryResult
 from app.services.llm.prompts import (
-    ANALYZE_TASK, COMPOSE_TASK, DIALOGUE_TASK, FOLLOWUP_TASK, SUMMARY_TASK, stage_messages,
+    ANALYZE_TASK, COMPOSE_TASK, DIALOGUE_TASK, ESCALATION_EXTRACTION_TASK, FOLLOWUP_TASK, SUMMARY_TASK, stage_messages,
 )
 
 
@@ -56,6 +56,9 @@ class OpenWebUILLM:
 
     def dialogue(self, message, context):
         return self._call(DialogueResult, DIALOGUE_TASK, {"message": message, "context": context})
+
+    def extract_escalation(self, message, context):
+        return self._call(EscalationExtraction, ESCALATION_EXTRACTION_TASK, {"message": message, "context": context})
 
     def analyze_context(self, message, context):
         return self._call(AnalysisResult, ANALYZE_TASK, {"message": message, "context": context})

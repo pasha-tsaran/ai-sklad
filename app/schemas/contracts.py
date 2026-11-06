@@ -19,11 +19,21 @@ class FeedbackRequest(StrictModel):
 
 
 class EscalationDetails(StrictModel):
-    account_holder_name: str = Field(min_length=3, max_length=255)
+    account_holder_name: str = Field(min_length=2, max_length=255)
     account_login: str = Field(min_length=1, max_length=100, pattern=r"^[^\r\n]+$")
     computer_name: str = Field(min_length=1, max_length=63, pattern=r"^[A-Za-z0-9_.-]+$")
     subject: str = Field(min_length=3, max_length=200, pattern=r"^[^\r\n]+$")
     additional_info: str = Field(default="", max_length=2000)
+
+
+class EscalationExtraction(StrictModel):
+    """Untrusted field candidates; backend must verify their verbatim evidence."""
+
+    account_holder_name: str | None = Field(default=None, max_length=255)
+    account_login: str | None = Field(default=None, max_length=100)
+    computer_name: str | None = Field(default=None, max_length=63)
+    subject: str | None = Field(default=None, max_length=200)
+    additional_info: str | None = Field(default=None, max_length=2000)
 
 
 class AnalysisResult(StrictModel):

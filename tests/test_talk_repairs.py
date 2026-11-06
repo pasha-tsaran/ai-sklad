@@ -13,6 +13,7 @@ from app import talk_worker
 from app.core.config import Settings, get_settings
 from app.models import Delivery, Escalation, Job, MessageAttachment
 from app.services.rag.talk import TalkKnowledge
+from app.services.mail.draft import make_mailto
 from app.workers.handlers import run_one
 from tests.test_talk_dialogue import QUESTION, Knowledge, talk as talk
 from tests.test_workflow import DETAILS
@@ -68,18 +69,20 @@ def test_complete_private_form_creates_exact_mail_draft_and_never_queues_smtp(ta
             assert expected in body
         delivery = session.scalar(select(Delivery).where(Delivery.message_id == drafts[0].message_id))
         assert delivery.account_id == talk.account_id and delivery.provenance is None
+        expected_link = make_mailto(escalation.email, "operator@example.net")
     replies = [text for role, text, photo in talk.snapshot()["messages"] if role == "assistant"]
-    assert any("Черновик письма подготовлен" in text and "Пока письмо не отправлено" in text for text in replies)
+    assert any("Подготовлено письмо для технической поддержки." in text and "Кому: operator@example.net" in text for text in replies)
     assert not any("Письмо поставлено в очередь" in text for text in replies)
-    text = next(text for text in replies if "Черновик письма подготовлен" in text)
-    link = re.search(r"\[Открыть письмо\]\((mailto:[^)]+)\)", text)
-    if len(extra) < 100:
+    text = next(text for text in replies if "Подготовлено письмо для технической поддержки." in text)
+    link = re.search(r"\[Открыть письмо в почте\]\((mailto:[^)]+)\)", text)
+    if expected_link:
         assert link is not None
         uri = urlsplit(link.group(1))
         assert uri.path == "operator@example.net"
         fields = parse_qs(uri.query)
         for expected in ["Иванов Иван Иванович", "ivanov", "WS-001", extra]:
             assert expected in fields["body"][0]
+        assert QUESTION in fields["body"][0]
     else:
         assert link is None  # Long form stays complete in EML instead of being truncated into a URI.
 
