@@ -274,7 +274,7 @@ def test_activation_ignores_old_unread_history_but_keeps_first_new_question_and_
     server = Server()
     server.history[ROOM] = [message(1, stamp=SECOND - 30, content="Old unread private text"), message(2),
                             message(3, actor=SERVICE), message(4, systemMessage="conversation_created"),
-                            message(5, messageParameters={"file": {"type": "file", "link": "https://external"}}),
+                            message(5, messageParameters={"object": {"type": "file", "link": "https://external"}}),
                             message(6, kind="bots"), message(7, actor="other-employee")]
     assert poll_once(factory, configuration(), server.client()) is True
     accounts, rooms, inbox = snapshot(factory)

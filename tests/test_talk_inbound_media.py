@@ -29,7 +29,7 @@ def image_bytes(format="PNG"):
 def upload(raw=None, mime="image/png"):
     raw = raw or image_bytes()
     return message(123, content="Не читается код. {file} Символ {other} оставьте без изменений.",
-                   systemMessage="file_shared", messageParameters={"file": {
+                   systemMessage="", messageParameters={"file": {
                        "type": "file", "id": "456", "name": "../../employee-private-name.png",
                        "path": "Talk/Фото ошибки 01.png", "mimetype": mime, "size": str(len(raw)),
                        "etag": "original-etag", "permissions": "1", "hide-download": "no",
@@ -107,16 +107,24 @@ def assert_read_only(server):
 def test_caption_preserves_user_words_and_only_removes_matching_file_placeholders():
     result = parse_inbound_media(upload())
     assert result == {"files": [456], "caption": "Не читается код.  Символ {other} оставьте без изменений."}
-    original = message(10, content="Обычный текст {file}", messageParameters={"file": {"type": "file"}})
+    original = message(10, content="Обычный текст {file}", messageParameters={"mention": {"type": "user", "id": EMPLOYEE}})
     assert parse_inbound_media(original) == {"files": [], "caption": "Обычный текст {file}"}
     photo_only = upload()
     photo_only["message"] = "{file}"
     assert parse_inbound_media(photo_only) == {"files": [456], "caption": ""}
 
 
+def test_actual_rest_photo_comment_has_empty_system_message_but_keeps_rich_file_parameter():
+    wire = upload()
+    wire["systemMessage"] = ""
+    wire["message"] = "Не открывается программа."
+    assert parse_inbound_media(wire) == {"files": [456], "caption": "Не открывается программа."}
+
+
 def test_limits_are_explicit_and_batch_overflow_is_not_silently_dropped():
     assert MAX_INBOUND_FILES == 6 and MAX_IMAGE_BYTES == 8_000_000 and MAX_INCIDENT_BYTES == 24_000_000
     source = upload()
+    source["systemMessage"] = "file_shared"  # Legacy explicit multi-file envelope.
     item = source["messageParameters"]["file"]
     source["messageParameters"] = {"file" + str(i): {**item, "id": str(i + 1)} for i in range(7)}
     result = parse_inbound_media(source)
@@ -143,8 +151,10 @@ def test_unsupported_or_invalid_photo_metadata_has_safe_error_and_keeps_caption(
 
 
 @pytest.mark.parametrize("format", ["PNG", "JPEG"])
-def test_download_preserves_exact_original_bytes_and_immutable_file_binding(format):
+@pytest.mark.parametrize("marker", [None, "", "file_shared"], ids=["missing-marker", "rest-empty-marker", "legacy-marker"])
+def test_download_preserves_exact_original_bytes_and_immutable_file_binding(format, marker):
     server = MediaServer(format)
+    server.source["systemMessage"] = marker
     result = download(server)
     assert result.data == server.raw and result.sha256 == hashlib.sha256(server.raw).hexdigest()
     assert result.content_type == server.mime and result.etag == "original-etag"
@@ -158,8 +168,31 @@ def test_download_preserves_exact_original_bytes_and_immutable_file_binding(form
     assert_read_only(server)
 
 
+def test_generic_object_sharing_cannot_be_accepted_as_canonical_file_or_downloaded():
+    server = MediaServer()
+    server.source["messageParameters"] = {"object": server.source["messageParameters"]["file"]}
+    parsed = parse_inbound_media(server.source)
+    assert parsed["files"] == [] and "error_code" not in parsed
+    with pytest.raises(AccountError, match="inbound_media_scope_changed"):
+        download(server)
+    assert not any("/remote.php/" in request.url.path for request in server.requests)
+    assert_read_only(server)
+
+
+def test_only_literal_file_parameter_counts_when_other_typed_file_rich_objects_exist():
+    server = MediaServer()
+    server.source["messageParameters"]["object"] = {
+        **server.source["messageParameters"]["file"], "id": "999", "path": "Private/unshared.png",
+    }
+    assert parse_inbound_media(server.source)["files"] == [456]
+    with pytest.raises(AccountError, match="inbound_media_unavailable"):
+        server.client().download_inbound_image(ROOM, 123, 999, expected_employee=EMPLOYEE)
+    assert not any("/remote.php/" in request.url.path for request in server.requests)
+    assert_read_only(server)
+
+
 @pytest.mark.parametrize("scope", ["group", "foreign", "third-user", "other-employee", "other-author", "wrong-room",
-                                  "wrong-message", "ordinary-message", "deleted", "missing"])
+                                  "wrong-message", "unrelated-system", "system-type", "deleted", "missing"])
 def test_download_never_fetches_photo_outside_exact_employee_private_upload(scope):
     server = MediaServer()
     if scope == "group":
@@ -176,8 +209,10 @@ def test_download_never_fetches_photo_outside_exact_employee_private_upload(scop
         server.source["token"] = "otherroom"
     elif scope == "wrong-message":
         server.source["id"] = 124
-    elif scope == "ordinary-message":
-        server.source["systemMessage"] = ""
+    elif scope == "unrelated-system":
+        server.source["systemMessage"] = "conversation_created"
+    elif scope == "system-type":
+        server.source["messageType"] = "system"
     elif scope == "deleted":
         server.source["messageType"] = "comment_deleted"
     else:

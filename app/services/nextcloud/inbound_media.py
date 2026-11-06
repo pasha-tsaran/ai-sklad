@@ -81,6 +81,11 @@ def _entries(message):
         raise InvalidInboundMedia("inbound_media_unavailable")
     entries = [(key, item) for key, item in parameters.items()
                if isinstance(item, dict) and item.get("type") == "file"]
+    if message.get("systemMessage") != "file_shared":
+        # REST clears systemMessage after file_shared is rendered as a comment.
+        # Only this literal key is produced by the file-share parser. The generic
+        # object-sharing API can produce a user-controlled typed-file "object".
+        entries = [(key, item) for key, item in entries if key == "file"]
     if not entries or len(entries) > MAX_INBOUND_FILES:
         raise InvalidInboundMedia("inbound_media_too_many" if entries else "inbound_media_unavailable")
     if any(not isinstance(key, str) or _KEY.fullmatch(key) is None for key, _ in entries):
@@ -95,13 +100,27 @@ def _file_id(value):
     return number
 
 
+def is_inbound_media_message(message):
+    """Classify actual REST file shares and the older explicit marker shape."""
+    if not isinstance(message, dict):
+        return False
+    marker = message.get("systemMessage")
+    if marker == "file_shared":
+        return True
+    if marker not in (None, ""):
+        return False
+    parameters = message.get("messageParameters")
+    file = parameters.get("file") if isinstance(parameters, dict) else None
+    return isinstance(file, dict) and file.get("type") == "file"
+
+
 def parse_inbound_media(message):
     """Extract IDs/caption only; no URLs, paths, identity inference or network calls."""
     caption = message.get("message", "") if isinstance(message, dict) else ""
     if not isinstance(caption, str):
         caption = ""
     result = {"files": [], "caption": caption}
-    if not isinstance(message, dict) or message.get("systemMessage") != "file_shared":
+    if not is_inbound_media_message(message):
         return result
     try:
         entries = _entries(message)
@@ -139,6 +158,8 @@ def file_descriptor(message, file_id):
     if parsed.get("error_code"):
         raise InvalidInboundMedia(parsed["error_code"])
     target = _file_id(file_id)
+    if target not in parsed["files"]:
+        raise InvalidInboundMedia("inbound_media_unavailable")
     matching = [item for _, item in _entries(message) if _file_id(item.get("id")) == target]
     if len(matching) != 1:
         raise InvalidInboundMedia("inbound_media_unavailable")

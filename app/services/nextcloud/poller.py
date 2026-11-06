@@ -14,7 +14,7 @@ from sqlalchemy import select
 from app.models.talk import TalkAccount, TalkInbox, TalkRoom
 from app.services.chat.channel_profile import update_nextcloud_profile
 from app.services.nextcloud.account import AccountClient, AccountError, sequence
-from app.services.nextcloud.inbound_media import parse_inbound_media
+from app.services.nextcloud.inbound_media import is_inbound_media_message, parse_inbound_media
 
 MAX_INBOUND_CHARS = 8000
 
@@ -30,7 +30,7 @@ def _payload(message, employee, service, activated):
             or message.get("systemMessage") not in {None, "", "file_shared"}
             or message["timestamp"] < int(_utc(activated).timestamp())):
         return None
-    if message.get("systemMessage") == "file_shared":
+    if is_inbound_media_message(message):
         parsed = parse_inbound_media(message)
         caption = parsed["caption"]
         media = {key: value for key, value in parsed.items() if key != "caption"}
@@ -42,7 +42,7 @@ def _payload(message, employee, service, activated):
     parameters = message.get("messageParameters") or {}
     values = parameters.values() if isinstance(parameters, dict) else parameters if isinstance(parameters, list) else []
     if any(isinstance(value, dict) and value.get("type") in {"file", "media", "attachment"} for value in values):
-        return None  # A file is accepted only through the server's file_shared event.
+        return None  # Generic rich objects aren't canonical file-share parameters.
     content = message.get("message")
     return (content, {}) if isinstance(content, str) and content.strip() and len(content) <= MAX_INBOUND_CHARS else None
 

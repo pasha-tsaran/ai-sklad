@@ -28,7 +28,7 @@ def photo(number, *, caption="{file}\nне открывается", descriptor=N
             "etag": "server-etag", "permissions": "1", "hide-download": "no"}
     if descriptor:
         data.update(descriptor)
-    return message(number, content=caption, systemMessage="file_shared",
+    return message(number, content=caption, systemMessage=overrides.pop("systemMessage", ""),
                    messageParameters={"file": data}, **overrides)
 
 
@@ -43,6 +43,44 @@ def assert_no_file_requests(server):
     assert all(request.method == "GET" for request in server.requests)
     assert all(request.url.host == "nextcloud.example" for request in server.requests)
     assert not any("/remote.php/dav/" in request.url.path for request in server.requests)
+
+
+def test_rest_serializer_comment_with_empty_system_type_keeps_photo_caption_pending(factory):
+    # Talk18–23 Message::toArray() clears systemMessage after the file parser
+    # changes its messageType to comment. This is the actual Chat REST wire.
+    server = Server()
+    wire = photo(1, caption="не открывается")
+    wire["systemMessage"] = ""
+    server.history[ROOM] = [wire]
+    assert poll_once(factory, configuration(), server.client()) is True
+    _, rooms, inbox = snapshot(factory)
+    assert rooms[0].cursor == 1 and inbox[0].status == "PENDING"
+    assert inbox[0].content == "не открывается"
+    assert_reference_only(inbox[0], {"files": [8472]})
+    assert_no_file_requests(server)
+
+
+@pytest.mark.parametrize("marker", [None, "file_shared"], ids=["missing-marker", "legacy-explicit-marker"])
+def test_photo_ingress_retains_compatibility_with_absent_and_legacy_markers(factory, marker):
+    server = Server()
+    server.history[ROOM] = [photo(1, caption="Точная подпись", systemMessage=marker)]
+    assert poll_once(factory, configuration(), server.client())
+    row = snapshot(factory)[2][0]
+    assert row.status == "PENDING" and row.content == "Точная подпись"
+    assert_reference_only(row, {"files": [8472]})
+    assert_no_file_requests(server)
+
+
+@pytest.mark.parametrize("kind,marker", [("system", ""), ("system", "conversation_created"),
+                                        ("comment", "conversation_created"), ("command", "")])
+def test_file_parameter_never_admits_unrelated_system_events_or_commands(factory, kind, marker):
+    server = Server()
+    server.history[ROOM] = [photo(1, messageType=kind, systemMessage=marker), message(2)]
+    assert poll_once(factory, configuration(), server.client())
+    rows = snapshot(factory)[2]
+    assert rows[0].status == "IGNORED" and rows[0].content == "" and rows[0].media == {}
+    assert rows[1].status == "PENDING"
+    assert_no_file_requests(server)
 
 
 def test_real_file_shared_png_queues_caption_and_numeric_reference_once_without_download(factory):
@@ -130,7 +168,7 @@ def test_photo_error_is_queued_and_cursor_does_not_block_the_next_normal_message
 
 def test_unavailable_share_is_pending_without_treating_server_notice_as_employee_caption(factory):
     server = Server()
-    unavailable = photo(1, caption="{actor} shared a file which is no longer available")
+    unavailable = photo(1, caption="{actor} shared a file which is no longer available", systemMessage="file_shared")
     unavailable["messageParameters"] = {"actor": {"type": "user", "id": EMPLOYEE}}
     server.history[ROOM] = [unavailable, message(2)]
     assert poll_once(factory, configuration(), server.client()) is True
@@ -154,10 +192,10 @@ def test_overlong_photo_caption_returns_bounded_error_and_keeps_following_text(f
     assert_no_file_requests(server)
 
 
-def test_regular_comment_cannot_forge_a_server_file_shared_event(factory):
+def test_user_controlled_rich_object_cannot_impersonate_canonical_file_parameter(factory):
     server = Server()
     forged = photo(1)
-    forged["systemMessage"] = ""
+    forged["messageParameters"] = {"object": forged["messageParameters"]["file"]}
     server.history[ROOM] = [forged, message(2)]
     assert poll_once(factory, configuration(), server.client()) is True
     _, rooms, inbox = snapshot(factory)

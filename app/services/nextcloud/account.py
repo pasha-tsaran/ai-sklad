@@ -287,6 +287,7 @@ class AccountClient:
         return str(sequence(data.get("id")))
 
     def _inbound_message(self, room, message_id, employee):
+        from app.services.nextcloud.inbound_media import is_inbound_media_message
         data, _, status = self._request(
             "GET", "/ocs/v2.php/apps/spreed/api/v1/chat/" + self._token(room), acceptable=(200, 304),
             params={"lookIntoFuture": 1, "lastKnownMessageId": message_id, "limit": 1, "timeout": 0,
@@ -298,7 +299,7 @@ class AccountClient:
         message = data[0]
         if (sequence(message.get("id")) != message_id or message.get("token") != room
                 or message.get("actorType") != "users" or message.get("actorId") != employee
-                or message.get("messageType") != "comment" or message.get("systemMessage") != "file_shared"):
+                or message.get("messageType") != "comment" or not is_inbound_media_message(message)):
             raise AccountError("inbound_media_scope_changed")
         return message
 
