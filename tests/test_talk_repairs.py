@@ -73,8 +73,9 @@ def test_complete_private_form_creates_exact_mail_draft_and_never_queues_smtp(ta
         assert all((deliveries[key].account_id, deliveries[key].provenance) == value
                    for key, value in source_tags.items())
         body = escalation.email["body"]
-        for expected in ["Иванов Иван Иванович", "ivanov", "WS-001", extra, QUESTION]:
+        for expected in ["Иванов Иван Иванович", "WS-001", extra, QUESTION]:
             assert expected in body
+        assert "Логин:" not in body and "account_login" not in body and "ivanov" not in body
         preview_message = session.scalar(select(Message).where(
             Message.content.startswith("Подготовлено письмо для технической поддержки."),
         ))
@@ -97,8 +98,9 @@ def test_complete_private_form_creates_exact_mail_draft_and_never_queues_smtp(ta
     assert fields["subject"] == ["[AI-Support] Сканер не работает"]
     if expected_link:
         assert link.group(1) == expected_link
-        for expected in ["Иванов Иван Иванович", "ivanov", "WS-001", extra]:
+        for expected in ["Иванов Иван Иванович", "WS-001", extra]:
             assert expected in fields["body"][0]
+        assert "Логин:" not in fields["body"][0] and "ivanov" not in fields["body"][0]
         assert QUESTION in fields["body"][0]
     else:
         assert fields["body"] == [""]

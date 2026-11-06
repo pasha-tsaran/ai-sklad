@@ -13,7 +13,7 @@ from app.models import Delivery, Escalation, Feedback, Incident, Job, Message, M
 from app.models.talk import TalkAccount, TalkInbox, TalkRoom
 from app.schemas.contracts import AnalysisResult, DialogueResult
 from app.services.chat.talk_dialogue import (
-    BACK_TO_BOT, CHANGED, CLARIFY_QUESTIONS, ESCALATION_MENU, FORM_CARD_HEADER, INTAKE_QUESTIONS,
+    BACK_TO_BOT, CHANGED, CLARIFY_QUESTIONS, ESCALATION_MENU, INTAKE_QUESTIONS,
     RESUME_GUIDE, UNAVAILABLE, process_one,
 )
 from app.services.llm.mock import MockLLM
@@ -596,7 +596,7 @@ def test_feedback_during_form_keeps_the_form_and_does_not_restart_alternative_gu
     talk.incoming(message, 3)
     talk.process(knowledge)
     state = talk.snapshot()
-    assert assistants(state)[-1][0].startswith(FORM_CARD_HEADER)
+    assert assistants(state)[-1][0].startswith("ФИО:")
     assert INTAKE_QUESTIONS["computer_name"] in assistants(state)[-1][0]
     assert state["incident"].pending_action == "COLLECT_ESCALATION_DETAILS"
     assert len(state["attempts"]) == 1 and len(knowledge.searches) == searches
@@ -780,7 +780,7 @@ def test_form_is_requested_only_after_positive_menu_choice_and_can_still_be_canc
     talk.incoming(choice, 2)
     talk.process()
     state = talk.snapshot()
-    assert assistants(state)[-1][0].startswith(FORM_CARD_HEADER) and state["flow"]["escalation"]["stage"] == "FORM"
+    assert assistants(state)[-1][0].startswith("ФИО:") and state["flow"]["escalation"]["stage"] == "FORM"
     assert state["incident"].pending_action == "COLLECT_ESCALATION_DETAILS"
     with talk.env.factory() as session:
         assert session.scalar(select(func.count()).select_from(Escalation)) == 0
@@ -994,7 +994,7 @@ def test_scattered_intake_keeps_collected_fields_and_asks_only_the_next_missing_
     assert assistants(state)[-1] == (INTAKE_QUESTIONS["subject"], None)
     assert state["flow"]["escalation"]["intake_fields"]["computer_name"] == "terminal76-sk"
     assert state["flow"]["escalation"]["intake_requested_field"] == "subject"
-    assert all(not text.startswith(FORM_CARD_HEADER) for text, _ in assistants(state)[2:])
+    assert all(not text.startswith("ФИО:") for text, _ in assistants(state)[2:])
     talk.incoming("Уменьшить громкость на проводном сканере ШК", 5)
     talk.process(knowledge, model)
     state = talk.snapshot()
@@ -1107,10 +1107,11 @@ def test_operator_card_uses_trusted_employee_profile_and_asks_only_for_unknown_w
         talk.process(knowledge, model)
     state = talk.snapshot()
     card = assistants(state)[-1][0]
-    assert card.startswith(FORM_CARD_HEADER)
-    for text in ["ФИО: Павел Царан", "Логин: employee", "Компьютер: Не определён", INTAKE_QUESTIONS["computer_name"]]:
+    assert card.startswith("ФИО: Павел Царан")
+    for text in ["Компьютер: Не определён", INTAKE_QUESTIONS["computer_name"]]:
         assert text in card
-    assert card.count("?") == 1 and "Как вас зовут" not in card and "рабочий логин?" not in card
+    assert card.count("?") == 1 and "Как вас зовут" not in card
+    assert "логин" not in card.casefold() and "Данные профиля Nextcloud" not in card
     assert state["flow"]["escalation"]["intake_fields"] == {
         "account_holder_name": "Павел Царан", "account_login": "employee",
     }
@@ -1203,5 +1204,45 @@ def test_profile_card_never_uses_server_hostname_or_foreign_display_identity_as_
         talk.process(knowledge, model)
     card = assistants(talk.snapshot())[-1][0]
     assert "Чужой Пользователь" not in card and "Системный Администратор" not in card and "SkladTechBot" not in card
-    assert "Логин: employee" in card and "Компьютер: Не определён" in card
+    assert "логин" not in card.casefold() and "Компьютер: Не определён" in card
     assert not model.calls and not knowledge.searches
+
+
+@pytest.mark.parametrize("uid", ["u" * 150, "ldap/employee"], ids=["long-nextcloud-uid", "non-login-uid"])
+def test_internal_uid_handle_never_appears_in_card_or_letter_and_auth_identity_stays_unchanged(talk, uid):
+    with talk.env.factory() as session, session.begin():
+        session.get(TalkRoom, talk.room_id).employee_id = uid
+    _profile(talk)
+    talk.settings.mail_backend, talk.settings.support_email = "mailto", "operator@example.net"
+    model, knowledge = NoGeneration(), Knowledge()
+    for sequence, content in enumerate(["оператор", "1", "terminal76-sk", "Настроить сканер штрихкодов"], 1):
+        talk.incoming(content, sequence, sender=uid)
+        talk.process(knowledge, model)
+    state = talk.snapshot()
+    assert state["incident"].state == "ESCALATED" and not model.calls and not knowledge.searches
+    internal = "nc_" + hashlib.sha256(uid.encode()).hexdigest()
+    with talk.env.factory() as session:
+        assert session.get(TalkRoom, talk.room_id).employee_id == uid
+        assert all(row.sender_id == uid for row in session.scalars(select(TalkInbox)))
+        draft = session.scalar(select(Escalation))
+        assert draft.details["account_login"] == internal and len(internal) <= 100
+        assert internal not in draft.email["body"] and uid not in draft.email["body"]
+    for text, _ in assistants(state):
+        assert "логин" not in text.casefold() and "Данные профиля Nextcloud" not in text
+        assert internal not in text and uid not in text
+
+
+def test_empty_retired_login_field_is_filled_internally_without_asking_the_employee(talk):
+    talk.settings.mail_backend, talk.settings.support_email = "mailto", "operator@example.net"
+    model, knowledge = NoGeneration(), Knowledge()
+    talk.incoming("оператор")
+    talk.process(knowledge, model)
+    talk.incoming("ФИО: Павел\nЛогин:\nКомпьютер: terminal76-sk\nТема: Уменьшить громкость сканера", 2)
+    talk.process(knowledge, model)
+    state = talk.snapshot()
+    assert state["incident"].state == "ESCALATED" and not model.calls and not knowledge.searches
+    with talk.env.factory() as session:
+        draft = session.scalar(select(Escalation))
+        assert draft.details["account_login"] == "employee"
+        assert "Логин:" not in draft.email["body"] and "account_login" not in draft.email["body"]
+    assert "account_login" not in INTAKE_QUESTIONS

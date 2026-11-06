@@ -1,4 +1,5 @@
 import json
+import re
 import unicodedata
 from datetime import timezone
 
@@ -11,6 +12,24 @@ from app.services.chat.policies import FORM_ACTION
 from app.services.chat.service import add_user_message, enqueue, get_owned, messenger
 from app.services.mail.draft import make_mailto
 from app.services.mail.presentation import letter_preview
+
+
+def _letter_text(content):
+    """Omit the retired login field from letter copies, keeping private history intact."""
+    prefix = "Данные заявки: "
+    if content.startswith(prefix):
+        try:
+            fields = json.loads(content[len(prefix):])
+        except (TypeError, ValueError):
+            pass
+        else:
+            if isinstance(fields, dict):
+                fields.pop("account_login", None)
+                content = prefix + json.dumps(fields, ensure_ascii=False)
+    return re.sub(
+        r"^[ \t]*(?:логин(?:\s+пользователя(?:\s+рабочей\s+станции)?)?|account_login)\s*:[^\r\n]*(?:\r?\n|$)"
+        r"|^[ \t]*Данные профиля Nextcloud[ \t]*(?:\r?\n|$)", "", content, flags=re.I | re.M,
+    )
 
 
 def collect_details(session, user_id, incident_id, details, settings):
@@ -33,7 +52,7 @@ def collect_details(session, user_id, incident_id, details, settings):
         .order_by(SolutionAttempt.ordinal)
     ).all()
     transcript = "\n\n".join(
-        f"{'Пользователь' if m.role == 'user' else 'Помощник (бот)'}: {m.content}" for m in messages
+        f"{'Пользователь' if m.role == 'user' else 'Помощник (бот)'}: {_letter_text(m.content)}" for m in messages
     )
     escalation_id = new_id()
     created_at = incident.created_at
@@ -42,7 +61,7 @@ def collect_details(session, user_id, incident_id, details, settings):
     body = (
         f"Обращение: {incident.id}\n"
         f"ФИО пользователя рабочей станции: {details.account_holder_name}\n"
-        f"Логин: {details.account_login}\nКомпьютер: {details.computer_name}\n"
+        f"Компьютер: {details.computer_name}\n"
         f"Время обращения (UTC): {created_at.isoformat()}\n"
         f"Дополнительно: {details.additional_info}\n\n"
         "Испробованные решения:\n"
@@ -73,7 +92,7 @@ def collect_details(session, user_id, incident_id, details, settings):
         # Complete user-entered fields go to the employee's own mail client.
         # This mode never queues SMTP or claims the employee pressed Send.
         entered_fields = (
-            f"ФИО: {details.account_holder_name}\nЛогин: {details.account_login}\n"
+            f"ФИО: {details.account_holder_name}\n"
             f"Компьютер: {details.computer_name}\nТема: {details.subject}\n"
             f"Описание: {details.additional_info}\n"
         )
@@ -81,7 +100,7 @@ def collect_details(session, user_id, incident_id, details, settings):
         # cannot represent. Keep the original report in history and its readable
         # words/line breaks in the draft instead of failing the whole intake.
         problem = "".join(char if unicodedata.category(char) != "Cc" or char in "\r\n\t" else " "
-                          for char in (incident.description or ""))
+                          for char in _letter_text(incident.description or ""))
         draft = {**escalation.email, "body": (
             entered_fields
             + (f"\nИсходная проблема:\n{problem}\n" if problem else "")

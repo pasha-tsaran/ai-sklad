@@ -4,6 +4,7 @@ import argparse
 import json
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 
 from sqlalchemy import select, text, update
 
@@ -18,6 +19,7 @@ from app.services.nextcloud.account import AccountClient, AccountError
 from app.services.nextcloud.delivery import deliver_one
 from app.services.nextcloud.poller import poll_once
 from app.services.nextcloud.progress import recover_progress, tick_progress
+from app.services.nextcloud.typing import NativeTyping
 
 LOCK_ID = 73412063  # Separate from the main worker and read-only PostgreSQL lock test.
 
@@ -100,8 +102,7 @@ def run(settings, *, once=False):
                     break
             return
         # Slow model calls cannot pause room discovery or the preceding text/photo deliveries.
-        progress_client = AccountClient(settings)
-        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="talk") as pool:
+        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="talk") as pool, closing(NativeTyping(settings)) as progress_client:
             polling = processing = progressing = None
             next_poll = 0.0
             while True:
@@ -141,12 +142,18 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Personal Nextcloud Talk account connector")
     parser.add_argument("--check", action="store_true", help="Check account and private rooms without sending")
     parser.add_argument("--check-knowledge", action="store_true", help="Read approved knowledge and photos without sending")
+    parser.add_argument("--check-typing", action="store_true", help="Read native typing prerequisites without joining or sending")
     parser.add_argument("--once", action="store_true", help="Run one real poll/process/delivery cycle")
     args = parser.parse_args(argv)
     configure_logging()
     try:
         settings = get_settings()
-        if args.check_knowledge:
+        if args.check_typing:
+            with closing(NativeTyping(settings)) as typing:
+                result = typing.check()
+            print(json.dumps(result, ensure_ascii=False))
+            return 0 if result.get("status") == "ok" else 1
+        elif args.check_knowledge:
             from app.services.rag.talk import TalkKnowledge
 
             result = TalkKnowledge(settings).check()

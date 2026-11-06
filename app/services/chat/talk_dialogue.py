@@ -1,6 +1,7 @@
 """Durable private Talk dialogue using the same approved steps/photos as WebUI."""
 
 import copy
+import hashlib
 import re
 from dataclasses import dataclass, field
 from datetime import timezone
@@ -34,7 +35,6 @@ from integrations.openwebui.automatic_instruction_images import (
 
 UNAVAILABLE = "Сейчас не удалось проверить базу знаний. Повторите вопрос немного позже или напишите «оператор»."
 CHANGED = "Инструкция изменилась или доступ к ней недоступен. Продолжение приостановлено до проверки актуального источника."
-FORM_CARD_HEADER = "Данные профиля Nextcloud"
 ESCALATION_MENU = ("Как продолжим?\n1 — оформить письмо в техническую поддержку.\n"
                    "2 — продолжить диалог с ботом.\n\nМожно ответить цифрой или словами. Заявка пока не отправлена.")
 RESUME_GUIDE = ("Продолжим с ботом с того же шага. Заявка не отправлена. "
@@ -42,7 +42,6 @@ RESUME_GUIDE = ("Продолжим с ботом с того же шага. З�
 BACK_TO_BOT = "Продолжим с ботом. Опишите, с каким вопросом нужна помощь."
 INTAKE_QUESTIONS = {
     "account_holder_name": "Как вас зовут?",
-    "account_login": "Какой у вас рабочий логин?",
     "computer_name": "Как называется ваш рабочий компьютер?",
     "subject": "Кратко опишите, с чем нужна помощь. Если нужно, добавьте подробности.",
     "additional_info": "Напишите дополнительное описание короче — до 2000 символов.",
@@ -107,24 +106,35 @@ def _prefill_intake(flow, context):
     fields = copy.deepcopy(escalation.get("intake_fields", {}))
     if not escalation.get("profile_prefilled"):
         profile = context.get("channel_profile", {})
-        for key in ("account_holder_name", "account_login", "computer_name"):
+        for key in ("account_holder_name", "computer_name"):
             value = profile.get(key)
             if key not in fields and isinstance(value, str) and value.strip():
                 fields[key] = value.strip()
         escalation = {**escalation, "profile_prefilled": True}
         if not fields.get("computer_name"):
             escalation["intake_requested_field"] = "computer_name"
+    if not fields.get("account_login"):
+        if login := _internal_login(context):
+            fields["account_login"] = login
     updated["escalation"] = {**escalation, "intake_fields": fields}
     return updated
+
+
+def _internal_login(context):
+    """Keep the old required schema field internal; never infer a Windows login."""
+    uid = context.get("channel_profile", {}).get("account_login")
+    if not isinstance(uid, str) or not uid:
+        return None
+    if len(uid) <= 100 and re.fullmatch(r"[A-Za-zА-Яа-яЁё0-9_][A-Za-zА-Яа-яЁё0-9_.@+\\-]*", uid):
+        return uid
+    return "nc_" + hashlib.sha256(uid.encode("utf-8")).hexdigest()
 
 
 def _profile_form_request(flow, context):
     updated = _prefill_intake(flow, context)
     fields = updated["escalation"]["intake_fields"]
     prompted = _intake_prompt(updated)
-    card = (FORM_CARD_HEADER + "\n"
-            + "ФИО: " + fields.get("account_holder_name", "Не определено") + "\n"
-            + "Логин: " + fields.get("account_login", "Не определён") + "\n"
+    card = ("ФИО: " + fields.get("account_holder_name", "Не определено") + "\n"
             + "Компьютер: " + fields.get("computer_name", "Не определён"))
     text = (card + "\n\n" + prompted.blocks[0][0]
             + "\n\nЕсли данные неверны, напишите исправление. Чтобы вернуться к боту, напишите «Отмена» или «2».")
@@ -136,13 +146,19 @@ def _intake_turn(message, flow, llm, context):
     escalation = updated["escalation"]
     fields = copy.deepcopy(escalation["intake_fields"])
     result = parse_intake(message, fields, llm, requested_field=escalation.get("intake_requested_field"))
-    computer = result.fields.get("computer_name")
+    collected, missing_fields, details = dict(result.fields), list(result.missing), result.details
+    if "account_login" not in collected and (login := _internal_login(context)):
+        collected["account_login"] = login
+        missing_fields = [key for key in missing_fields if key != "account_login"]
+        if not missing_fields:
+            details = EscalationDetails.model_validate(collected)
+    computer = collected.get("computer_name")
     current_computer = context.get("channel_profile", {}).get("computer_name")
     confirmed = computer if computer and (computer != fields.get("computer_name") or computer != current_computer) else None
-    if result.details is not None:
-        return Turn("FORM", details=result.details, confirmed_computer=confirmed)
-    missing = next((key for key in result.missing if key in INTAKE_QUESTIONS), None)
-    updated["escalation"] = {**escalation, "stage": "FORM", "intake_fields": result.fields,
+    if details is not None:
+        return Turn("FORM", details=details, confirmed_computer=confirmed)
+    missing = next((key for key in missing_fields if key in INTAKE_QUESTIONS), None)
+    updated["escalation"] = {**escalation, "stage": "FORM", "intake_fields": collected,
                              "intake_requested_field": missing}
     question = INTAKE_QUESTIONS[missing] if missing else "В чём нужна помощь? Кратко опишите проблему."
     return Turn("REPLY", [(question, None)], flow=updated, confirmed_computer=confirmed)
@@ -369,10 +385,10 @@ def _turn(message, flow, context, previous_pending, llm, knowledge, settings):
             return _resume_turn(flow, context, llm, knowledge)
         if choice == "FORM_REQUEST" or intent == "HUMAN":
             if flow.get("escalation", {}).get("profile_prefilled"):
-                return _intake_prompt(flow)
+                return _intake_prompt(_prefill_intake(flow, context))
             return _profile_form_request(flow, context)
         if intent == "FEEDBACK" or is_confirmation(message):
-            return (_intake_prompt(flow) if flow.get("escalation", {}).get("profile_prefilled")
+            return (_intake_prompt(_prefill_intake(flow, context)) if flow.get("escalation", {}).get("profile_prefilled")
                     else _profile_form_request(flow, context))
         if reply := _simple_social(message):
             return Turn("REPLY", [(reply, None)])

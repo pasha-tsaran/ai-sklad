@@ -29,7 +29,7 @@ def literal_text(preview):
 
 def test_preview_contains_actual_recipient_subject_and_every_letter_field():
     email = {"to": "ignored@example.com", "subject": '[AI-Support] Сканер "ШК"', "body": (
-        "ФИО: Иванов Иван\nЛогин: warehouse\nКомпьютер: WS-001\n"
+        "ФИО: Иванов Иван\nКомпьютер: WS-001\n"
         "Тема: Настройка сканера\nОписание: Не читает код & выдаёт ошибку № 1.\n"
     )}
     before = copy.deepcopy(email)
@@ -50,11 +50,11 @@ def test_employee_markdown_html_and_fences_stay_inside_literal_letter(content):
 
 
 def test_preview_preserves_long_letter_and_normalizes_only_line_endings():
-    body = "ФИО:\tИванов\rЛогин: employee\r\n" + "Строка описания.\n" * 5000 + "КОНЕЦ\n"
+    body = "ФИО:\tИванов\rКомпьютер: WS-001\r\n" + "Строка описания.\n" * 5000 + "КОНЕЦ\n"
     preview = letter_preview({"subject": "Заявка", "body": body}, RECIPIENT)
     assert literal_text(preview).endswith("КОНЕЦ")
     assert literal_text(preview).count("Строка описания.") == 5000
-    assert "ФИО:\tИванов\nЛогин: employee\n" in literal_text(preview)
+    assert "ФИО:\tИванов\nКомпьютер: WS-001\n" in literal_text(preview)
 
 
 @pytest.mark.parametrize("email,recipient", [
@@ -72,7 +72,7 @@ def test_letter_preview_queue_keeps_earlier_step_photo_bytes_and_source_tags_unc
     bound = bind(factory)
     image = SimpleNamespace(filename="illustration-01.png", content_type="image/png", data=png(),
                             caption="На снимке показано меню «Операции».")
-    email = {"subject": "Сканер не работает", "body": "ФИО: Иванов\nЛогин: employee\nКомпьютер: WS-001\n"}
+    email = {"subject": "Сканер не работает", "body": "ФИО: Иванов\nКомпьютер: WS-001\n"}
     preview = "Подготовлено письмо для технической поддержки.\n\n" + letter_preview(email, RECIPIENT)
     with factory() as session, session.begin():
         messenger = RoutedMessenger()
@@ -120,8 +120,11 @@ def test_real_ticket_keeps_full_preview_and_exact_topic_without_attachment_or_sm
         preview = next(text for text in replies if text.startswith("Подготовлено письмо для технической поддержки."))
         rendered = re.search(r"(`{3,})\n(.*?)\n\1", preview, re.S)
         assert rendered and rendered.group(2) + "\n" == f"Кому: {RECIPIENT}\nТема: {subject}\n\n{body}"
-        for field in details.values():
-            assert field.strip() in rendered.group(2)
+        for key, field in details.items():
+            if key != "account_login":
+                assert field.strip() in rendered.group(2)
+        assert "Логин:" not in body and "account_login" not in body and details["account_login"] not in body
+        assert "Данные профиля Nextcloud" not in preview
         link = re.search(r"\[[^\]]+\]\((mailto:[^)]+)\)", preview)
         assert link is not None and len(link.group(1)) <= MAX_MAILTO_CHARS
         parsed = urlsplit(link.group(1))
@@ -175,3 +178,31 @@ def test_invisible_chat_control_in_original_problem_cannot_poison_a_valid_draft(
         assert session.get(Incident, incident_id).description == original
         assert session.scalar(select(MessageAttachment)) is None
         assert session.scalar(select(Job).where(Job.kind == "SEND_MAIL")) is None
+
+
+def test_smtp_letter_omits_retired_login_and_profile_heading_but_keeps_private_history_and_legacy_api(env):
+    from app.services.chat.messages import append_message
+
+    configured = get_settings()
+    configured.mail_backend = "smtp"
+    incident_id = env.post("/api/chat", {"message": "оператор"}).json()["incident_id"]
+    old_card = "Данные профиля Nextcloud\nФИО: Иванов Иван\nЛогин: legacy-login\nКомпьютер: WS-001"
+    old_form = "ФИО: Иванов Иван\nЛогин: legacy-login\nКомпьютер: WS-001\nНе печатает принтер."
+    with env.factory() as session, session.begin():
+        append_message(session, incident_id, "assistant", old_card, "DELIVERED_MOCK")
+        append_message(session, incident_id, "user", old_form, "RECEIVED")
+    details = {"account_holder_name": "Иванов Иван", "account_login": "legacy-login", "computer_name": "WS-001",
+               "subject": "Принтер не печатает", "additional_info": "PDF открывается, но печать не начинается."}
+    result = env.post(f"/api/incidents/{incident_id}/escalation-details", details)
+    assert result.status_code == 202
+    with env.factory() as session:
+        draft = session.scalar(select(Escalation))
+        assert draft.details["account_login"] == "legacy-login"  # Existing API contract stays compatible.
+        body = draft.email["body"]
+        assert "Логин:" not in body and "account_login" not in body and "legacy-login" not in body
+        assert "Данные профиля Nextcloud" not in body and "Не печатает принтер." in body
+        assert "Иванов Иван" in body and "WS-001" in body and details["additional_info"] in body
+        messages = session.scalars(select(Message.content).where(Message.incident_id == incident_id)).all()
+        assert old_card in messages and old_form in messages
+        assert any('"account_login": "legacy-login"' in content for content in messages)
+        assert session.scalar(select(Job).where(Job.kind == "SEND_MAIL")) is not None

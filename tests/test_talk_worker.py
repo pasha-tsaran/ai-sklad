@@ -120,6 +120,35 @@ def test_cli_check_error_never_serializes_http_body_or_credentials(monkeypatch, 
     assert "private-response-body" not in output.out + output.err
 
 
+def test_native_typing_cli_reports_readonly_prerequisites_without_running_database_or_worker(monkeypatch, capsys):
+    monkeypatch.setattr(runner, "configure_logging", lambda: None)
+    monkeypatch.setattr(runner, "get_settings", settings)
+    monkeypatch.setattr(runner, "get_engine", lambda: pytest.fail("Typing check must not open the database"))
+    monkeypatch.setattr(runner, "run", lambda *a, **kw: pytest.fail("Typing check must not poll or deliver"))
+    calls = []
+
+    class Typing:
+        def __init__(self, configuration):
+            calls.append("constructed")
+
+        def check(self):
+            calls.append("readonly-check")
+            return {"status": "ok", "mode": "internal", "typing_supported": True, "privacy_allowed": True}
+
+        def set_typing(self, *args, **kwargs):
+            pytest.fail("Read-only check cannot start a native signal")
+
+        def close(self):
+            calls.append("closed")
+
+    monkeypatch.setattr(runner, "NativeTyping", Typing)
+    assert runner.main(["--check-typing"]) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "status": "ok", "mode": "internal", "typing_supported": True, "privacy_allowed": True,
+    }
+    assert calls == ["constructed", "readonly-check", "closed"]
+
+
 @pytest.fixture
 def factory():
     engine = create_engine("sqlite://")
