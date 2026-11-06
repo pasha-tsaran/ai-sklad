@@ -161,6 +161,30 @@ def test_mock_mode_remains_explicitly_mock_without_a_real_letter_or_mailto_claim
         assert session.scalar(select(Job).where(Job.kind == "SEND_MAIL")) is not None
 
 
+@pytest.mark.parametrize("has_photos", [False, True])
+def test_personal_mail_preview_honestly_requests_manual_photos_without_creating_attachments(env, has_photos):
+    configured = get_settings()
+    configured.mail_backend, configured.support_email = "mailto", RECIPIENT
+    incident_id = env.post("/api/chat", {"message": "оператор"}).json()["incident_id"]
+    with env.factory() as session, session.begin():
+        session.get(Incident, incident_id).has_user_photos = has_photos
+    details = {"account_holder_name": "Иванов Иван", "account_login": "ivanov", "computer_name": "WS-001",
+               "subject": "Ошибка сканера", "additional_info": "Не открывается окно настройки."}
+    response = env.post(f"/api/incidents/{incident_id}/escalation-details", details)
+    assert response.status_code == 202 and response.json()["draft_prepared"]
+    with env.factory() as session:
+        preview = session.scalars(select(Message.content).where(
+            Message.incident_id == incident_id, Message.role == "assistant",
+        ).order_by(Message.sequence)).all()[-1]
+        assert ("Фотографии из чата не добавлены в письмо автоматически." in preview) is has_photos
+        assert ("Прикрепите нужные фотографии в своём почтовом ящике" in preview) is has_photos
+        escalation = session.scalar(select(Escalation).where(Escalation.incident_id == incident_id))
+        assert escalation.status == "DRAFT" and escalation.email["body"].startswith(details["additional_info"])
+        assert session.scalar(select(MessageAttachment)) is None
+        assert session.scalar(select(Job).where(Job.kind == "SEND_MAIL")) is None
+        assert "attach=" not in preview and ".eml" not in preview
+
+
 @pytest.mark.parametrize("control", ["\x85", "\x0b", "\x7f"])
 def test_original_report_is_not_copied_or_substituted_for_explicit_description(env, control):
     configured = get_settings()

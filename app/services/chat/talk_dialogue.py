@@ -40,6 +40,14 @@ ESCALATION_MENU = ("Как продолжим?\n1 — оформить пись�
 RESUME_GUIDE = ("Продолжим с ботом с того же шага. Заявка не отправлена. "
                 "Напишите, что не получается, или «Готово», если выполнили показанные действия.")
 BACK_TO_BOT = "Продолжим с ботом. Опишите, с каким вопросом нужна помощь."
+PHOTO_NOTICE = ("Сообщение с фото получено. Распознавание изображения ещё не подключено; "
+                "я учитываю только текст. Фото к письму пока нужно прикрепить вручную.")
+MEDIA_ERRORS = {
+    "unsupported_inbound_media_type": "Формат вложения пока не поддерживается.",
+    "inbound_media_too_large": "Вложение слишком большое для обработки.",
+    "inbound_media_too_many": "В одном сообщении слишком много вложений.",
+    "inbound_caption_too_long": "Подпись к вложению слишком длинная. Отправьте описание отдельным текстом.",
+}
 INTAKE_QUESTIONS = {
     "account_holder_name": "Как вас зовут?",
     "computer_name": "Как называется ваш рабочий компьютер?",
@@ -70,6 +78,7 @@ class Turn:
     details: EscalationDetails | None = None
     resume: dict | None = None
     confirmed_computer: str | None = None
+    media_notice: str | None = None
 
 
 class _TimedProxy:
@@ -381,7 +390,46 @@ def _support_turn(message, flow, context, llm, knowledge):
                 approved, next_flow, analysis)
 
 
-def _turn(message, flow, context, previous_pending, llm, knowledge, settings):
+def _media_failure(error_code):
+    return (MEDIA_ERRORS.get(error_code, "Вложение недоступно или его не удалось обработать.")
+            + " Я учитываю только текст сообщения; нужный файл пока нужно прикрепить к письму вручную.")
+
+
+def _turn(message, flow, context, previous_pending, llm, knowledge, settings, *, inbound_media=None):
+    """Employee images remain evidence metadata; only the actual caption follows the text route."""
+    media = inbound_media if isinstance(inbound_media, dict) else {}
+    has_photo = isinstance(media.get("files"), list) and bool(media["files"])
+    error = media.get("error_code")
+    error = error if isinstance(error, str) and error else None
+    if not has_photo and error is None:
+        return _text_turn(message, flow, context, previous_pending, llm, knowledge, settings)
+    notice = _media_failure(error) if error else PHOTO_NOTICE
+    if not message.strip():
+        next_flow = None
+        if previous_pending == FORM_ACTION:
+            prompted = _intake_prompt(_prefill_intake(flow, context))
+            prompt, next_flow = prompted.blocks[0][0], prompted.flow
+            # A photo is not a manual hostname reply or a new menu choice.
+            # Keep an outstanding collector link and the intake stage intact.
+            prior_stage = flow.get("escalation", {}).get("stage")
+            if prior_stage:
+                next_flow["escalation"]["stage"] = prior_stage
+        elif flow.get("source"):
+            prompt = "Опишите словами, что происходит и на каком шаге возникла трудность."
+        elif flow.get("clarification_keys") and flow["clarification_keys"][-1] in CLARIFY_QUESTIONS:
+            prompt = CLARIFY_QUESTIONS[flow["clarification_keys"][-1]]
+        else:
+            prompt = "Опишите словами проблему и то, какая помощь нужна."
+        return Turn("REPLY", [(notice + "\n\n" + prompt, None)], flow=next_flow)
+    turn = _text_turn(message, flow, context, previous_pending, llm, knowledge, settings)
+    # A valid-photo FORM already gets the manual-attachment warning from the
+    # letter presenter. Media failures must still be visible before that preview.
+    if turn.action != "FORM" or error:
+        turn.media_notice = notice
+    return turn
+
+
+def _text_turn(message, flow, context, previous_pending, llm, knowledge, settings):
     protected = (knowledge_scope_reply(message, settings.openwebui_knowledge_ids)
                  or refusal_reply(message))
     if protected:
@@ -518,6 +566,9 @@ def _claim(factory, settings, account_id):
             room.flow = {key: value for key, value in (room.flow or {}).items() if key != "_processing"}
         previous = {"pending": incident.pending_action, "result": incident.result, "state": incident.state}
         inbox.status, inbox.tries, inbox.error_code = "RUNNING", inbox.tries + 1, None
+        media = copy.deepcopy(inbox.media or {})
+        if media.get("files"):
+            incident.has_user_photos = True
         start_progress(inbox)
         incident.pending_action, incident.version = "PROCESSING", incident.version + 1
         context = load_context(session, incident, settings)
@@ -526,7 +577,8 @@ def _claim(factory, settings, account_id):
         room.flow = {**flow, "_processing": {"inbox_id": inbox.id, "tries": inbox.tries, "previous": previous}}
         return {"inbox_id": inbox.id, "room_id": room.id, "incident_id": incident.id, "version": incident.version,
                 "message": inbox.content, "flow": flow, "previous": previous,
-                "context": context, "principal": principal, "account_id": account.id, "tries": inbox.tries}
+                "context": context, "principal": principal, "account_id": account.id, "tries": inbox.tries,
+                "media": media}
 
 
 def _attempt(session, incident):
@@ -599,6 +651,8 @@ def _finish(factory, turn, claimed, llm, settings):
         append_message(session, incident.id, "user", claimed["message"], "RECEIVED")
         if turn.confirmed_computer:
             remember_computer(room, incident.id, turn.confirmed_computer)
+        if turn.media_notice:
+            _deliver(session, incident, [(turn.media_notice, None)])
         pending = _attempt(session, incident)
         if turn.action in {"GUIDE", "RETRY_GUIDE"}:
             if turn.action == "RETRY_GUIDE" and pending:
@@ -730,7 +784,8 @@ def process_one(factory, settings, llm, knowledge=None, *, account_id=None):
     try:
         with _measure(metadata, "route"):
             turn = _turn(claimed["message"], claimed["flow"], claimed["context"],
-                         claimed["previous"]["pending"], timed_llm, timed_knowledge, settings)
+                         claimed["previous"]["pending"], timed_llm, timed_knowledge, settings,
+                         inbound_media=claimed["media"])
         with _measure(metadata, "persist"):
             finished = _finish(factory, turn, claimed, llm, settings)
     except Exception as error:

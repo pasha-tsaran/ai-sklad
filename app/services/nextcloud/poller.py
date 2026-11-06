@@ -14,6 +14,7 @@ from sqlalchemy import select
 from app.models.talk import TalkAccount, TalkInbox, TalkRoom
 from app.services.chat.channel_profile import update_nextcloud_profile
 from app.services.nextcloud.account import AccountClient, AccountError, sequence
+from app.services.nextcloud.inbound_media import parse_inbound_media
 
 MAX_INBOUND_CHARS = 8000
 
@@ -22,18 +23,33 @@ def _utc(value):
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
 
 
-def _text(message, employee, service, activated):
+def _payload(message, employee, service, activated):
     sender = message.get("actorId")
     if (message.get("actorType") != "users" or sender != employee or sender == service
-            or message.get("messageType") != "comment" or message.get("systemMessage")
+            or message.get("messageType") not in {"comment", "voice-message"}
+            or message.get("systemMessage") not in {None, "", "file_shared"}
             or message["timestamp"] < int(_utc(activated).timestamp())):
+        return None
+    if message.get("systemMessage") == "file_shared":
+        parsed = parse_inbound_media(message)
+        caption = parsed["caption"]
+        media = {key: value for key, value in parsed.items() if key != "caption"}
+        if len(caption) > MAX_INBOUND_CHARS:
+            caption, media = "", {"files": [], "error_code": "inbound_caption_too_long"}
+        return caption, media
+    if message.get("messageType") != "comment":
         return None
     parameters = message.get("messageParameters") or {}
     values = parameters.values() if isinstance(parameters, dict) else parameters if isinstance(parameters, list) else []
     if any(isinstance(value, dict) and value.get("type") in {"file", "media", "attachment"} for value in values):
-        return None  # No downloading employee files, avatars or remote rich-object URLs.
+        return None  # A file is accepted only through the server's file_shared event.
     content = message.get("message")
-    return content if isinstance(content, str) and content.strip() and len(content) <= MAX_INBOUND_CHARS else None
+    return (content, {}) if isinstance(content, str) and content.strip() and len(content) <= MAX_INBOUND_CHARS else None
+
+
+def _text(message, employee, service, activated):
+    payload = _payload(message, employee, service, activated)
+    return payload[0] if payload is not None else None
 
 
 def _room_error(factory, room_id, exc):
@@ -157,7 +173,8 @@ def poll_once(factory, settings, client=None):
                     update_nextcloud_profile(room, observed_profile)
                 for message in messages:
                     remote_sequence = sequence(message["id"])
-                    content = _text(message, employee, service, activated)
+                    payload = _payload(message, employee, service, activated)
+                    content, media = payload if payload is not None else (None, {})
                     # Ignore old/unsupported content without retaining old private transcripts.
                     sender = message.get("actorId")
                     sender = sender if isinstance(sender, str) and len(sender) <= 255 else ""
@@ -168,6 +185,7 @@ def poll_once(factory, settings, client=None):
                     session.add(TalkInbox(
                         room_id=room_id, remote_message_id=str(remote_sequence),
                         remote_sequence=remote_sequence, sender_id=sender, content=content or "",
+                        media=media,
                         occurred_at=datetime.fromtimestamp(message["timestamp"], timezone.utc),
                         status="PENDING" if content is not None else "IGNORED",
                     ))

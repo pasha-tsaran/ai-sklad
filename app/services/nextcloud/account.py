@@ -286,6 +286,96 @@ class AccountClient:
             raise AccountError("invalid_send_result")
         return str(sequence(data.get("id")))
 
+    def _inbound_message(self, room, message_id, employee):
+        data, _, status = self._request(
+            "GET", "/ocs/v2.php/apps/spreed/api/v1/chat/" + self._token(room), acceptable=(200, 304),
+            params={"lookIntoFuture": 1, "lastKnownMessageId": message_id, "limit": 1, "timeout": 0,
+                    "includeLastKnown": 1, "setReadMarker": 0, "noStatusUpdate": 1,
+                    "markNotificationsAsRead": 0},
+        )
+        if status != 200 or not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], dict):
+            raise AccountError("inbound_media_unavailable")
+        message = data[0]
+        if (sequence(message.get("id")) != message_id or message.get("token") != room
+                or message.get("actorType") != "users" or message.get("actorId") != employee
+                or message.get("messageType") != "comment" or message.get("systemMessage") != "file_shared"):
+            raise AccountError("inbound_media_scope_changed")
+        return message
+
+    def _inbound_binary(self, method, path, maximum, **kwargs):
+        with httpx.Client(auth=(self.username, self.password), verify=True, follow_redirects=False,
+                          timeout=self.settings.integration_timeout_seconds, transport=self.transport) as client:
+            with client.stream(method, self.base + path, **kwargs) as response:
+                if response.status_code != (207 if method == "PROPFIND" else 200):
+                    raise AccountError("inbound_media_download_unavailable")
+                length = response.headers.get("content-length")
+                if length is not None and (not length.isascii() or not length.isdigit() or int(length) > maximum):
+                    raise AccountError("inbound_media_too_large")
+                raw = bytearray()
+                for block in response.iter_bytes():
+                    raw.extend(block)
+                    if len(raw) > maximum:
+                        raise AccountError("inbound_media_too_large")
+                return bytes(raw), dict(response.headers)
+
+    def download_inbound_image(self, room, remote_message_id, file_id, *, expected_employee):
+        """Read one actual employee upload through our own authenticated DAV root.
+
+        Paths/URLs are never accepted from the caller. Re-read the exact Talk
+        message and compare file identity/permissions/ETag around the download.
+        """
+        from app.services.nextcloud.inbound_media import (
+            ALLOWED_TYPES, MAX_IMAGE_BYTES, InboundImage, InvalidInboundMedia,
+            dav_metadata, file_descriptor, normalized_etag, verify_image,
+        )
+        try:
+            if not isinstance(expected_employee, str) or not expected_employee:
+                raise AccountError("inbound_media_scope_changed")
+            message_id, target = sequence(remote_message_id), sequence(file_id)
+            checked = self.validate_room(room, expected_employee=expected_employee)
+            uid = checked["service_id"]
+            if uid in {".", ".."} or "/" in uid or "\\" in uid:
+                raise AccountError("inbound_media_scope_changed")
+            source = self._inbound_message(room, message_id, expected_employee)
+            descriptor = file_descriptor(source, target)
+            path = "/remote.php/dav/files/" + quote(uid, safe="") + "/" + "/".join(
+                quote(part, safe="") for part in descriptor["path"].split("/")
+            )
+            properties = (b'<?xml version="1.0"?><d:propfind xmlns:d="DAV:" xmlns:oc="http://owncloud.org/ns">'
+                          b'<d:prop><oc:fileid/><d:getetag/><d:getcontentlength/><d:getcontenttype/>'
+                          b'<d:resourcetype/></d:prop></d:propfind>')
+            def stat():
+                raw, _ = self._inbound_binary("PROPFIND", path, 100_000, content=properties,
+                                              headers={"Depth": "0", "Content-Type": "application/xml"})
+                result = dav_metadata(raw, path, self.base)
+                if (any(result[key] != descriptor[key] for key in ("id", "size", "mimetype"))
+                        or (descriptor["etag"] and result["etag"] != descriptor["etag"])):
+                    raise AccountError("inbound_media_file_changed")
+                return result
+            before = stat()
+            self.validate_room(room, expected_employee=expected_employee)
+            raw, headers = self._inbound_binary("GET", path, MAX_IMAGE_BYTES,
+                                                headers={"If-Match": '"' + before["etag"] + '"'})
+            mime = headers.get("content-type", "").split(";", 1)[0].strip().lower()
+            if (mime != descriptor["mimetype"] or len(raw) != descriptor["size"]
+                    or normalized_etag(headers.get("etag")) != before["etag"]):
+                raise AccountError("inbound_media_file_changed")
+            verify_image(raw, mime)
+            if stat() != before:
+                raise AccountError("inbound_media_file_changed")
+            after = self._inbound_message(room, message_id, expected_employee)
+            if file_descriptor(after, target) != descriptor:
+                raise AccountError("inbound_media_file_changed")
+            self.validate_room(room, expected_employee=expected_employee)
+            digest = hashlib.sha256(raw).hexdigest()
+            filename = "photo-" + hashlib.sha256((room + ":" + str(message_id) + ":" + str(target)
+                                                   + ":" + digest).encode()).hexdigest()[:24] + ALLOWED_TYPES[mime][1]
+            return InboundImage(raw, mime, filename, digest, str(message_id), str(target), expected_employee, before["etag"])
+        except InvalidInboundMedia as error:
+            raise AccountError(error.code) from None
+        except httpx.HTTPError:
+            raise AccountError("inbound_media_download_unavailable") from None
+
     def send_image(self, room, content, message_id, attachment, *, expected_employee=None):
         checked = self.validate_room(room, expected_employee=expected_employee)
         raw = attachment.data

@@ -63,6 +63,7 @@ class Incident(Entity, Base):
     pending_action: Mapped[str | None] = mapped_column(String(64))
     result: Mapped[str | None] = mapped_column(String(32))
     escalation_reason: Mapped[str | None] = mapped_column(String(64))
+    has_user_photos: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     __table_args__ = (
         CheckConstraint("failed_attempts BETWEEN 0 AND 5"),

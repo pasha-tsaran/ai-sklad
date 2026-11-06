@@ -426,6 +426,11 @@ def test_talk_account_migration_matches_models_and_downgrades_cleanly(tmp_path):
     )
     device_migration = importlib.util.module_from_spec(device_spec)
     device_spec.loader.exec_module(device_migration)
+    photo_spec = importlib.util.spec_from_file_location(
+        "inbound_photo_metadata_migration", path.with_name("0008_inbound_photo_metadata.py"),
+    )
+    photo_migration = importlib.util.module_from_spec(photo_spec)
+    photo_spec.loader.exec_module(photo_migration)
     engine = create_engine("sqlite:///" + str(tmp_path / "migration.db"))
     old_tables = [table for table in Base.metadata.sorted_tables
                   if not table.name.startswith("talk_") and table.name != "device_collections"]
@@ -435,18 +440,22 @@ def test_talk_account_migration_matches_models_and_downgrades_cleanly(tmp_path):
         connection.exec_driver_sql("DROP INDEX ix_deliveries_account_id")
         connection.exec_driver_sql("ALTER TABLE deliveries DROP COLUMN provenance")
         connection.exec_driver_sql("ALTER TABLE deliveries DROP COLUMN account_id")
+        connection.exec_driver_sql("ALTER TABLE incidents DROP COLUMN has_user_photos")
         context = MigrationContext.configure(connection)
         with Operations.context(context):
             migration.upgrade()
             profile_migration.upgrade()
             device_migration.upgrade()
+            photo_migration.upgrade()
         assert compare_metadata(context, Base.metadata) == []
         with Operations.context(context):
+            photo_migration.downgrade()
             device_migration.downgrade()
             profile_migration.downgrade()
             migration.downgrade()
         assert all(not name.startswith("talk_") for name in connection.dialect.get_table_names(connection))
         assert "device_collections" not in connection.dialect.get_table_names(connection)
+        assert "has_user_photos" not in {column["name"] for column in connection.dialect.get_columns(connection, "incidents")}
         assert not {"provenance", "account_id"}.intersection(
             column["name"] for column in connection.dialect.get_columns(connection, "deliveries")
         )

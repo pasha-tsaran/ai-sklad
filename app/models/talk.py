@@ -50,3 +50,4 @@ class TalkInbox(Entity, Base):
         Index("ix_talk_inbox_status_sequence", "status", "remote_sequence"),
     )
     progress: Mapped[dict] = mapped_column(JSON, default=dict, server_default=text("'{}'"))
+    media: Mapped[dict] = mapped_column(JSON, default=dict, server_default=text("'{}'"))

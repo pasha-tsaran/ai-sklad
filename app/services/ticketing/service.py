@@ -104,6 +104,9 @@ def collect_details(session, user_id, incident_id, details, settings):
             "Подготовлено письмо для технической поддержки.\n\n"
             + letter_preview(draft, settings.support_email)
         )
+        if incident.has_user_photos:
+            explanation += ("\n\nФотографии из чата не добавлены в письмо автоматически. "
+                            "Прикрепите нужные фотографии в своём почтовом ящике перед отправкой.")
         if link:
             explanation += "\n\n[Открыть письмо в почте](" + link + ")"
         else:
