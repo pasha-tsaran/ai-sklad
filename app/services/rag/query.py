@@ -27,14 +27,37 @@ _QUALITY_EVIDENCE = _QUALITY_SYMPTOMS + (
     "качеств", "тонер", "картридж", "чернил", "головк", "quality", "cartridge", "ink",
 )
 
+# Closed aliases of named products/transports. Do not transliterate arbitrary
+# Russian words, expand generic 'толк', or conflate related vendor products.
+_ALIAS_SEPARATOR = r"[\s‐‑‒–—-]*"
+_WIFI_ALIAS = rf"(?:wi{_ALIAS_SEPARATOR}fi|(?:вай|ви){_ALIAS_SEPARATOR}(?:фай|фи))"
+_BLUETOOTH_ALIAS = rf"(?:blue{_ALIAS_SEPARATOR}tooth|бл[юу]ту[зсф](?:а|у|ом|е)?|(?:блю|блу){_ALIAS_SEPARATOR}ту[зс](?:а|у|ом|е)?)"
+_NEXTCLOUD_ALIAS = rf"(?:next{_ALIAS_SEPARATOR}cloud|некст{_ALIAS_SEPARATOR}кл[ао]уд)"
+_PRODUCT_ALIASES = (
+    (rf"{_NEXTCLOUD_ALIAS}{_ALIAS_SEPARATOR}(?:talk|т[оа]лк)(?:а|у|ом|е)?", "nextcloud talk"),
+    (_NEXTCLOUD_ALIAS, "nextcloud"),
+    (rf"(?:forti{_ALIAS_SEPARATOR}gate|форт[ие]?{_ALIAS_SEPARATOR}г[еэ]й?т(?:а|у|ом|е|ы|ов)?)", "fortigate"),
+    (rf"(?:forti{_ALIAS_SEPARATOR}client|форт[ие]?{_ALIAS_SEPARATOR}клиент(?:а|у|ом|е|ы|ов)?)", "forticlient"),
+    (_WIFI_ALIAS, "wifi"),
+    (_BLUETOOTH_ALIAS, "bluetooth"),
+)
+
+
+def _normalize_product_aliases(text):
+    # Users often omit the separator in 'поблютуз'. Split only a known
+    # preposition immediately followed by a complete known transport alias.
+    text = re.sub(rf"\b(по|через)(?=(?:{_WIFI_ALIAS}|{_BLUETOOTH_ALIAS})\b)", r"\1 ", text)
+    for alias, canonical in _PRODUCT_ALIASES:
+        text = re.sub(rf"\b(?:{alias})\b", canonical, text)
+    return text
+
 
 def normalized_query(value):
     """A full, ordered fingerprint: preserve negations, model numbers and symptoms."""
     if not isinstance(value, str):
         return ""
     text = unicodedata.normalize("NFKC", value).casefold().replace("ё", "е")
-    text = re.sub(r"\b(?:wi[\s‐‑–—-]*fi|вай[\s-]*фай|вайфай|вифи)\b", " wifi ", text)
-    text = re.sub(r"\b(?:блютуз|блютус|блютуф|blue[\s-]*tooth)\b", " bluetooth ", text)
+    text = _normalize_product_aliases(text)
     return " ".join(re.findall(r"[a-zа-я0-9]+(?:[._-][a-zа-я0-9]+)*", text))
 
 
@@ -154,6 +177,13 @@ def source_compatible(problem, text, *, complete=False):
     if complete and not required.issubset(available):
         return False
     if complete:
+        requested_words = set(normalized_query(problem).split())
+        source_words = set(normalized_query(text).split())
+        products = requested_words & {"fortigate", "forticlient", "nextcloud"}
+        if not products.issubset(source_words):
+            return False
+        if {"nextcloud", "talk"}.issubset(requested_words) and "talk" not in source_words:
+            return False
         if not _task_covered(problem, text):
             return False
         wanted_models, wanted_versions = _identifiers(problem)

@@ -597,14 +597,15 @@ def test_feedback_during_form_keeps_the_form_and_does_not_restart_alternative_gu
     talk.process(knowledge)
     talk.incoming("Не помогло", 2)
     talk.process(knowledge)
+    talk.incoming("1", 3)
+    talk.process(knowledge)
     before = talk.snapshot()
     assert before["incident"].pending_action == "COLLECT_ESCALATION_DETAILS"
     searches = len(knowledge.searches)
     knowledge.documents.append(approved(2, OTHER))
-    talk.incoming(message, 3)
+    talk.incoming(message, 4)
     talk.process(knowledge)
     state = talk.snapshot()
-    assert assistants(state)[-1][0].startswith("ФИО:")
     assert INTAKE_QUESTIONS["computer_name"] in assistants(state)[-1][0]
     assert state["incident"].pending_action == "COLLECT_ESCALATION_DETAILS"
     assert len(state["attempts"]) == 1 and len(knowledge.searches) == searches
@@ -1084,7 +1085,7 @@ def test_missing_name_answer_is_assigned_only_after_the_backend_actually_asked_f
 
     monkeypatch.setattr(engine, "parse_intake", record)
     model, knowledge = NoGeneration(), Knowledge()
-    for sequence, content in enumerate(["оператор", "Готово", "terminal76-sk", "Павел"], 1):
+    for sequence, content in enumerate(["оператор", "1", "terminal76-sk", "Павел"], 1):
         talk.incoming(content, sequence)
         talk.process(knowledge, model)
     state = talk.snapshot()

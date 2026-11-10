@@ -24,6 +24,7 @@ from app.services.chat.messages import append_message
 from app.services.chat.policies import FORM_ACTION, MAX_ATTEMPTS, TERMINAL_STATES, direct_intent
 from app.services.chat.service import messenger
 from app.services.rag.openwebui import save_snapshot
+from app.services.rag.query import normalized_query
 from app.services.rag.talk import (
     ApprovedTalkDocument, KnowledgeUnavailable, SourceSelection, TalkKnowledge, _SELECTION_TASK,
 )
@@ -275,6 +276,12 @@ def _current_step_question(message):
     ))
 
 
+def _technical_message(message):
+    canonical = normalized_query(message)
+    return bool(requires_support(message) or requires_support(canonical)
+                or re.search(r"\b(?:fortigate|forticlient|bluetooth)\b", canonical))
+
+
 def _free_support_request(message):
     # The CHOICE menu is not the form yet. A fresh work question is a request
     # to keep talking, while explicitly labelled ticket fields stay data.
@@ -282,11 +289,85 @@ def _free_support_request(message):
             or re.search(r"\b(?:меня\s+зовут|мой\s+логин|логин|фио)\b", message, re.I)
             or _ordered_lines(message) is not None):
         return False
-    return requires_support(message) and bool(re.search(
+    return _technical_message(message) and bool(re.search(
         r"(?:^|[.!?]\s*)(?:как\b|почему\b|где\b|что\b|помоги\w*\b|подскажи\w*\b)|"
         r"\b(?:не\s+(?:работает|печатает|сканирует|подключается)|нужно\s+(?:подключить|настроить))\b",
         message.casefold(),
     ))
+
+
+def _structured_letter(message):
+    identity_reply = (not re.match(r"\s*(?:как|почему|где|зачем|когда|кто|что|а\s+если|другой\s+вопрос)\b", message, re.I)
+                      and bool(re.search(r"\b(?:меня\s+зовут|(?:мой|рабочий)\s+логин)\b", message, re.I)))
+    return (_ordered_lines(message) is not None or bool(re.search(
+        r"(?:^|\n)\s*(?:фио|логин|компьютер|тема|описание)\s*:", message, re.I,
+    )) or identity_reply)
+
+
+def _positive_connections(message):
+    words = normalized_query(message).split()
+    return {word for index, word in enumerate(words) if word in {"wifi", "bluetooth", "usb", "ethernet"}
+            and not {"не", "без"}.intersection(words[max(0, index - 3):index])}
+
+
+def _without_previous_connection(previous, message):
+    if not _positive_connections(message) or not _positive_connections(previous):
+        return previous
+    words = normalized_query(previous).split()
+    return " ".join(word for index, word in enumerate(words)
+                    if word not in {"wifi", "bluetooth", "usb", "ethernet"}
+                    or {"не", "без"}.intersection(words[max(0, index - 3):index]))
+
+
+def _form_interrupted(message, flow):
+    if _structured_letter(message):
+        return False
+    text = normalized_query(message)
+    if re.match(r"^(?:а\s+если|а\s+как|а\s+можно|другой\s+вопрос|другая\s+проблема|"
+                r"подожди\w*|погоди\w*|кстати|не\s+хочу\s+оформлять|"
+                r"давай\w*\s+(?:пока\s+)?(?:без\s+заявки|продолжим))\b", text):
+        return True
+    requested = flow.get("escalation", {}).get("intake_requested_field")
+    if requested in {"subject", "additional_info"}:
+        # The employee can deliberately write a question as the subject/body.
+        return False
+    return bool(_free_support_request(message) or _positive_connections(message)
+                or re.match(r"^(?:как|почему|где|зачем|когда|кто|что|расскажи\w*|подскажи\w*)\b", text))
+
+
+def _continue_from_letter(message, flow, context, llm, knowledge, settings):
+    """A work question resumes support; unfinished personal form fields stay out of retrieval."""
+    saved = flow.get("escalation", {}).get("resume", {})
+    restored = copy.deepcopy(saved.get("flow", {key: value for key, value in flow.items() if key != "escalation"}))
+    text = normalized_query(message)
+    if text in {"да", "нет", "готово", "понятно", "ок", "хорошо", "не знаю"}:
+        return Turn("RESUME", [(BACK_TO_BOT, None)], flow=restored, resume=saved)
+    if not (restored.get("source") and _current_step_question(message)):
+        prior = _last_problem(restored, context)
+        refinement = bool(_positive_connections(message)) and bool(re.match(
+            r"^(?:а\s+(?:если|по|через|как)|по\b|через\b|подключ\w*\s+по\b)", text,
+        ))
+        if prior and refinement:
+            # A later explicit transport supersedes the previous choice. Never
+            # require Bluetooth and Wi-Fi simultaneously after "а если по Wi-Fi".
+            prior = _without_previous_connection(prior, message)
+            restored = {"clarification_query": prior, "excluded": []}
+        else:
+            restored = {}
+    try:
+        following = _text_turn(message, restored, context, None, llm, knowledge, settings)
+    except KnowledgeUnavailable:
+        following = Turn("REPLY", [(UNAVAILABLE, None)], flow={
+            "clarification_query": _problem_query(message, restored), "excluded": restored.get("excluded", []),
+        })
+    if following.action in {"NO_KNOWLEDGE", "HUMAN"}:
+        return Turn("RESUME", [("В базе знаний пока нет подходящей утверждённой инструкции для этого вопроса. "
+                                "Можем продолжить разбираться; письмо в поддержку не оформляется.", None)],
+                    flow=following.flow or {"clarification_query": _problem_query(message, restored)}, resume={})
+    if following.action == "REPLY":
+        following.action, following.resume = "RESUME", {}
+        following.flow = following.flow if following.flow is not None else restored
+    return following
 
 
 def _escalation_choice(message):
@@ -323,11 +404,15 @@ def _last_problem(flow, context):
     # Current reports are kept explicitly in flow. Recent conversation messages
     # can be intake data, so they are not a fallback source for retrieval queries.
     subject = context.get("incident", {}).get("subject")
-    return subject if isinstance(subject, str) and requires_support(subject) and not control(subject) else ""
+    return subject if isinstance(subject, str) and _technical_message(subject) and not control(subject) else ""
 
 
 def _problem_query(message, flow):
     previous = flow.get("clarification_query")
+    if re.match(r"\s*(?:как|почему|зачем|когда|кто|что\s+делать|другой\s+вопрос|другая\s+проблема)\b", message, re.I):
+        return message[:6000]
+    if previous:
+        previous = _without_previous_connection(previous, message)
     factual_answer = (flow.get("clarification_keys") and len(message) <= 2000
                       and not re.match(r"\s*(?:как|почему|зачем|что\s+делать|другая\s+проблема)\b", message, re.I))
     if previous and message != previous and (len(message.split()) <= 8 or factual_answer):
@@ -527,24 +612,13 @@ def _text_turn(message, flow, context, previous_pending, llm, knowledge, setting
             if flow.get("escalation", {}).get("profile_prefilled"):
                 return _intake_prompt(_prefill_intake(flow, context))
             return _profile_form_request(flow, context)
-        if intent == "FEEDBACK" or is_confirmation(message):
-            return (_intake_prompt(_prefill_intake(flow, context)) if flow.get("escalation", {}).get("profile_prefilled")
-                    else _profile_form_request(flow, context))
         if reply := _simple_social(message):
             return Turn("REPLY", [(reply, None)])
-        if flow.get("escalation", {}).get("stage") == "CHOICE" and _free_support_request(message):
-            saved = flow.get("escalation", {}).get("resume", {})
-            restored = copy.deepcopy(saved.get("flow", {key: value for key, value in flow.items() if key != "escalation"}))
-            try:
-                following = _support_turn(message, restored, context, llm, knowledge)
-            except KnowledgeUnavailable:
-                following = Turn("REPLY", [(UNAVAILABLE, None)], flow={
-                    "clarification_query": _problem_query(message, restored), "excluded": restored.get("excluded", []),
-                })
-            if following.action == "REPLY":
-                following.action, following.resume = "RESUME", {}
-                following.flow = following.flow if following.flow is not None else restored
-            return following
+        stage = flow.get("escalation", {}).get("stage")
+        if ((stage == "CHOICE" and not _structured_letter(message)) or _form_interrupted(message, flow)):
+            return _continue_from_letter(message, flow, context, llm, knowledge, settings)
+        if intent == "FEEDBACK" or is_confirmation(message):
+            return _intake_prompt(_prefill_intake(flow, context))
         # Everything else here is employee data for the pending letter. It must
         # not be classified as chat or used to search for another instruction.
         return _intake_turn(message, flow, llm, context)
@@ -578,7 +652,7 @@ def _text_turn(message, flow, context, previous_pending, llm, knowledge, setting
                                       or _PHOTO_REQUEST.search(message) or _NEXT_PHOTO.search(message))) or (
         flow.get("clarification_query") and len(message.split()) <= 8
     )
-    if not requires_support(message) and not pinned:
+    if not _technical_message(message) and not pinned:
         try:
             routed = DialogueResult.model_validate(llm.dialogue(message, context))
             if routed.route == "REFUSE":
