@@ -16,7 +16,7 @@ from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, event, select
+from sqlalchemy import MetaData, create_engine, event, select
 
 from app.api.dependencies import get_session
 from app.api.device import router
@@ -299,9 +299,15 @@ def test_device_migration_is_additive_preserves_existing_rows_and_downgrades_onl
     migration = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(migration)
     engine = create_engine("sqlite:///" + str(tmp_path / "migration.db"))
-    old = [table for table in Base.metadata.sorted_tables if table.name != "device_collections"]
+    expected = MetaData()
+    for table in Base.metadata.sorted_tables:
+        if table.name != "successful_retrievals":
+            table.to_metadata(expected)
+    expected.tables["talk_inbox"]._columns.remove(expected.tables["talk_inbox"].c.media)
+    expected.tables["incidents"]._columns.remove(expected.tables["incidents"].c.has_user_photos)
+    old = [table for table in expected.sorted_tables if table.name != "device_collections"]
     with engine.begin() as connection:
-        Base.metadata.create_all(connection, tables=old)
+        expected.create_all(connection, tables=old)
         connection.execute(User.__table__.insert().values(id="existing-user", external_id="prior-user", display_name="Имя"))
         connection.execute(TalkAccount.__table__.insert().values(id="existing-account", server_url=BASE,
                                                                 username=SERVICE, activated_at=now()))
@@ -312,7 +318,8 @@ def test_device_migration_is_additive_preserves_existing_rows_and_downgrades_onl
         context = MigrationContext.configure(connection)
         with Operations.context(context):
             migration.upgrade()
-        assert compare_metadata(context, Base.metadata) == []
+        assert compare_metadata(context, expected) == []
+        assert "successful_retrievals" not in connection.dialect.get_table_names(connection)
         assert {table.name: [dict(row._mapping) for row in connection.execute(select(table))] for table in tables} == before
         with Operations.context(context):
             migration.downgrade()

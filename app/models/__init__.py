@@ -22,6 +22,7 @@ from app.models.entities import (
 )
 from app.models.talk import TalkAccount, TalkInbox, TalkRoom
 from app.models.device import DeviceCollection
+from app.models.retrieval import SuccessfulRetrieval
 
 __all__ = [
     "AuditEvent",
@@ -42,6 +43,7 @@ __all__ = [
     "ResolutionMemory",
     "Solution",
     "SolutionAttempt",
+    "SuccessfulRetrieval",
     "TalkAccount",
     "TalkInbox",
     "TalkRoom",

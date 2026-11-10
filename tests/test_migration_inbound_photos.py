@@ -20,10 +20,16 @@ def migration():
     return module
 
 
-def old_metadata():
-    previous = MetaData()
+def expected_metadata():
+    expected = MetaData()
     for table in Base.metadata.sorted_tables:
-        table.to_metadata(previous)
+        if table.name != "successful_retrievals":
+            table.to_metadata(expected)
+    return expected
+
+
+def old_metadata():
+    previous = expected_metadata()
     for table, name in [("talk_inbox", "media"), ("incidents", "has_user_photos")]:
         previous.tables[table]._columns.remove(previous.tables[table].c[name])
     return previous
@@ -60,6 +66,7 @@ def seed_old_writer(connection):
 def test_inbound_migration_preserves_real_prior_rows_and_legacy_writer_defaults(tmp_path):
     engine = create_engine(f"sqlite:///{tmp_path / 'inbound-photo-migration.db'}")
     previous = old_metadata()
+    expected = expected_metadata()
     change = migration()
     with engine.begin() as connection:
         previous.create_all(connection)
@@ -70,7 +77,8 @@ def test_inbound_migration_preserves_real_prior_rows_and_legacy_writer_defaults(
         context = MigrationContext.configure(connection)
         with Operations.context(context):
             change.upgrade()
-        assert compare_metadata(context, Base.metadata) == []
+        assert compare_metadata(context, expected) == []
+        assert "successful_retrievals" not in connection.dialect.get_table_names(connection)
         assert snapshot(connection, previous) == before
         assert connection.scalar(select(TalkInbox.media).where(TalkInbox.id == "inbox")) == {}
         assert connection.scalar(select(Incident.has_user_photos).where(Incident.id == "incident")) is False
@@ -98,7 +106,7 @@ def test_inbound_migration_preserves_real_prior_rows_and_legacy_writer_defaults(
         assert snapshot(connection, previous) == after_legacy
         with Operations.context(context):
             change.upgrade()
-        assert compare_metadata(context, Base.metadata) == []
+        assert compare_metadata(context, expected) == []
         assert snapshot(connection, previous) == after_legacy
         assert connection.scalar(select(TalkInbox.media).where(TalkInbox.id == "inbox")) == {}
         assert connection.scalar(select(Incident.has_user_photos).where(Incident.id == "incident")) is False

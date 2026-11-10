@@ -12,7 +12,8 @@ def test_additive_migration_preserves_conversation(tmp_path):
     # Construct the prior schema from the unchanged model fields, then apply the actual migration.
     expected = MetaData()
     for table in Base.metadata.sorted_tables:
-        table.to_metadata(expected)
+        if table.name != "successful_retrievals":
+            table.to_metadata(expected)
     # 0005 adds these outbox fields; this test checks 0002's original contract.
     deliveries = expected.tables["deliveries"]
     for index in list(deliveries.indexes):

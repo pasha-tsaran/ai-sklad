@@ -167,14 +167,14 @@ def test_invalid_scope_or_file_reference_never_expands_to_all_available_knowledg
 
 def test_plain_markdown_instructions_are_read_as_original_utf8_without_invented_images():
     knowledge, _ = provider(filename="05_Acrobat PDF печать.md", data="Нажмите Ctrl+P.\nПроверьте печать PDF.".encode())
-    approved = knowledge.search(QUERY)
+    approved = knowledge.search("Как напечатать PDF в Acrobat?")
     assert approved.document["images"] == [] and approved.illustrations == {}
     assert approved.document["content"] == "Нажмите Ctrl+P.\nПроверьте печать PDF."
 
 
 def test_pdf_uses_complete_webui_extracted_text_and_revalidates_its_hash_without_invented_photos():
     knowledge, state = provider(filename="05_Acrobat PDF печать.pdf", data="Откройте PDF и нажмите Ctrl+P.".encode())
-    approved = knowledge.search(QUERY)
+    approved = knowledge.search("Как напечатать PDF в Acrobat?")
     assert approved.document["content"] == state["data"].decode()
     assert approved.document["images"] == [] and approved.illustrations == {}
     assert approved.candidate.source["original_sha256"] is None
@@ -194,7 +194,7 @@ def test_xlsx_tables_keep_all_original_cells_without_model_generated_prose():
                                    '<c r="B1"><v>141</v></c></row></sheetData></worksheet>',
     })
     knowledge, _ = provider(filename="Acrobat PDF печать.xlsx", data=data)
-    approved = knowledge.search(QUERY)
+    approved = knowledge.search("Как напечатать PDF в Acrobat?")
     assert "A1: Печать PDF | B1: 141" in approved.document["content"]
     assert approved.document["images"] == []
 

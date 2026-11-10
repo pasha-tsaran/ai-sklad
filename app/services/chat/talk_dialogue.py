@@ -7,11 +7,12 @@ from dataclasses import dataclass, field
 from datetime import timezone
 from uuid import NAMESPACE_URL, uuid5
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
+from sqlalchemy.exc import DBAPIError
 
 from app.core.logging import event
 from app.models import (
-    Conversation, Delivery, Feedback, Incident, Message, SolutionAttempt, User, now,
+    AuditEvent, Conversation, Delivery, Feedback, Incident, Message, SolutionAttempt, User, now,
 )
 from app.models.talk import TalkAccount, TalkInbox, TalkRoom
 from app.schemas.contracts import AnalysisResult, DialogueResult, EscalationDetails
@@ -23,8 +24,11 @@ from app.services.chat.messages import append_message
 from app.services.chat.policies import FORM_ACTION, MAX_ATTEMPTS, TERMINAL_STATES, direct_intent
 from app.services.chat.service import messenger
 from app.services.rag.openwebui import save_snapshot
-from app.services.rag.talk import ApprovedTalkDocument, KnowledgeUnavailable, TalkKnowledge
-from app.services.ticketing.intake import parse_intake
+from app.services.rag.talk import (
+    ApprovedTalkDocument, KnowledgeUnavailable, SourceSelection, TalkKnowledge, _SELECTION_TASK,
+)
+from app.services.rag.success import SuccessfulTalkKnowledge, remember_success
+from app.services.ticketing.intake import _ordered_lines, parse_intake
 from app.services.ticketing.service import collect_details
 from integrations.openwebui.automatic_instruction_images import (
     TIMING_MARKER, _clock, _measure, _milliseconds,
@@ -104,7 +108,7 @@ def _report_timing(metadata, started, route, block_count, error_code=None):
         state = metadata[TIMING_MARKER]
         event("talk.turn_failed" if error_code else "talk.turn_completed", total_ms=total, route=route,
               timings_ms=dict(state.get("stages_ms", {})), stage_calls=dict(state.get("stage_calls", {})),
-              block_count=block_count, error_code=error_code)
+              block_count=block_count, error_code=error_code, cache_hit=bool(metadata.get("cache_hit")))
     except Exception:
         pass  # Diagnostics never change the stored employee reply.
 
@@ -209,6 +213,82 @@ def _simple_social(message):
     return None
 
 
+def _feedback_kind(message, flow=None):
+    """Accept an explicit reported outcome, never infer it from a short 'yes'."""
+    if "?" in message:
+        return None
+    normalized = _normalized(message).replace("ё", "е")
+    normalized = re.sub(r"^(?:(?:да|ну|ура|спасибо|благодарю|отлично|вот)\s+)+", "", normalized)
+    normalized = re.sub(r"\s+(?:спасибо(?:\s+большое)?|благодарю)(?:\s+вам)?$", "", normalized)
+    positive = {
+        "помогло", "да помогло", "помогло спасибо", "спасибо помогло", "заработало",
+        "все заработало", "ура все заработало", "спасибо все заработало", "все работает",
+        "теперь все работает", "теперь работает", "проблема решена", "проблема устранена",
+        "получилось все работает",
+    }
+    negative = {
+        "не помогло", "нет не помогло", "не сработало", "пока не работает", "все еще не работает",
+        "ничего не изменилось", "проблема осталась", "все равно не работает", "не заработало",
+        "сделал но не помогло", "сделала но не помогло", "попробовал не помогло",
+        "попробовала не помогло",
+    }
+    if normalized in positive:
+        return "SUCCESS"
+    if normalized in negative:
+        return "FAILED"
+    problem = str((flow or {}).get("query", "")).casefold()
+    printer = bool(re.search(r"\b(?:принтер\w*|печат\w*|pdf|acrobat)\b", problem))
+    scanner = bool(re.search(r"\b(?:сканер\w*|сканир\w*|штрихкод\w*)\b", problem))
+    if normalized in {"теперь печатает", "принтер теперь печатает", "теперь принтер печатает"}:
+        return "SUCCESS" if printer and not scanner else None
+    if normalized in {"теперь сканирует", "сканер теперь работает", "теперь сканер работает"}:
+        return "SUCCESS" if scanner and not printer else None
+    if normalized in {"принтер все равно не печатает", "все равно не печатает", "принтер по прежнему не печатает"}:
+        return "FAILED" if printer and not scanner else None
+    if normalized in {"сканер все равно не работает", "сканер по прежнему не работает", "все равно не сканирует"}:
+        return "FAILED" if scanner and not printer else None
+    return None
+
+
+def _step_confirmed(message):
+    normalized = _normalized(message).replace("ё", "е")
+    return is_confirmation(message) or normalized in {
+        "этот шаг сделал", "этот шаг сделала", "с этим шагом закончил", "с этим шагом закончила",
+        "сделал что дальше", "сделала что дальше", "сделал это что дальше", "сделала это что дальше",
+        "выполнил что дальше", "выполнила что дальше", "можно дальше", "можем продолжать",
+        "давайте дальше", "готов можно дальше", "готово что дальше", "все сделал что дальше",
+    }
+
+
+def _current_step_question(message):
+    """Conversational difficulty points back to source text/photos, not invented alternatives."""
+    return is_ui_question(message) or _normalized(message) in {
+        "не получилось", "не получается", "не смог", "не смогла", "не разобрался", "не разобралась",
+        "застрял", "застряла", "я застрял", "я застряла",
+    } or bool(re.search(
+        r"(?:застрял(?:а)?\s+(?:на\s+)?(?:этом|первом|втором|текущем)\b|"
+        r"не\s+(?:разобрался|разобралась|понял(?:а)?|наш[её]л(?:а)?)|куда\s+(?:здесь\s+|тут\s+)?нажать|"
+        r"(?:объясни(?:те)?|расскажи(?:те)?)\s+(?:это\s+|пожалуйста\s+)?(?:проще|попроще|понятнее|подробнее)|"
+        r"(?:можно|нужно)\s+подробнее|(?:такого|такой|этого|этой)\s+(?:пункта|кнопки|галочки|меню)\s+нет|"
+        r"(?:пункт|кнопка|галочка)\s+(?:у\s+меня\s+)?(?:серая|недоступна|неактивна)|"
+        r"нету\s+(?:такого|такой|этого|этой|кнопки|пункта|меню))", message.casefold(),
+    ))
+
+
+def _free_support_request(message):
+    # The CHOICE menu is not the form yet. A fresh work question is a request
+    # to keep talking, while explicitly labelled ticket fields stay data.
+    if (re.search(r"(?:^|\n)\s*(?:фио|логин|компьютер|тема|описание)\s*:", message, re.I)
+            or re.search(r"\b(?:меня\s+зовут|мой\s+логин|логин|фио)\b", message, re.I)
+            or _ordered_lines(message) is not None):
+        return False
+    return requires_support(message) and bool(re.search(
+        r"(?:^|[.!?]\s*)(?:как\b|почему\b|где\b|что\b|помоги\w*\b|подскажи\w*\b)|"
+        r"\b(?:не\s+(?:работает|печатает|сканирует|подключается)|нужно\s+(?:подключить|настроить))\b",
+        message.casefold(),
+    ))
+
+
 def _escalation_choice(message):
     normalized = _normalized(message)
     if normalized in {"2", "отмена", "отменить", "отменить заявку", "назад", "вернуться к боту",
@@ -248,7 +328,9 @@ def _last_problem(flow, context):
 
 def _problem_query(message, flow):
     previous = flow.get("clarification_query")
-    if previous and message != previous and len(message.split()) <= 8:
+    factual_answer = (flow.get("clarification_keys") and len(message) <= 2000
+                      and not re.match(r"\s*(?:как|почему|зачем|что\s+делать|другая\s+проблема)\b", message, re.I))
+    if previous and message != previous and (len(message.split()) <= 8 or factual_answer):
         return (previous + "\n" + message)[:6000]
     return message[:6000]
 
@@ -320,8 +402,8 @@ def _support_turn(message, flow, context, llm, knowledge):
     has_guide = bool(flow.get("source"))
     photo_request = bool(_PHOTO_REQUEST.search(message) or _NEXT_PHOTO.search(message))
     next_photo = bool(photo_request and _NEXT_PHOTO.search(message))
-    clarification = bool(has_guide and (is_ui_question(message) or photo_request and not next_photo))
-    continuation = bool(has_guide and (is_confirmation(message) or next_photo))
+    clarification = bool(has_guide and (_current_step_question(message) or photo_request and not next_photo))
+    continuation = bool(has_guide and (_step_confirmed(message) or next_photo))
     if continuation and not flow.get("has_more"):
         return Turn("REPLY", [("Удалось решить проблему? Напишите «Помогло» или «Не помогло».", None)])
     analysis = None
@@ -380,6 +462,8 @@ def _support_turn(message, flow, context, llm, knowledge):
                      "query": problem, "has_more": len(eligible) > 6,
                      "next_offset": 6 if len(eligible) > 6 else None,
                      "excluded": flow.get("excluded", []) if flow else []}
+        if retrieval_key := getattr(knowledge, "last_cache_key", None):
+            next_flow["retrieval_key"] = retrieval_key
     if not knowledge.is_current(approved.document["source"]):
         return Turn("REPLY", [(CHANGED, None)])
     if not selected:
@@ -448,6 +532,19 @@ def _text_turn(message, flow, context, previous_pending, llm, knowledge, setting
                     else _profile_form_request(flow, context))
         if reply := _simple_social(message):
             return Turn("REPLY", [(reply, None)])
+        if flow.get("escalation", {}).get("stage") == "CHOICE" and _free_support_request(message):
+            saved = flow.get("escalation", {}).get("resume", {})
+            restored = copy.deepcopy(saved.get("flow", {key: value for key, value in flow.items() if key != "escalation"}))
+            try:
+                following = _support_turn(message, restored, context, llm, knowledge)
+            except KnowledgeUnavailable:
+                following = Turn("REPLY", [(UNAVAILABLE, None)], flow={
+                    "clarification_query": _problem_query(message, restored), "excluded": restored.get("excluded", []),
+                })
+            if following.action == "REPLY":
+                following.action, following.resume = "RESUME", {}
+                following.flow = following.flow if following.flow is not None else restored
+            return following
         # Everything else here is employee data for the pending letter. It must
         # not be classified as chat or used to search for another instruction.
         return _intake_turn(message, flow, llm, context)
@@ -462,8 +559,8 @@ def _text_turn(message, flow, context, previous_pending, llm, knowledge, setting
         return Turn("HUMAN")
     if reply := _simple_social(message):
         return Turn("REPLY", [(reply, None)])
-    if intent == "FEEDBACK":
-        if message.strip().casefold().rstrip(".!?") == "помогло":
+    if feedback := _feedback_kind(message, flow):
+        if feedback == "SUCCESS":
             return Turn("SUCCESS")
         if flow.get("source") and context.get("incident", {}).get("failed_attempts", 0) < MAX_ATTEMPTS - 1:
             search_flow = {"excluded": list(dict.fromkeys(flow.get("excluded", []) + [flow["source"]["file_id"]]))}
@@ -475,9 +572,9 @@ def _text_turn(message, flow, context, previous_pending, llm, knowledge, setting
                 following.action = "RETRY_GUIDE"
                 return following
         return Turn("FAILED")
-    if is_confirmation(message) and not flow:
+    if _step_confirmed(message) and not flow:
         return Turn("REPLY", [("Опишите, пожалуйста, с какой рабочей проблемой нужна помощь.", None)])
-    pinned = (flow.get("source") and (is_confirmation(message) or is_ui_question(message)
+    pinned = (flow.get("source") and (_step_confirmed(message) or _current_step_question(message)
                                       or _PHOTO_REQUEST.search(message) or _NEXT_PHOTO.search(message))) or (
         flow.get("clarification_query") and len(message.split()) <= 8
     )
@@ -498,10 +595,40 @@ def _text_turn(message, flow, context, previous_pending, llm, knowledge, setting
         return Turn("REPLY", [(UNAVAILABLE, None)], flow=problem_flow)
 
 
+def _report_failed_inbox(session, inbox, room, principal):
+    """A terminal generation failure gets one durable reply, never an endless room barrier."""
+    incident = session.scalar(select(Incident).where(Incident.id == room.incident_id).with_for_update())
+    conversation = session.get(Conversation, incident.conversation_id) if incident else None
+    if conversation is None or conversation.user_id != principal:
+        # Corrupt/obsolete ownership must not produce an external private reply.
+        session.add(AuditEvent(event="talk.turn_failure_reported", details={
+            "inbox_id": inbox.id, "error_code": "RoomScopeChanged", "reply_queued": False,
+        }))
+        return
+    processing = (room.flow or {}).get("_processing", {})
+    if processing.get("inbox_id") == inbox.id:
+        previous = processing.get("previous", {})
+        incident.pending_action, incident.result = previous.get("pending"), previous.get("result")
+        room.flow = {key: value for key, value in (room.flow or {}).items() if key != "_processing"}
+    append_message(session, incident.id, "user", inbox.content, "RECEIVED")
+    _deliver(session, incident, [(
+        "Не удалось обработать предыдущее сообщение из-за временной ошибки. "
+        "Текущий шаг сохранён. Напишите вопрос ещё раз или «оператор», чтобы оформить письмо в поддержку.", None,
+    )])
+    incident.version += 1
+    audit(session, incident.id, "talk.turn_failure_reported", inbox_id=inbox.id,
+          error_code=inbox.error_code, reply_queued=True)
+
+
 def _claim(factory, settings, account_id):
     with factory() as session, session.begin():
+        reported_failure = select(AuditEvent.id).where(
+            AuditEvent.event == "talk.turn_failure_reported",
+            AuditEvent.details["inbox_id"].as_string() == TalkInbox.id,
+        ).exists()
         statement = select(TalkInbox).join(TalkRoom).join(TalkAccount).where(
-            TalkInbox.status.in_(["PENDING", "RUNNING", "FAILED"]), TalkRoom.enabled.is_(True),
+            or_(TalkInbox.status.in_(["PENDING", "RUNNING"]),
+                (TalkInbox.status == "FAILED") & ~reported_failure), TalkRoom.enabled.is_(True),
             TalkAccount.enabled.is_(True),
             TalkAccount.server_url == settings.nextcloud_base_url.rstrip("/"),
         )
@@ -511,10 +638,12 @@ def _claim(factory, settings, account_id):
         queued = session.scalars(statement.order_by(
             TalkInbox.remote_sequence, TalkInbox.created_at, TalkInbox.id
         ).with_for_update(skip_locked=True)).all()
-        blocked = set()
+        # A failed turn has no live generation. RUNNING remains a barrier even
+        # if a later poll inserted an older remote sequence behind it.
+        blocked = {item.room_id for item in queued if item.status == "RUNNING"}
         inbox = None
         for item in queued:
-            if item.room_id not in blocked and item.status == "PENDING":
+            if item.room_id not in blocked and item.status in {"PENDING", "FAILED"}:
                 room = session.get(TalkRoom, item.room_id)
                 account = session.get(TalkAccount, room.account_id)
                 principal = str(uuid5(NAMESPACE_URL, account.server_url + "/" + account.username + "/"
@@ -538,6 +667,9 @@ def _claim(factory, settings, account_id):
             return {"ignored": True}
         principal = str(uuid5(NAMESPACE_URL, account.server_url + "/" + account.username + "/"
                               + room.room_token + "/" + room.employee_id))
+        if inbox.status == "FAILED":
+            _report_failed_inbox(session, inbox, room, principal)
+            return {"ignored": True}
         user = session.get(User, principal)
         if user is None:
             session.add(User(id=principal, external_id="talk-account:" + principal, display_name=room.employee_id[:255]))
@@ -661,26 +793,39 @@ def _finish(factory, turn, claimed, llm, settings):
                 incident.failed_attempts += 1
                 session.flush()
                 pending = None
-            file_id = turn.approved.document["source"]["file_id"]
-            same = bool(pending and pending.evidence.get("talk_source", {}).get("file_id") == file_id)
-            if not same and pending:
-                pending.status = "UNASSESSED"
-                session.flush()
+            source = turn.approved.document["source"]
+            existing = session.scalar(select(SolutionAttempt).where(
+                SolutionAttempt.incident_id == incident.id,
+                SolutionAttempt.solution_id == turn.approved.candidate.solution_id,
+            ))
+            same = bool(existing is not None and pending is not None and existing.id == pending.id)
             attempts = session.scalars(select(SolutionAttempt).where(SolutionAttempt.incident_id == incident.id)).all()
-            if not same and len(attempts) >= MAX_ATTEMPTS:
+            if existing and existing.evidence.get("talk_source") != source:
+                _deliver(session, incident, [(CHANGED, None)])
+            elif existing and existing.status not in {"UNASSESSED", "WAITING_FEEDBACK"}:
+                # A failed solution already owns its unique feedback record.
+                # Do not repeat it as a new attempt or silently reset the result.
+                room.flow = _offer_escalation(session, incident, "NO_MORE_SOLUTIONS", room.flow, claimed["context"])
+            elif existing is None and len(attempts) >= MAX_ATTEMPTS:
                 room.flow = _offer_escalation(session, incident, "ATTEMPTS_EXHAUSTED", turn.flow, claimed["context"])
             else:
+                if not same and pending:
+                    pending.status = "UNASSESSED"
+                    session.flush()  # Release uq_pending_attempt before reactivating another saved attempt.
                 save_snapshot(session, turn.approved.candidate)
-                first = _deliver(session, incident, turn.blocks, source=turn.approved.document["source"])
+                first = _deliver(session, incident, turn.blocks, source=source)
                 if not same:
-                    candidate = turn.approved.candidate
-                    session.add(SolutionAttempt(
-                        incident_id=incident.id, solution_id=candidate.solution_id, ordinal=len(attempts) + 1,
-                        message_id=first.id, evidence={"title": candidate.title, "version": candidate.version,
-                            "chunk_id": candidate.chunk_id, "content": candidate.content, "steps": candidate.steps,
-                            "source": candidate.source, "talk_source": turn.approved.document["source"]},
-                        retrieval_score=candidate.score, llm_backend=llm.name,
-                    ))
+                    if existing is not None:
+                        existing.status, existing.message_id = "WAITING_FEEDBACK", first.id
+                    else:
+                        candidate = turn.approved.candidate
+                        session.add(SolutionAttempt(
+                            incident_id=incident.id, solution_id=candidate.solution_id, ordinal=len(attempts) + 1,
+                            message_id=first.id, evidence={"title": candidate.title, "version": candidate.version,
+                                "chunk_id": candidate.chunk_id, "content": candidate.content, "steps": candidate.steps,
+                                "source": candidate.source, "talk_source": source},
+                            retrieval_score=candidate.score, llm_backend=llm.name,
+                        ))
                 incident.state, incident.pending_action, incident.result = "WAITING_FEEDBACK", None, "ANSWER"
                 incident.escalation_reason = None
                 if turn.analysis:
@@ -704,6 +849,8 @@ def _finish(factory, turn, claimed, llm, settings):
                     incident.state, incident.pending_action, incident.closed_at = "RESOLVED", None, now()
                     session.flush()
                     remember_resolution(session, incident, settings)
+                    remember_success(session, settings, claimed["principal"], incident.id,
+                                     (room.flow or {}).get("retrieval_key"), pending.evidence.get("talk_source"))
                     room.flow = {}
                     _deliver(session, incident, [("Спасибо за обратную связь. Рад, что удалось решить проблему.", None)])
                 else:
@@ -763,8 +910,35 @@ def _finish(factory, turn, claimed, llm, settings):
                     incident.description = problem[-8000:]
         incident.version += 1
         inbox.status, inbox.error_code = "DONE", None
-        audit(session, incident.id, "talk.turn_completed", route=turn.action, block_count=len(turn.blocks))
+        # The public completion event is emitted by process_one after commit.
+        # Recording it through audit() here previously logged a false success
+        # when a deferred UNIQUE constraint failed on transaction exit.
+        session.add(AuditEvent(incident_id=incident.id, event="talk.turn_completed",
+                               details={"route": turn.action, "block_count": len(turn.blocks)}))
         return True
+
+
+def _safe_database_error(error):
+    """Only known machine identifiers, never SQL, driver messages or bind values."""
+    if not isinstance(error, DBAPIError):
+        return {}
+    identifiers = {}
+    original = error.orig
+    sqlstate = getattr(original, "sqlstate", None) or getattr(original, "pgcode", None)
+    if isinstance(sqlstate, str) and re.fullmatch(r"[A-Z0-9]{5}", sqlstate):
+        identifiers["db_sqlstate"] = sqlstate
+    constraint = getattr(getattr(original, "diag", None), "constraint_name", None)
+    if constraint in {
+        "uq_pending_attempt", "uq_active_incident", "solution_attempts_incident_id_solution_id_key",
+        "solution_attempts_incident_id_ordinal_key", "feedback_attempt_id_key",
+        "messages_incident_id_sequence_key", "knowledge_documents_pkey", "knowledge_chunks_pkey", "solutions_pkey",
+        "talk_inbox_room_id_remote_message_id_key",
+    }:
+        identifiers["db_constraint"] = constraint
+    sqlite_code = getattr(original, "sqlite_errorname", None)
+    if isinstance(sqlite_code, str) and re.fullmatch(r"SQLITE_(?:CONSTRAINT|BUSY|LOCKED)(?:_[A-Z]+)?", sqlite_code):
+        identifiers["db_sqlite_code"] = sqlite_code
+    return identifiers
 
 
 def process_one(factory, settings, llm, knowledge=None, *, account_id=None):
@@ -777,27 +951,40 @@ def process_one(factory, settings, llm, knowledge=None, *, account_id=None):
         return True
     metadata = {"message_id": claimed["inbox_id"],
                 TIMING_MARKER: {"message_id": claimed["inbox_id"], "stages_ms": {}, "stage_calls": {}}}
-    timed_llm = _TimedProxy(llm, metadata, {"dialogue": "model_api", "analyze_context": "model_api",
-                                           "extract_escalation": "model_api"})
-    timed_knowledge = _TimedProxy(knowledge or TalkKnowledge(settings), metadata,
-                                  {"search": "search", "read": "read", "is_current": "verify"})
     try:
+        timed_llm = _TimedProxy(llm, metadata, {"dialogue": "model_api", "analyze_context": "model_api",
+                                               "extract_escalation": "model_api"})
+        def select_source(payload):
+            with _measure(metadata, "model_api"):
+                call = getattr(llm, "_call", None)
+                return call(SourceSelection, _SELECTION_TASK, payload) if callable(call) else {"file_id": None}
+
+        cached_knowledge = SuccessfulTalkKnowledge(
+            knowledge or TalkKnowledge(settings, selector=select_source), factory, settings,
+            claimed["principal"], claimed["context"],
+        )
+        timed_knowledge = _TimedProxy(cached_knowledge, metadata,
+                                      {"search": "search", "read": "read", "is_current": "verify"})
         with _measure(metadata, "route"):
             turn = _turn(claimed["message"], claimed["flow"], claimed["context"],
                          claimed["previous"]["pending"], timed_llm, timed_knowledge, settings,
                          inbound_media=claimed["media"])
+        metadata["cache_hit"] = cached_knowledge.cache_hit
         with _measure(metadata, "persist"):
             finished = _finish(factory, turn, claimed, llm, settings)
     except Exception as error:
         with factory() as session, session.begin():
-            inbox = session.get(TalkInbox, claimed["inbox_id"])
-            incident = session.get(Incident, claimed["incident_id"])
+            inbox = session.scalar(select(TalkInbox).where(TalkInbox.id == claimed["inbox_id"]).with_for_update())
+            room = session.scalar(select(TalkRoom).where(TalkRoom.id == claimed["room_id"]).with_for_update())
+            incident = session.scalar(select(Incident).where(Incident.id == claimed["incident_id"]).with_for_update())
             if (inbox.status == "RUNNING" and inbox.tries == claimed["tries"]
                     and incident.version == claimed["version"]):
                 inbox.status = "PENDING" if inbox.tries < 3 else "FAILED"
                 inbox.error_code = type(error).__name__
                 incident.pending_action = claimed["previous"]["pending"]
-                session.get(TalkRoom, claimed["room_id"]).flow = claimed["flow"]
+                incident.result = claimed["previous"]["result"]
+                room.flow = claimed["flow"]
+        event("talk.turn_error", error_code=type(error).__name__, **_safe_database_error(error))
         _report_timing(metadata, started, "FAILED", 0, type(error).__name__)
         return True
     _report_timing(metadata, started, turn.action if finished else "IGNORED", len(turn.blocks))

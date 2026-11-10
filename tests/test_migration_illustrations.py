@@ -9,8 +9,12 @@ from app.models import Base
 
 
 def test_illustration_migration_preserves_existing_messages(tmp_path):
-    previous = MetaData()
+    expected = MetaData()
     for table in Base.metadata.sorted_tables:
+        if table.name != "successful_retrievals":
+            table.to_metadata(expected)
+    previous = MetaData()
+    for table in expected.sorted_tables:
         if table.name != "message_attachments":
             table.to_metadata(previous)
     engine = create_engine(f"sqlite:///{tmp_path / 'images-migration.db'}")
@@ -25,5 +29,5 @@ def test_illustration_migration_preserves_existing_messages(tmp_path):
         with Operations.context(context):
             migration.upgrade()
         assert connection.scalar(text("SELECT display_name FROM users WHERE id='old'")) == "Existing employee"
-        assert compare_metadata(context, Base.metadata) == []
+        assert compare_metadata(context, expected) == []
     engine.dispose()

@@ -25,8 +25,10 @@ def _migration():
 def test_profile_progress_migration_preserves_existing_private_queue_and_roundtrips(tmp_path, status):
     expected = MetaData()
     for table in Base.metadata.sorted_tables:
-        if table.name != "device_collections":
+        if table.name not in {"device_collections", "successful_retrievals"}:
             table.to_metadata(expected)
+    expected.tables["talk_inbox"]._columns.remove(expected.tables["talk_inbox"].c.media)
+    expected.tables["incidents"]._columns.remove(expected.tables["incidents"].c.has_user_photos)
     previous = MetaData()
     for table in expected.sorted_tables:
         table.to_metadata(previous)

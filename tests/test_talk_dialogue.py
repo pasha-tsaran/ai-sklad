@@ -274,11 +274,11 @@ def test_pre_activation_history_is_ignored(talk):
         assert session.get(TalkInbox, inbox).status == "IGNORED"
 
 
-def test_failed_or_running_inbox_blocks_later_messages_in_that_room(talk):
+def test_running_inbox_blocks_later_messages_in_that_room(talk):
     first = talk.incoming(QUESTION)
     second = talk.incoming("Готово", 2)
     with talk.env.factory() as session, session.begin():
-        session.get(TalkInbox, first).status = "FAILED"
+        session.get(TalkInbox, first).status = "RUNNING"
     assert not talk.process()
     with talk.env.factory() as session:
         assert session.get(TalkInbox, second).status == "PENDING"
@@ -533,7 +533,8 @@ def test_per_turn_timing_reports_stages_without_query_or_identity(talk, monkeypa
     assert name == "talk.turn_completed" and timing["total_ms"] >= 0
     assert timing["stage_calls"].get("model_api", 0) == 0
     assert all(timing["timings_ms"][stage] >= 0 for stage in ("search", "verify", "route", "persist"))
-    assert set(timing) == {"total_ms", "route", "timings_ms", "stage_calls", "block_count", "error_code"}
+    assert set(timing) == {"total_ms", "route", "timings_ms", "stage_calls", "block_count", "error_code", "cache_hit"}
+    assert timing["cache_hit"] is False
     assert QUESTION not in str(timing) and "employee" not in str(timing) and DOC not in str(timing)
 
 

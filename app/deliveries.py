@@ -1,11 +1,12 @@
 """Operator-only local CLI. Inspect mail/Talk ambiguities before an explicit retry."""
 
 import argparse
+import re
 
 from sqlalchemy import select
 
 from app.db import session_factory
-from app.models import Delivery, Escalation, Job, Message, now
+from app.models import Delivery, Escalation, Job, Message, TalkInbox, now
 from app.services.chat.audit import audit
 
 
@@ -22,6 +23,14 @@ def main():
         if not args.id:
             for row in session.scalars(select(model).where(model.status.in_(["UNKNOWN", "FAILED"]))):
                 print(row.id, row.status)
+            if args.kind == "talk":
+                for row in session.scalars(select(TalkInbox).where(TalkInbox.status == "FAILED").order_by(
+                    TalkInbox.created_at, TalkInbox.id,
+                )):
+                    code = row.error_code
+                    if not isinstance(code, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,99}", code):
+                        code = "UnknownError"
+                    print("inbox", row.id, row.status, code)
             return
         row = session.scalar(select(model).where(model.id == args.id).with_for_update())
         if not row or row.status not in {"UNKNOWN", "FAILED"}:
