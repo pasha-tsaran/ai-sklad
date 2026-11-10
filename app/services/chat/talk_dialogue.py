@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from datetime import timezone
 from uuid import NAMESPACE_URL, uuid5
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import DBAPIError
 
 from app.core.logging import event
@@ -19,6 +19,10 @@ from app.schemas.contracts import AnalysisResult, DialogueResult, EscalationDeta
 from app.services.chat.audit import audit
 from app.services.chat.channel_profile import channel_profile, remember_computer
 from app.services.nextcloud.progress import start_progress
+from app.services.nextcloud.interruption import (
+    TERMINAL_DELIVERIES, has_unfinished_guide, is_resume_request, latest_paused, pause_due_to_input,
+    record_response, resume_response,
+)
 from app.services.chat.memory import load_context, remember_resolution
 from app.services.chat.messages import append_message
 from app.services.chat.policies import FORM_ACTION, MAX_ATTEMPTS, TERMINAL_STATES, direct_intent
@@ -64,6 +68,9 @@ CLARIFY_QUESTIONS = {
     "CONNECTION": "Как устройство подключено: кабелем USB к компьютеру, сетевым кабелем или по Wi-Fi?",
     "ERROR_TEXT": "Какой точный текст ошибки вы видите? Перепишите его, пожалуйста.",
     "SYMPTOMS": "Опишите, что именно не работает и что появляется на экране.",
+    "SCANNER_KIND": "Вы имеете в виду сканер штрихкодов или сканер документов? Если знаете модель, напишите её.",
+    "SCANNER_GOAL": "Что именно нужно настроить у сканера: работу в программе или отдельный параметр? Напишите желаемый результат своими словами.",
+    "SCANNER_SYMPTOMS": "Что происходит при сканировании: код не считывается, считывается неверно или не появляется в нужной программе?",
 }
 _PHOTO_REQUEST = re.compile(
     r"\b(?:покажи(?:те)?|повтори(?:те)?|пришли(?:те)?|отправь(?:те)?)\s+"
@@ -411,6 +418,11 @@ def _problem_query(message, flow):
     previous = flow.get("clarification_query")
     if re.match(r"\s*(?:как|почему|зачем|когда|кто|что\s+делать|другой\s+вопрос|другая\s+проблема)\b", message, re.I):
         return message[:6000]
+    if flow.get("clarification_keys") and any(key.startswith("SCANNER_") for key in flow["clarification_keys"]):
+        latest = normalized_query(message)
+        if (re.search(r"\b(?:принтер\w*|тсд|nextcloud|fortigate|forticlient|outlook|почт\w*)\b", latest)
+                and not re.search(r"\b(?:сканер\w*|штрих\w*|баркод\w*|шк)\b", latest)):
+            return message[:6000]
     if previous:
         previous = _without_previous_connection(previous, message)
     factual_answer = (flow.get("clarification_keys") and len(message) <= 2000
@@ -483,12 +495,137 @@ def _photo_blocks(approved, selected, has_more, clarification):
     return blocks
 
 
+def _scanner_inventory(knowledge):
+    try:
+        inventory = getattr(knowledge, "scanner_context", lambda: {})()
+    except Exception:
+        return []
+    if not isinstance(inventory, dict) or inventory.get("status") != "ok":
+        return []
+    sources = inventory.get("sources")
+    return sources[:30] if isinstance(sources, list) else []
+
+
+def _scanner_question(key, knowledge, sources=None):
+    """Enrich questions only with the current approved originals' inventory."""
+    question = CLARIFY_QUESTIONS[key]
+    sources = _scanner_inventory(knowledge) if sources is None else sources
+
+    def names(field, kind=None):
+        result = []
+        for source in sources[:30]:
+            if not isinstance(source, dict):
+                continue
+            categories = source.get("categories", [])
+            if kind and (not isinstance(categories, list) or kind not in categories):
+                continue
+            values = source.get(field, [])
+            if not isinstance(values, list):
+                continue
+            for value in values[:20]:
+                if (isinstance(value, str) and 2 <= len(value) <= 80
+                        and re.fullmatch(r"[A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9 ._/-]*", value)
+                        and value not in result):
+                    result.append(value)
+        return result[:3]
+
+    if key == "SCANNER_KIND" and (models := names("models", "barcode")):
+        return ("Вы имеете в виду сканер штрихкодов (в инструкциях: " + ", ".join(models)
+                + ") или сканер документов? Если ваша модель другая, напишите её.")
+    if key == "SCANNER_GOAL" and (applications := names("applications", "barcode")):
+        return ("Что именно нужно настроить: работу сканера в программе ("
+                + ", ".join(applications) + ") или отдельный параметр самого сканера? "
+                "Напишите желаемый результат своими словами.")
+    return question
+
+
+def _scanner_model_kind(text, sources):
+    for source in sources:
+        if not isinstance(source, dict) or not isinstance(source.get("models"), list):
+            continue
+        for model in source["models"][:20]:
+            if not isinstance(model, str) or not 2 <= len(model) <= 80:
+                continue
+            normalized = normalized_query(model)
+            # A short code must be an entire token, never a substring of a
+            # different model or a document reference.
+            identifiers = [normalized] + [word for word in normalized.split()
+                                          if re.search(r"[a-zа-я]", word) and re.search(r"\d", word)]
+            if any(value and re.search(r"(?<!\w)" + re.escape(value) + r"(?!\w)", text) for value in identifiers):
+                kinds = source.get("categories", [])
+                if isinstance(kinds, list) and len(kinds) == 1 and kinds[0] in {"barcode", "document"}:
+                    return kinds[0]
+    return None
+
+
+def _scanner_clarification(message, flow, knowledge):
+    """A related file is not proof that the employee wants its entire procedure.
+
+    Ask one decision at a time before retrieval can pin a generic scanner report
+    to a program-specific guide. Device names never come from model knowledge.
+    """
+    latest = normalized_query(message)
+    problem = _problem_query(message, flow)
+    correction = bool(re.search(r"\b(?:уже|давно)\s+подключ\w*\b", latest)
+                      and re.search(r"\b(?:настро\w*|настрой\w*)\b", latest))
+    if (correction and not re.search(r"\b(?:сканер\w*|штрих\w*|баркод\w*|шк)\b", latest)
+            and not re.search(r"\b(?:принтер\w*|тсд|nextcloud|fortigate|forticlient)\b", latest)):
+        prior = normalized_query(flow.get("query", ""))
+        if re.search(r"\b(?:сканер\w*|штрих\w*|баркод\w*|шк)\b", prior):
+            device = "Сканер штрихкодов" if re.search(r"\b(?:штрих\w*|баркод\w*|шк)\b", prior) else "Сканер"
+            problem = device + "\n" + message
+    text = normalized_query(problem)
+    scanner = bool(re.search(r"\b(?:сканер\w*|штрих\w*|баркод\w*|шк)\b", text))
+    if not scanner:
+        return None
+    barcode = bool(re.search(r"\b(?:штрих\w*|баркод\w*|шк)\b", text))
+    document = bool(re.search(r"\b(?:документ\w*|мфу|планшетн\w*)\b", text))
+    program = bool(re.search(r"\b(?:1[сc]|адрес)\b", text))
+    concrete = bool(re.search(
+        r"\b(?:громк\w*|звук\w*|звуков\w*|сигнал\w*|суффикс\w*|префикс\w*|"
+        r"раскладк\w*|кодировк\w*|enter|перенос\w*|красн\w*|мига\w*|морга\w*|"
+        r"не\s+(?:читает|считывает|сканирует|передает|появляется)|неверн\w*|ошибк\w*)\b", text,
+    ))
+    inventory = None
+    if not barcode and not document and not program:
+        inventory = _scanner_inventory(knowledge)
+        kind = _scanner_model_kind(text, inventory)
+        barcode, document = kind == "barcode", kind == "document"
+    # A correction is about a different desired result, even if the old source
+    # happened to be a guide to adding the scanner in 1C.
+    if correction and not re.search(
+        r"\b(?:1[сc]|адрес|громк\w*|звук\w*|суффикс\w*|префикс\w*|раскладк\w*|кодировк\w*)\b", latest,
+    ):
+        key = "SCANNER_GOAL"
+    elif not barcode and not document and not program:
+        key = "SCANNER_KIND"
+    elif barcode and not program and not concrete:
+        key = "SCANNER_GOAL" if re.search(r"\b(?:настро\w*|настрой\w*)\b", text) else "SCANNER_SYMPTOMS"
+    else:
+        return None
+    asked = list(flow.get("clarification_keys", []))
+    if key in asked:
+        # Repeating an uninformative reply does not authorize an arbitrary
+        # source, and must not cause the same broad question to loop forever.
+        question = "Коротко опишите, что хотите изменить или что происходит при работе со сканером. Можно привести пример."
+    else:
+        question = _scanner_question(key, knowledge, sources=inventory)
+        asked.append(key)
+    return Turn("REPLY", [(question, None)], flow={
+        "clarification_query": problem, "clarification_keys": asked,
+        "excluded": flow.get("excluded", []),
+    })
+
+
 def _support_turn(message, flow, context, llm, knowledge):
     has_guide = bool(flow.get("source"))
     photo_request = bool(_PHOTO_REQUEST.search(message) or _NEXT_PHOTO.search(message))
     next_photo = bool(photo_request and _NEXT_PHOTO.search(message))
     clarification = bool(has_guide and (_current_step_question(message) or photo_request and not next_photo))
     continuation = bool(has_guide and (_step_confirmed(message) or next_photo))
+    if not clarification and not continuation:
+        if followup := _scanner_clarification(message, flow, knowledge):
+            return followup
     if continuation and not flow.get("has_more"):
         return Turn("REPLY", [("Удалось решить проблему? Напишите «Помогло» или «Не помогло».", None)])
     analysis = None
@@ -718,12 +855,13 @@ def _claim(factory, settings, account_id):
         inbox = None
         for item in queued:
             if item.room_id not in blocked and item.status in {"PENDING", "FAILED"}:
-                room = session.get(TalkRoom, item.room_id)
+                room = session.scalar(select(TalkRoom).where(TalkRoom.id == item.room_id).with_for_update())
                 account = session.get(TalkAccount, room.account_id)
                 principal = str(uuid5(NAMESPACE_URL, account.server_url + "/" + account.username + "/"
                                       + room.room_token + "/" + room.employee_id))
+                pause_due_to_input(session, room, item)
                 uncertain = session.scalar(select(Delivery.id).join(Message).join(Incident).join(Conversation).where(
-                    Delivery.room_token == room.room_token, Delivery.status != "SENT",
+                    Delivery.room_token == room.room_token, Delivery.status.not_in(TERMINAL_DELIVERIES),
                     Conversation.user_id == principal,
                 ).limit(1))
                 if uncertain is None:
@@ -854,13 +992,20 @@ def _finish(factory, turn, claimed, llm, settings):
         incident.pending_action = claimed["previous"]["pending"]
         incident.result = claimed["previous"]["result"]
         room.flow = claimed["flow"]
+        first_sequence = session.scalar(select(func.coalesce(func.max(Message.sequence), 0)).where(
+            Message.incident_id == incident.id,
+        ))
         append_message(session, incident.id, "user", claimed["message"], "RECEIVED")
         if turn.confirmed_computer:
             remember_computer(room, incident.id, turn.confirmed_computer)
         if turn.media_notice:
             _deliver(session, incident, [(turn.media_notice, None)])
         pending = _attempt(session, incident)
-        if turn.action in {"GUIDE", "RETRY_GUIDE"}:
+        if turn.action == "DELIVERY_RESUME":
+            if not resume_response(session, room, incident, inbox, turn.resume or {}):
+                _deliver(session, incident, [("Предыдущий ответ уже завершён или его нельзя безопасно продолжить. "
+                                                "Напишите, с чем нужна помощь.", None)])
+        elif turn.action in {"GUIDE", "RETRY_GUIDE"}:
             if turn.action == "RETRY_GUIDE" and pending:
                 pending.status = "FAILED"
                 session.add(Feedback(attempt_id=pending.id, helped=False, comment=""))
@@ -923,8 +1068,9 @@ def _finish(factory, turn, claimed, llm, settings):
                     incident.state, incident.pending_action, incident.closed_at = "RESOLVED", None, now()
                     session.flush()
                     remember_resolution(session, incident, settings)
-                    remember_success(session, settings, claimed["principal"], incident.id,
-                                     (room.flow or {}).get("retrieval_key"), pending.evidence.get("talk_source"))
+                    if not has_unfinished_guide(session, room, pending):
+                        remember_success(session, settings, claimed["principal"], incident.id,
+                                         (room.flow or {}).get("retrieval_key"), pending.evidence.get("talk_source"))
                     room.flow = {}
                     _deliver(session, incident, [("Спасибо за обратную связь. Рад, что удалось решить проблему.", None)])
                 else:
@@ -984,6 +1130,9 @@ def _finish(factory, turn, claimed, llm, settings):
                     incident.description = problem[-8000:]
         incident.version += 1
         inbox.status, inbox.error_code = "DONE", None
+        if turn.action != "DELIVERY_RESUME":
+            record_response(session, room, incident, inbox, first_sequence)
+        pause_due_to_input(session, room)
         # The public completion event is emitted by process_one after commit.
         # Recording it through audit() here previously logged a false success
         # when a deferred UNIQUE constraint failed on transaction exit.
@@ -1040,9 +1189,21 @@ def process_one(factory, settings, llm, knowledge=None, *, account_id=None):
         timed_knowledge = _TimedProxy(cached_knowledge, metadata,
                                       {"search": "search", "read": "read", "is_current": "verify"})
         with _measure(metadata, "route"):
-            turn = _turn(claimed["message"], claimed["flow"], claimed["context"],
-                         claimed["previous"]["pending"], timed_llm, timed_knowledge, settings,
-                         inbound_media=claimed["media"])
+            paused = None
+            if is_resume_request(claimed["message"]) and not claimed["media"]:
+                with factory() as session:
+                    room = session.get(TalkRoom, claimed["room_id"])
+                    paused = latest_paused(session, room)
+            if paused is not None:
+                source = paused.get("flow", {}).get("source")
+                if source and not timed_knowledge.is_current(source):
+                    turn = Turn("REPLY", [(CHANGED, None)])
+                else:
+                    turn = Turn("DELIVERY_RESUME", resume=paused)
+            else:
+                turn = _turn(claimed["message"], claimed["flow"], claimed["context"],
+                             claimed["previous"]["pending"], timed_llm, timed_knowledge, settings,
+                             inbound_media=claimed["media"])
         metadata["cache_hit"] = cached_knowledge.cache_hit
         with _measure(metadata, "persist"):
             finished = _finish(factory, turn, claimed, llm, settings)

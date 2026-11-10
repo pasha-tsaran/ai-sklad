@@ -8,6 +8,7 @@ not changed, and cursor advancement commits atomically with durable inbox rows.
 """
 
 from datetime import datetime, timezone
+import time
 
 from sqlalchemy import select
 
@@ -61,6 +62,87 @@ def _room_error(factory, room_id, exc):
                 "room_not_private", "room_employee_changed", "room_not_allowed", "access_denied"
             } else "UNAVAILABLE"
             room.error_code = exc.code if isinstance(exc, AccountError) else type(exc).__name__[:100]
+
+
+def _queue_room_page(factory, settings, client, *, token, cursor, room_id, employee, service,
+                     activated, observed_profile=None):
+    """Persist one validated read page atomically; also used before output blocks."""
+    page = client.messages(token, cursor, limit=settings.nextcloud_batch_size)
+    messages, next_cursor = page["messages"], sequence(page["cursor"], allow_zero=True)
+    if not isinstance(messages, list) or len(messages) > settings.nextcloud_batch_size or next_cursor < cursor:
+        raise AccountError("invalid_message_page")
+    previous = cursor
+    for message in messages:
+        if not isinstance(message, dict) or message.get("token") != token:
+            raise AccountError("invalid_message_page")
+        value = sequence(message.get("id"))
+        if value <= previous or value > next_cursor:
+            raise AccountError("unordered_message_page")
+        stamp = message.get("timestamp")
+        if type(stamp) is not int or not 0 <= stamp <= 253_402_300_799:
+            raise AccountError("invalid_message_timestamp")
+        previous = value
+    page_accepted = 0
+    with factory() as session, session.begin():
+        room = session.scalar(select(TalkRoom).where(TalkRoom.id == room_id).with_for_update())
+        if room.cursor != cursor or room.employee_id != employee:
+            return 0, False  # A concurrent poll committed these messages first.
+        if observed_profile and any(_text(message, employee, service, activated) is not None for message in messages):
+            update_nextcloud_profile(room, observed_profile)
+        for message in messages:
+            remote_sequence = sequence(message["id"])
+            payload = _payload(message, employee, service, activated)
+            content, media = payload if payload is not None else (None, {})
+            # Ignore old/unsupported content without retaining old private transcripts.
+            sender = message.get("actorId")
+            sender = sender if isinstance(sender, str) and len(sender) <= 255 else ""
+            if session.scalar(select(TalkInbox.id).where(
+                TalkInbox.room_id == room_id, TalkInbox.remote_message_id == str(remote_sequence),
+            )) is not None:
+                continue
+            session.add(TalkInbox(
+                room_id=room_id, remote_message_id=str(remote_sequence),
+                remote_sequence=remote_sequence, sender_id=sender, content=content or "",
+                media=media,
+                occurred_at=datetime.fromtimestamp(message["timestamp"], timezone.utc),
+                status="PENDING" if content is not None else "IGNORED",
+            ))
+            page_accepted += content is not None
+        room.cursor, room.enabled, room.status, room.error_code = next_cursor, True, "ACTIVE", None
+    return page_accepted, len(messages) < settings.nextcloud_batch_size
+
+
+def refresh_room(factory, settings, client, account_id, token):
+    """Read one room immediately before output; never changes its read marker.
+
+    A failed read must not be mistaken for permission to continue old output.
+    All HTTP reads finish before the output-claim transaction starts.
+    """
+    with factory() as session:
+        binding = session.execute(select(TalkRoom, TalkAccount).join(TalkAccount).where(
+            TalkRoom.account_id == account_id, TalkRoom.room_token == token,
+            TalkRoom.enabled.is_(True), TalkAccount.enabled.is_(True),
+            TalkAccount.server_url == settings.nextcloud_base_url.rstrip("/"),
+        )).first()
+        if binding is None:
+            return False
+        room, account = binding
+        room_id, cursor, employee = room.id, room.cursor, room.employee_id
+        service, activated = account.username, account.activated_at
+    with factory() as session, session.begin():
+        room = session.scalar(select(TalkRoom).where(TalkRoom.id == room_id).with_for_update())
+        room.profile = {**(room.profile or {}), "_output_checked_at": time.time()}
+    try:
+        checked = client.validate_room(token, expected_employee=employee)
+        if (checked.get("type") != 1 or checked.get("service_id") != service
+                or checked.get("employee_id") != employee or checked.get("token") != token):
+            raise AccountError("room_not_private")
+        _, caught_up = _queue_room_page(factory, settings, client, token=token, cursor=cursor, room_id=room_id,
+                                        employee=employee, service=service, activated=activated)
+    except Exception as exc:
+        _room_error(factory, room_id, exc)
+        return False
+    return caught_up
 
 
 def poll_once(factory, settings, client=None):
@@ -149,48 +231,10 @@ def poll_once(factory, settings, client=None):
                 existing = (room.id, room.employee_id, room.cursor, room.status)
         room_id, employee, cursor, _ = existing
         try:
-            page = client.messages(token, cursor, limit=settings.nextcloud_batch_size)
-            messages, next_cursor = page["messages"], sequence(page["cursor"], allow_zero=True)
-            if not isinstance(messages, list) or len(messages) > settings.nextcloud_batch_size or next_cursor < cursor:
-                raise AccountError("invalid_message_page")
-            previous = cursor
-            for message in messages:
-                if not isinstance(message, dict) or message.get("token") != token:
-                    raise AccountError("invalid_message_page")
-                value = sequence(message.get("id"))
-                if value <= previous or value > next_cursor:
-                    raise AccountError("unordered_message_page")
-                stamp = message.get("timestamp")
-                if type(stamp) is not int or not 0 <= stamp <= 253_402_300_799:
-                    raise AccountError("invalid_message_timestamp")
-                previous = value
-            page_accepted = 0
-            with factory() as session, session.begin():
-                room = session.scalar(select(TalkRoom).where(TalkRoom.id == room_id).with_for_update())
-                if room.cursor != cursor or room.employee_id != employee:
-                    continue  # Another poll committed first; never advance over unseen messages.
-                if observed_profile and any(_text(message, employee, service, activated) is not None for message in messages):
-                    update_nextcloud_profile(room, observed_profile)
-                for message in messages:
-                    remote_sequence = sequence(message["id"])
-                    payload = _payload(message, employee, service, activated)
-                    content, media = payload if payload is not None else (None, {})
-                    # Ignore old/unsupported content without retaining old private transcripts.
-                    sender = message.get("actorId")
-                    sender = sender if isinstance(sender, str) and len(sender) <= 255 else ""
-                    if session.scalar(select(TalkInbox.id).where(
-                        TalkInbox.room_id == room_id, TalkInbox.remote_message_id == str(remote_sequence),
-                    )) is not None:
-                        continue
-                    session.add(TalkInbox(
-                        room_id=room_id, remote_message_id=str(remote_sequence),
-                        remote_sequence=remote_sequence, sender_id=sender, content=content or "",
-                        media=media,
-                        occurred_at=datetime.fromtimestamp(message["timestamp"], timezone.utc),
-                        status="PENDING" if content is not None else "IGNORED",
-                    ))
-                    page_accepted += content is not None
-                room.cursor, room.enabled, room.status, room.error_code = next_cursor, True, "ACTIVE", None
+            page_accepted, _ = _queue_room_page(
+                factory, settings, client, token=token, cursor=cursor, room_id=room_id,
+                employee=employee, service=service, activated=activated, observed_profile=observed_profile,
+            )
             accepted += page_accepted
         except Exception as exc:
             _room_error(factory, room_id, exc)

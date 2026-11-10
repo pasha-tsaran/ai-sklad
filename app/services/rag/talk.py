@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.core.logging import event
 from app.services.rag.documents import Illustration, read_xlsx
+from app.services.rag.equipment import scanner_facts, scanner_filename
 from app.services.rag.interface import Candidate
 from app.services.rag.knowledge_files import KnowledgeFilesError, list_knowledge_files
 from app.services.rag.query import choose_source, retrieval_query, source_compatible
@@ -206,6 +207,21 @@ class TalkKnowledge:
             failure = KnowledgeUnavailable(type(error).__name__, "read")
             report_failure(failure)
             raise failure from None
+
+    def scanner_context(self):
+        """Bounded original-backed hints from this bot's approved collection only."""
+        with knowledge_stage("equipment_context"), self._client() as client:
+            files = self._files(client)
+            selected = [key for key, item in files.items() if scanner_filename(item["filename"])][:8]
+            sources = [scanner_facts(self._read(client, key, files)) for key in selected]
+            # Recheck the whole catalogue after reading, not merely each earlier file.
+            current = self._files(client)
+            sources = [source for source in sources if source["file_id"] in current
+                       and current[source["file_id"]]["knowledge_id"] == source["knowledge_id"]
+                       and current[source["file_id"]]["filename"] == source["filename"]]
+            return {"status": "ok", "sources": sources,
+                    "categories": sorted({kind for source in sources for kind in source["categories"]}),
+                    "models": list(dict.fromkeys(model for source in sources for model in source["models"]))[:6]}
 
     def search(self, query, excluded=(), fallback_query=None):
         """Use the native scoped search, never an autonomous model/tool selection."""

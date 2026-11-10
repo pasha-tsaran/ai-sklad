@@ -82,13 +82,20 @@ def test_technical_topic_switch_recovers_a_legacy_form_without_reusing_letter_da
     talk.incoming(question, 2)
     assert talk.process(knowledge, model)
     state = no_letter(talk)
-    assert state["incident"].pending_action is None and state["incident"].state == "WAITING_FEEDBACK"
-    assert len(knowledge.searches) > searches and "escalation" not in state["flow"]
+    assert state["incident"].pending_action is None and "escalation" not in state["flow"]
     queries = " ".join(query for query, _, _ in knowledge.searches[searches:])
-    assert question in queries and "PRIVATE-" not in queries and "private-login" not in queries
-    assert sum(bool(picture) for _, picture in assistants(state)) == 6
     if "сканер" in question:
+        # Escaping a letter is not consent to pick an arbitrary scanner guide.
+        # The new broad request needs a device/goal clarification first.
+        assert state["incident"].state == "DIAGNOSING" and state["flow"]["clarification_keys"]
+        assert len(knowledge.searches) == searches and not state["attempts"]
+        assert not any(picture for _, picture in assistants(state))
+        queries += state["flow"]["clarification_query"]
         assert "принтер" not in queries.casefold() and "тсд" not in queries.casefold()
+    else:
+        assert state["incident"].state == "WAITING_FEEDBACK" and len(knowledge.searches) > searches
+        assert sum(bool(picture) for _, picture in assistants(state)) == 6
+    assert question in queries and "PRIVATE-" not in queries and "private-login" not in queries
 
 
 def test_explicit_letter_still_accepts_question_shaped_subject_and_description_verbatim(talk):

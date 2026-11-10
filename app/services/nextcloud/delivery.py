@@ -10,6 +10,7 @@ from sqlalchemy.orm import aliased
 
 from app.models import Conversation, Delivery, Incident, Message, MessageAttachment, TalkAccount, TalkRoom
 from app.services.chat.messages import append_message
+from app.services.nextcloud.interruption import TERMINAL_DELIVERIES, pause_due_to_input
 
 
 def split_text(content, limit=32_000):
@@ -180,6 +181,7 @@ def deliver_one(factory, settings, client=None):
     if settings.nextcloud_backend not in {"talk", "account"}:
         return False
     current_account_id = None
+    refreshed_room = None
     if settings.nextcloud_backend == "account":
         from app.services.nextcloud.account import AccountClient
 
@@ -192,20 +194,62 @@ def deliver_one(factory, settings, client=None):
             ))
         if current_account_id is None:
             return False
+        if callable(getattr(client, "messages", None)):
+            # Refresh just the next actionable room, outside the claim's DB
+            # transaction. This catches a user correction even before the
+            # independent background poll's next scheduled cycle.
+            with factory() as session:
+                candidates = session.scalars(select(Delivery).join(Message).where(
+                    Delivery.account_id == current_account_id,
+                    Delivery.status.not_in(TERMINAL_DELIVERIES),
+                ).order_by(Message.created_at, Message.incident_id, Message.sequence)).all()
+                blocked = set()
+                ready = []
+                for candidate in candidates:
+                    if candidate.room_token not in blocked and candidate.status == "PENDING":
+                        bound = session.scalar(select(TalkRoom).where(
+                            TalkRoom.account_id == current_account_id, TalkRoom.room_token == candidate.room_token,
+                            TalkRoom.enabled.is_(True),
+                        ))
+                        if bound is not None:
+                            checked_at = (bound.profile or {}).get("_output_checked_at", 0)
+                            ready.append((checked_at if type(checked_at) in {int, float} else 0, candidate.room_token))
+                    blocked.add(candidate.room_token)
+                if ready:
+                    # A long read backlog or slow room cannot monopolize the
+                    # sender while other employees have actionable replies.
+                    refreshed_room = min(ready, key=lambda entry: entry[0])[1]
+            if refreshed_room is None:
+                return False
+            from app.services.nextcloud.poller import refresh_room
+
+            if not refresh_room(factory, settings, client, current_account_id, refreshed_room):
+                return False
     with factory() as session, session.begin():
         # An ambiguous/failed delivery blocks later messages in that room, not other rooms.
         query = (select(Delivery)
             .join(Message, Delivery.message_id == Message.id)
-            .where(Delivery.status != "SENT")
+            .where(Delivery.status.not_in(TERMINAL_DELIVERIES))
             .order_by(Message.created_at, Message.incident_id, Message.sequence))
         if current_account_id:
             query = query.where(Delivery.account_id == current_account_id)
+            if refreshed_room is not None:
+                query = query.where(Delivery.room_token == refreshed_room)
         else:
             query = query.where(Delivery.account_id.is_(None))
         rows = session.scalars(query).all()
         blocked = set()
         delivery = None
         for row in rows:
+            if current_account_id and row.status == "PENDING":
+                bound_room = session.scalar(select(TalkRoom).where(
+                    TalkRoom.account_id == current_account_id, TalkRoom.room_token == row.room_token,
+                    TalkRoom.enabled.is_(True),
+                ).with_for_update())
+                if bound_room is not None:
+                    pause_due_to_input(session, bound_room)
+            if row.status in TERMINAL_DELIVERIES:
+                continue
             if row.room_token not in blocked and row.status == "PENDING":
                 delivery = row
                 break

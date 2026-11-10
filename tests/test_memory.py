@@ -66,6 +66,26 @@ def message_for(session, incident, sequence, content, role="user"):
     return message
 
 
+def test_unsent_paused_or_cancelled_answers_are_not_presented_as_seen_history(env):
+    with env.factory() as session, session.begin():
+        incident = incident_for(session)
+        message_for(session, incident, 1, "Настройка сканера")
+        seen = message_for(session, incident, 2, "Уже полученный шаг", "assistant")
+        seen.delivery_status = "DELIVERED_TALK"
+        paused = message_for(session, incident, 3, "Ещё не показанная инструкция", "assistant")
+        paused.delivery_status = "PAUSED"
+        cancelled = message_for(session, incident, 4, "Отменённый черновик", "assistant")
+        cancelled.delivery_status = "CANCELLED"
+        message_for(session, incident, 5, "Он уже подключён")
+        current = load_context(session, incident, settings())
+        history = current["short_term"]["messages"]
+        assert [row["sequence"] for row in history] == [1, 2, 5]
+        assert "Ещё не показанная" not in json.dumps(current, ensure_ascii=False)
+        assert "Отменённый черновик" not in json.dumps(current, ensure_ascii=False)
+        # Keep the authoritative transcript and delivery snapshots for resumption/audit.
+        assert session.scalar(select(func.count()).select_from(Message).where(Message.incident_id == incident.id)) == 5
+
+
 def test_device_collection_capabilities_are_redacted_from_recent_and_compacted_model_context(env):
     token = "D" * 43
     https = "https://support.example/device/collect#token=" + token

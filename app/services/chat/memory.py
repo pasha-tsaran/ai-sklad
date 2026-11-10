@@ -9,7 +9,7 @@ import json
 import re
 from datetime import timedelta, timezone
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, or_, select
 
 from app.models import (
     Conversation,
@@ -197,7 +197,8 @@ def load_context(session, incident, settings):
     max_chars = settings.memory_max_chars
     recent = list(reversed(session.scalars(
         select(Message)
-        .where(Message.incident_id == incident.id)
+        .where(Message.incident_id == incident.id,
+               or_(Message.role != "assistant", Message.delivery_status.not_in(("PAUSED", "CANCELLED"))))
         .order_by(Message.sequence.desc())
         .limit(settings.memory_max_messages)
     ).all()))

@@ -18,7 +18,7 @@ def test_revisiting_unassessed_approved_guide_reuses_attempt_instead_of_duplicat
     talk.process(knowledge)
     first_attempt = talk.snapshot()["attempts"][0]
     knowledge.documents = [approved(1, OTHER)]
-    talk.incoming("Теперь нужен другой сканер штрихкодов", 2)
+    talk.incoming(QUESTION + " Настройка на другом рабочем месте.", 2)
     talk.process(knowledge)
     knowledge.documents = [approved(1, DOC)]
     last = talk.incoming(QUESTION, 3)
@@ -118,7 +118,7 @@ def test_changed_historical_guide_never_reactivates_old_attempt_or_posts_new_byt
     talk.incoming(QUESTION)
     talk.process(knowledge)
     knowledge.documents = [approved(1, OTHER)]
-    talk.incoming("Настроить другой сканер штрихкодов", 2)
+    talk.incoming(QUESTION + " Настройка на другом рабочем месте.", 2)
     talk.process(knowledge)
     before = talk.snapshot()
     changed = approved(1, DOC)
@@ -135,17 +135,18 @@ def test_changed_historical_guide_never_reactivates_old_attempt_or_posts_new_byt
         assert session.get(TalkInbox, last).status == "DONE"
 
 
-def test_two_rapid_messages_keep_entire_first_photo_batch_ahead_of_second_reply(talk):
+def test_two_rapid_messages_pause_first_photo_batch_before_second_reply(talk):
     first = talk.incoming(QUESTION, 1, previous_delivered=False)
     second = talk.incoming("Привет", 2, previous_delivered=False)
     assert talk.process(Knowledge([approved(8)]))
     before = talk.snapshot()
-    assert not talk.process()
+    assert talk.process()
     with talk.env.factory() as session:
         assert session.get(TalkInbox, first).status == "DONE"
-        assert session.get(TalkInbox, second).status == "PENDING"
+        assert session.get(TalkInbox, second).status == "DONE"
         deliveries = session.scalars(select(Delivery).join(Message).order_by(Message.sequence)).all()
-        assert len(deliveries) > 6 and all(row.status == "PENDING" for row in deliveries)
+        assert len(deliveries) > 6 and all(row.status == "PAUSED" for row in deliveries[:-1])
+        assert deliveries[-1].status == "PENDING"
     talk.incoming("Спасибо", 3)
     assert talk.process()
     after = talk.snapshot()
@@ -153,10 +154,17 @@ def test_two_rapid_messages_keep_entire_first_photo_batch_ahead_of_second_reply(
     def wire(blocks):
         return [(text, (picture.id, picture.sha256, picture.data) if picture else None) for text, picture in blocks]
 
-    assert wire(assistants(after)[:-1]) == wire(assistants(before))
+    assert wire(assistants(after)[:len(assistants(before))]) == wire(assistants(before))
+    assert [text for text, _ in assistants(after)[len(assistants(before)):]] == [
+        "Здравствуйте! Я помощник технической поддержки. Чем могу помочь?",
+        "Пожалуйста! Если нужна помощь, напишите.",
+    ]
     assert len(after["attempts"]) == 1
     with talk.env.factory() as session:
         assert session.get(TalkInbox, second).status == "DONE"
+        deliveries = session.scalars(select(Delivery).join(Message).order_by(Message.sequence)).all()
+        assert all(row.status == "PAUSED" for row in deliveries[:-2])
+        assert [row.status for row in deliveries[-2:]] == ["SENT", "PENDING"]
 
 
 def test_failed_room_with_pending_notice_cannot_starve_another_private_room(talk, monkeypatch):

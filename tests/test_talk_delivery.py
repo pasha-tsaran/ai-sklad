@@ -203,7 +203,10 @@ def test_ambiguous_write_blocks_later_text_and_photos_only_for_its_room(factory)
     assert sender.writes[0][1:3] == ("roomtwo", "Другой сотрудник")
     assert not deliver_one(factory, settings(), sender)
     rows = state(factory)
-    assert [delivery.status for delivery, _ in rows] == ["UNKNOWN", "PENDING", "PENDING", "SENT"]
+    # Different rooms can have the same clock tick. Only the per-room order
+    # is contractual; sorting both rooms by their local sequence is ambiguous.
+    assert [delivery.status for delivery, _ in rows if delivery.room_token == ROOM] == ["UNKNOWN", "PENDING", "PENDING"]
+    assert [delivery.status for delivery, _ in rows if delivery.room_token == "roomtwo"] == ["SENT"]
     assert len(failing.writes) == len(sender.writes) == 1
 
 

@@ -149,5 +149,9 @@ class SuccessfulTalkKnowledge:
     def read(self, file_id):
         return self.delegate.read(file_id)
 
+    def scanner_context(self):
+        method = getattr(self.delegate, "scanner_context", None)
+        return method() if callable(method) else {"status": "ok", "sources": [], "categories": [], "models": []}
+
     def is_current(self, source):
         return self.delegate.is_current(source)

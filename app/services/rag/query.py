@@ -125,6 +125,18 @@ def _identifiers(value):
     return models, versions
 
 
+def scanner_kinds(value):
+    """Distinguish a document scanner from a barcode reader using explicit evidence."""
+    text = normalized_query(value)
+    kinds = set()
+    if re.search(r"\b(?:штрих\w*|баркод\w*|barcode|шк)\b", text):
+        kinds.add("barcode")
+    if re.search(r"\b(?:сканер\w*|сканирован\w*)\s+(?:(?:бумажн\w*|обычн\w*)\s+)?"
+                 r"(?:документ\w*|бумаг\w*|лист\w*)\b", text):
+        kinds.add("document")
+    return kinds
+
+
 def _task_covered(problem, text):
     """Require the named task/feature, not just generic equipment overlap.
 
@@ -169,6 +181,10 @@ def source_compatible(problem, text, *, complete=False):
     """
     wanted, supplied = _connections(problem), _connections(text)
     if wanted and (supplied and not wanted.issubset(supplied) or complete and not wanted.issubset(supplied)):
+        return False
+    wanted_scanners, supplied_scanners = scanner_kinds(problem), scanner_kinds(text)
+    if wanted_scanners and (supplied_scanners and not wanted_scanners.issubset(supplied_scanners)
+                            or complete and not wanted_scanners.issubset(supplied_scanners)):
         return False
     required = _terms(problem) & {"принт", "скане", "тсд"}
     available = _terms(text)

@@ -457,15 +457,16 @@ def test_talk_and_webui_use_exactly_the_same_instruction_words_and_source_photo_
     assert all("/api/v1/files/" not in text for text, _ in talk_blocks)
 
 
-def test_pending_text_and_photo_deliveries_finish_before_processing_next_employee_turn(talk):
+def test_new_employee_prompt_pauses_pending_photos_before_processing_it(talk):
     talk.incoming(QUESTION)
     talk.process()
-    inbox = talk.incoming("Готово", 2, previous_delivered=False)
-    assert not talk.process()
-    with talk.env.factory() as session, session.begin():
-        assert session.get(TalkInbox, inbox).status == "PENDING"
-        session.execute(update(Delivery).where(Delivery.status == "PENDING").values(status="SENT"))
+    inbox = talk.incoming("Привет", 2, previous_delivered=False)
     assert talk.process()
+    with talk.env.factory() as session:
+        assert session.get(TalkInbox, inbox).status == "DONE"
+        rows = session.scalars(select(Delivery).join(Message).order_by(Message.sequence)).all()
+        assert rows[-1].status == "PENDING"
+        assert all(row.status == "PAUSED" for row in rows[:-1])
 
 
 def test_one_factual_clarification_preserves_original_problem_for_short_hp_answer(talk):
