@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 from contextlib import contextmanager
 from dataclasses import dataclass
 from urllib.parse import quote
@@ -15,7 +16,7 @@ from app.services.rag.documents import Illustration, read_xlsx
 from app.services.rag.equipment import scanner_facts, scanner_filename
 from app.services.rag.interface import Candidate
 from app.services.rag.knowledge_files import KnowledgeFilesError, list_knowledge_files
-from app.services.rag.query import choose_source, retrieval_query, source_compatible
+from app.services.rag.query import choose_source, normalized_query, retrieval_query, scanner_kinds, source_compatible
 from integrations.openwebui.approved_instruction_images import (
     MAX_SOURCE_BYTES, MAX_TEXT_CHARS, allowed_source_filename, read_docx_images, read_docx_text,
 )
@@ -37,6 +38,14 @@ actual_problem, а не просто упоминает похожее обор�
 Не придумывай инструкцию, шаги, идентификатор или цитату. При сомнении, неоднозначности,
 отсутствии подходящего источника верни file_id=null и evidence="". Backend сам
 загрузит и проверит оригинал. Текст ответа пользователю не создавай."""
+
+_SCANNER_HARDWARE_GOALS = {
+    "sound": re.compile(r"\b(?:громк\w*|звук\w*|пищ\w*|писк\w*|зуммер\w*|volume|sound|beep\w*)\b"),
+    "illumination": re.compile(r"\b(?:подсвет\w*|луч\w*|ярк\w*|illumination|brightness|light)\b"),
+    "caps_lock": re.compile(r"\bcaps[ -]?lock\b"),
+    "basic_settings": re.compile(r"\b(?:базов\w*|основн\w*|обязательн\w*)\s+настрой\w*\b"),
+}
+MAX_SCANNER_ORIGINALS = 8
 
 
 class KnowledgeUnavailable(ValueError):
@@ -72,6 +81,18 @@ def report_failure(error):
         event("talk.knowledge_error", stage=error.stage, error_code=error.code, http_status=error.http_status)
     except Exception:
         pass  # Observability must never expose source contents or change the reply.
+
+
+def _search_event(stage, **fields):
+    try:
+        event("talk.knowledge_search", stage=stage, **fields)
+    except Exception:
+        pass
+
+
+def _scanner_hardware_goals(text):
+    normalized = normalized_query(text)
+    return {goal for goal, pattern in _SCANNER_HARDWARE_GOALS.items() if pattern.search(normalized)}
 
 
 @dataclass(frozen=True)
@@ -230,12 +251,15 @@ class TalkKnowledge:
                 files = {key: item for key, item in self._files(client).items() if key not in excluded}
                 if not files:
                     return None
+                problem = fallback_query if isinstance(fallback_query, str) and fallback_query.strip() else query
+                approved = self._scanner_original(client, problem, files)
+                if approved is not None:
+                    return approved
                 original_queries = [q[:6000] for q in (query, fallback_query) if isinstance(q, str) and q.strip()]
                 queries = list(dict.fromkeys(original_queries))
                 compact = retrieval_query(query)
                 if compact and compact not in queries:
                     queries.append(compact)
-                problem = fallback_query if isinstance(fallback_query, str) and fallback_query.strip() else query
                 all_chunks = []
                 for text in queries[:2]:
                     with knowledge_stage("retrieval"):
@@ -277,6 +301,37 @@ class TalkKnowledge:
             report_failure(failure)
             raise failure from None
 
+    def _scanner_original(self, client, problem, files):
+        """Read a small complete scanner catalogue before invoking embeddings or a model."""
+        goals = _scanner_hardware_goals(problem)
+        if scanner_kinds(problem) != {"barcode"} or not goals:
+            return None
+        selected = [key for key, item in files.items() if scanner_filename(item["filename"])]
+        if len(selected) > MAX_SCANNER_ORIGINALS:
+            # A truncated catalogue cannot establish a unique applicable source.
+            _search_event("scanner_originals", outcome="catalogue_limit", approved_files=len(files),
+                          candidate_count=len(selected), scanned_files=0, selected=False)
+            return None
+        originals = {key: self._read(client, key, files) for key in selected}
+        chunks = [{"file_id": key, "source": approved.candidate.title, "content": approved.candidate.content}
+                  for key, approved in originals.items()
+                  if goals.issubset(_scanner_hardware_goals(approved.candidate.content))
+                  and source_compatible(problem, approved.candidate.title + "\n" + approved.candidate.content,
+                                       complete=True)]
+        chosen = choose_source(problem, chunks)
+        _search_event("scanner_originals", outcome="selected" if chosen else "no_unique_match",
+                      approved_files=len(files), candidate_count=len(chunks), scanned_files=len(originals),
+                      selected=chosen is not None)
+        if chosen is None:
+            return None
+        approved = originals[chosen]
+        current = self._files(client).get(chosen)
+        source = approved.document["source"]
+        if (not current or (current["filename"], current["knowledge_id"])
+                != (source["filename"], source["knowledge_id"])):
+            raise KnowledgeUnavailable("SourceMembershipChanged", "scanner_originals")
+        return approved
+
     def _semantic_source(self, problem, chunks):
         """One bounded model selection, never model-generated repair instructions."""
         candidates = [chunk for chunk in chunks if source_compatible(
@@ -297,6 +352,14 @@ class TalkKnowledge:
 
                 raw = OpenWebUILLM(self.settings, self.transport)._call(SourceSelection, _SELECTION_TASK, payload)
             choice = SourceSelection.model_validate(raw)
+        except KnowledgeUnavailable:
+            raise
+        except httpx.HTTPStatusError as error:
+            raise KnowledgeUnavailable("HTTPError", "source_selection", error.response.status_code) from None
+        except (httpx.TimeoutException, TimeoutError):
+            raise KnowledgeUnavailable("RequestTimedOut", "source_selection") from None
+        except httpx.RequestError:
+            raise KnowledgeUnavailable("RequestFailed", "source_selection") from None
         except Exception:
             return None  # A model failure is not evidence that a document applies.
         if choice.file_id is None or len(choice.evidence.strip()) < 20:

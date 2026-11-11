@@ -2,16 +2,18 @@
 
 from xml.sax.saxutils import escape
 
+import json
+
 import pytest
 
 from app.schemas.contracts import AnalysisResult
-from app.services.chat.talk_dialogue import CLARIFY_QUESTIONS
+from app.services.chat.talk_dialogue import CLARIFY_QUESTIONS, UNAVAILABLE
 from app.services.llm.mock import MockLLM
 from app.services.rag.query import printer_kinds, retrieval_query, source_compatible
 from tests.test_openwebui_instruction_images import instruction
 from tests.test_talk_dialogue import QUESTION, Knowledge, NoGeneration, approved, assistants
 from tests.test_talk_dialogue import talk as talk
-from tests.test_talk_knowledge import DOC, provider
+from tests.test_talk_knowledge import DOC, KB, provider
 
 
 def test_actual_barcode_setup_then_beam_and_volume_uses_instruction37_original_photo(talk):
@@ -34,7 +36,56 @@ def test_actual_barcode_setup_then_beam_and_volume_uses_instruction37_original_p
     assert any(photo for _, photo in assistants(result))
     assert "луч сканера и громкость" in result["flow"]["query"]
     assert not model.calls
-    assert any(request.method == "POST" for request in requests["calls"])
+    assert not any(request.method == "POST" for request in requests["calls"])
+
+
+@pytest.mark.parametrize("native_hit", [True, False], ids=["indexed-volume", "missing-vector-hit"])
+def test_short_volume_answer_keeps_barcode_scanner_context_and_sends_original_photo(talk, native_hit):
+    caption = "Для уменьшения громкости сканера считайте штрихкод минимальной громкости."
+    body = "Настройка сканера штрихкодов Zebra DS2208. Громкость выбирается соответствующим штрихкодом на листе."
+    source = instruction([caption], extra_paragraph="<w:p><w:r><w:t>" + escape(body) + "</w:t></w:r></w:p>")
+    knowledge, requests = provider(filename="37_Zebra DS2208 — лист настроечных штрихкодов.docx",
+                                   data=source, chunks=[(DOC, body)] if native_hit else [])
+    model = NoGeneration()
+    talk.incoming("Настройка сканер ШК")
+    assert talk.process(knowledge, model)
+    assert "громкость" in assistants(talk.snapshot())[-1][0]
+
+    talk.incoming("уменьшить громкость", 2)
+    assert talk.process(knowledge, model)
+    result = talk.snapshot()
+    assert result["flow"]["query"] == "Настройка сканер ШК\nуменьшить громкость"
+    assert len(result["attempts"]) == 1
+    assert result["flow"]["source"]["filename"].startswith("37_")
+    assert result["flow"]["source"]["knowledge_id"] == KB
+    assert any(photo for _, photo in assistants(result))
+    retrievals = [json.loads(request.content) for request in requests["calls"]
+                  if request.url.path.endswith("/retrieval/query/collection")]
+    assert retrievals == []
+    assert not model.calls
+
+
+def test_source_selection_timeout_replies_unavailable_without_analysis_retry_or_missing_claim(talk, caplog):
+    content = "Общие сведения об устройстве. Здесь описан принтер для рабочего места."
+    knowledge, _ = provider(filename="Общие сведения.md", data=content.encode(), chunks=[(DOC, content)])
+    selections = []
+
+    def timeout(payload):
+        selections.append(payload)
+        raise TimeoutError("local test timeout")
+
+    knowledge.selector = timeout
+    model = NoGeneration()
+    talk.incoming("Мобильный принтер ТСД")
+    with caplog.at_level("INFO", logger="ai-support"):
+        assert talk.process(knowledge, model)
+
+    result = talk.snapshot()
+    assert assistants(result) == [(UNAVAILABLE, None)]
+    assert not result["attempts"] and not result["flow"].get("escalation")
+    assert len(selections) == 1 and not model.calls
+    fields = next(record.fields for record in caplog.records if record.message == "talk.knowledge_error")
+    assert fields == {"stage": "source_selection", "error_code": "RequestTimedOut", "http_status": None}
 
 
 @pytest.mark.parametrize("message", ["Не работает сканер", "Настройка сканера", "Сканер выдаёт ошибку"])

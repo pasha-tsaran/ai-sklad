@@ -5,6 +5,7 @@ import json
 import pytest
 
 from app.services.rag.query import choose_source, normalized_query, retrieval_query, source_compatible
+from app.services.rag.talk import KnowledgeUnavailable
 from tests.test_openwebui_instruction_images import instruction
 from tests.test_talk_knowledge import DOC, OTHER, provider
 
@@ -175,7 +176,9 @@ def test_model_failure_never_becomes_an_instruction_or_an_unbounded_retry():
         raise TimeoutError("private model response")
 
     knowledge.selector = fail
-    assert knowledge.search("Мобильный принтер ТСД") is None
+    with pytest.raises(KnowledgeUnavailable) as captured:
+        knowledge.search("Мобильный принтер ТСД")
+    assert (captured.value.code, captured.value.stage) == ("RequestTimedOut", "source_selection")
     assert len(calls) == 1
     assert len([r for r in state["calls"] if r.method == "POST"]) == 2
 
