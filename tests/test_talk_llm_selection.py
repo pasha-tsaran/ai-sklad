@@ -50,7 +50,7 @@ def test_single_source_still_requires_model_selection_and_keeps_original_photo()
     assert approved.illustrations[1].caption == EVIDENCE
     assert len(decisions) == 1
     assert decisions[0]["actual_problem"] == problem
-    assert decisions[0]["candidates"][0]["content"] == approved.document["content"]
+    assert decisions[0]["candidates"][DOC] == approved.document["content"]
     assert not any(request.method == "POST" for request in state["calls"])
     assert sum(request.url.path.endswith("/content") for request in state["calls"]) == 2
 
@@ -72,18 +72,18 @@ def test_default_selector_uses_real_model_transport_with_scoped_catalogue_and_no
         assert payload["tools"] == [] and payload["tool_ids"] == []
         assert payload["features"] == {"web_search": False}
         assert payload["temperature"] == 0 and payload["stream"] is False
-        assert payload["response_format"] == {"type": "json_object"}
+        assert payload["response_format"]["type"] == "json_schema"
+        assert payload["params"]["think"] is False
+        assert payload["params"]["max_tokens"] == payload["max_tokens"] == 512
         system = payload["messages"][0]["content"]
         assert INSTRUCTION_SELECTION_TASK in system
         assert '"title": "InstructionSelection"' in system
         assert '"additionalProperties": false' in system
         source_payload = json.loads(payload["messages"][-1]["content"])
         assert source_payload["actual_problem"] == "The scanner is too loud."
-        assert source_payload["catalogue"] == [
-            {"file_id": DOC, "filename": state["files"][0]["filename"], "knowledge_id": KB},
-        ]
-        assert source_payload["candidates"][0]["file_id"] == DOC
-        assert EVIDENCE in source_payload["candidates"][0]["content"]
+        assert source_payload["knowledge_ids"] == [KB]
+        assert source_payload["catalogue"] == {DOC: state["files"][0]["filename"]}
+        assert EVIDENCE in source_payload["candidates"][DOC]
         return httpx.Response(200, json={
             "choices": [{"message": {"content": json.dumps(match())}}],
         })
@@ -103,7 +103,8 @@ def test_instruction37_without_native_index_hit_is_selected_by_model():
     result = knowledge.search_with_llm("Настройка сканер ШК\nуменьшить громкость")
     assert result.result == "MATCH" and len(result.approved.illustrations) == 1
     assert len(calls) == 1
-    assert calls[0]["catalogue"] == [{"file_id": DOC, "filename": filename, "knowledge_id": KB}]
+    assert calls[0]["knowledge_ids"] == [KB]
+    assert calls[0]["catalogue"] == {DOC: filename}
     assert not any(request.method == "POST" for request in state["calls"])
 
 
@@ -186,8 +187,8 @@ def test_model_can_request_another_authorized_original_and_then_confirm_it():
     result = knowledge.search_with_llm("Прибор разбудил весь склад писком")
     assert result.result == "MATCH" and result.approved.document["source"]["file_id"] == OTHER
     assert len(calls) == 2
-    assert {row["file_id"] for row in calls[0]["candidates"]} == {DOC}
-    assert {row["file_id"] for row in calls[1]["candidates"]} == {DOC, OTHER}
+    assert set(calls[0]["candidates"]) == {DOC}
+    assert set(calls[1]["candidates"]) == {DOC, OTHER}
     assert len(calls[0]["catalogue"]) == 10 and calls[1]["read_available"] is False
     assert all(request.url.host == "webui.example.invalid" for request in state["calls"])
 
@@ -216,7 +217,7 @@ def test_withdrawn_and_excluded_sources_are_absent_from_model_catalogue(filename
     payloads = []
     knowledge.selector = lambda payload: payloads.append(payload) or {"result": "NO_KNOWLEDGE"}
     result = knowledge.search_with_llm("Нужна помощь", excluded=excluded)
-    assert result.result == "NO_KNOWLEDGE" and payloads[0]["catalogue"] == []
+    assert result.result == "NO_KNOWLEDGE" and payloads[0]["catalogue"] == {}
     assert not any("/files/" in request.url.path for request in state["calls"])
 
 
@@ -228,7 +229,7 @@ def test_foreign_vector_ids_and_contents_never_reach_the_model_or_original_reade
     payloads = []
     knowledge.selector = lambda payload: payloads.append(payload) or {"result": "NO_KNOWLEDGE"}
     assert knowledge.search_with_llm("Прибор разбудил склад писком").result == "NO_KNOWLEDGE"
-    assert payloads[0]["candidates"] == []
+    assert payloads[0]["candidates"] == {}
     assert foreign not in str(payloads) and "Private foreign" not in str(payloads)
     assert not any("/api/v1/files/" in request.url.path for request in state["calls"])
 
@@ -258,7 +259,7 @@ def test_oversized_original_cannot_turn_incomplete_context_into_no_knowledge():
     knowledge.selector = lambda payload: payloads.append(payload) or {"result": "NO_KNOWLEDGE"}
     with pytest.raises(KnowledgeUnavailable, match="SelectionBudgetIncomplete"):
         knowledge.search_with_llm("Нужна помощь")
-    assert payloads[0]["candidate_budget_limited"] is True and payloads[0]["candidates"] == []
+    assert payloads[0]["candidate_budget_limited"] is True and payloads[0]["candidates"] == {}
 
 
 def test_large_catalogue_is_rejected_before_any_partial_listing_reaches_model():
@@ -276,12 +277,99 @@ def test_large_catalogue_is_rejected_before_any_partial_listing_reaches_model():
 def test_context_is_bounded_while_actual_user_problem_remains_complete():
     knowledge, _, payloads = selection_store()
     problem = "Нужна помощь с тихим сигналом"
-    result = knowledge.search_with_llm(problem, {"history": "old" * 10_000 + "latest"})
+    latest = "У сканера штрихкодов надо уменьшить громкость"
+    conversation = [{"role": "assistant", "content": "old" * 10_000}]
+    conversation += [{"role": "user", "content": "short recent remark " * 30} for _ in range(3)]
+    conversation.append({"role": "user", "content": latest})
+    result = knowledge.search_with_llm(problem, {"short_term": {"messages": conversation},
+                                               "current_message": latest})
     context = payloads[0]["context"]
     assert result.result == "MATCH" and payloads[0]["actual_problem"] == problem
-    assert context["history_truncated"] is True
-    assert len(context["context_excerpt"]) <= MAX_SELECTION_CONTEXT_CHARS
-    assert "latest" in context["context_excerpt"]
+    assert len(json.dumps(context, ensure_ascii=False)) <= MAX_SELECTION_CONTEXT_CHARS
+    assert context["current_message"] == latest
+    assert context["recent_messages"][-1] == {"role": "user", "content": latest}
+    assert all(len(message["content"]) <= 400 for message in context["recent_messages"])
+    assert "old" not in str(context) and "context_excerpt" not in context
+
+
+def test_compact_catalogue_keeps_all_fifty_ids_names_and_complete_source_conditions(caplog):
+    filename = "37_Zebra DS2208 — лист настроечных штрихкодов.docx"
+    conditions = EVIDENCE + " Применяется только к указанному устройству. Не сканируйте все коды подряд."
+    source_data = instruction([conditions])
+    rows = [(DOC, filename, source_data)]
+    rows += [(f"00000000-0000-4000-8000-{index:012d}", f"Материал по работе программы {index}.md",
+              b"Other approved guidance.") for index in range(101, 150)]
+    knowledge, _ = scanner_provider(rows, chunks=[])
+    payloads = []
+    knowledge.selector = lambda payload: payloads.append(copy.deepcopy(payload)) or match()
+    with caplog.at_level("INFO", logger="ai-support"):
+        decision = knowledge.search_with_llm("Уменьшить громкость сканера")
+    payload = payloads[0]
+    assert decision.result == "MATCH" and payload["knowledge_ids"] == [KB]
+    assert payload["catalogue"] == {file_id: name for file_id, name, _ in rows}
+    assert payload["candidates"] == {DOC: decision.approved.document["content"]}
+    assert conditions in payload["candidates"][DOC]
+    assert decision.approved.illustrations[1].data == read_docx_images(source_data)[0].data
+    expanded = {**payload, "catalogue": [
+        {"file_id": file_id, "filename": name, "knowledge_id": KB} for file_id, name, _ in rows
+    ], "candidates": [{"file_id": DOC, "source": filename, "knowledge_id": KB,
+                       "content": payload["candidates"][DOC]}]}
+    assert len(json.dumps(payload, ensure_ascii=False)) < len(json.dumps(expanded, ensure_ascii=False)) * 0.85
+    fields = next(record.fields for record in caplog.records if record.message == "talk.knowledge_search"
+                  and record.fields.get("stage") == "instruction_selection_request")
+    assert fields["approved_files"] == 50 and fields["candidate_count"] == fields["call_number"] == 1
+    assert fields["payload_chars"] == len(json.dumps(payload, ensure_ascii=False))
+    assert fields["source_chars"] == len(payload["candidates"][DOC])
+    assert all(isinstance(value, int) for name, value in fields.items() if name != "stage")
+    assert DOC not in str(fields) and filename not in str(fields) and EVIDENCE not in str(fields)
+
+
+def test_selection_context_keeps_technical_facts_and_recent_exchange_without_profile_or_record_ids():
+    knowledge, _, payloads = selection_store()
+    context = {
+        "authority": "PRIVATE_AUTHORITY",
+        "incident": {"id": "PRIVATE_INCIDENT", "state": "PRIVATE_STATE", "failed_attempts": 42,
+                     "subject": "Настройка сканера ШК", "equipment_model": "Сообщённая пользователем модель",
+                     "problem_type": "громкость"},
+        "channel_profile": {"account_holder_name": "PRIVATE_PROFILE", "computer_name": "PRIVATE_COMPUTER"},
+        "short_term": {"summary": "PRIVATE_OLD_SUMMARY", "attempts": [{"comment": "PRIVATE_ATTEMPT"}],
+                       "messages": [{"role": "user", "sequence": "PRIVATE_SEQUENCE", "content": "Сканер ШК"},
+                                    {"role": "assistant", "content": "Что нужно изменить?"},
+                                    {"role": "user", "content": "уменьшить громкость"}]},
+        "long_term": [{"incident_id": "PRIVATE_HISTORY", "resolved_at": "PRIVATE_TIMESTAMP"}],
+        "verified_previous_source": {"file_id": DOC, "sha256": "PRIVATE_SOURCE_HASH"},
+        "previous_question": "Что нужно изменить?", "current_message": "уменьшить громкость",
+    }
+    assert knowledge.search_with_llm("Настройка сканера ШК\nуменьшить громкость", context).result == "MATCH"
+    selected = payloads[0]["context"]
+    assert selected["technical_facts"] == {key: context["incident"][key]
+                                           for key in ("subject", "equipment_model", "problem_type")}
+    assert selected["current_message"] == "уменьшить громкость"
+    assert selected["previous_question"] == "Что нужно изменить?"
+    assert selected["recent_messages"] == [
+        {"role": "user", "content": "Сканер ШК"},
+        {"role": "assistant", "content": "Что нужно изменить?"},
+        {"role": "user", "content": "уменьшить громкость"},
+    ]
+    assert selected["verified_previous_source"] == {"file_id": DOC}
+    assert "PRIVATE_" not in json.dumps(selected)
+    assert len(json.dumps(selected, ensure_ascii=False)) <= MAX_SELECTION_CONTEXT_CHARS
+
+
+def test_oversized_optional_context_does_not_splice_fields_or_lose_actual_problem():
+    knowledge, _, payloads = selection_store()
+    problem = "Сканер\n" + "уточнение " * 500
+    context = {"current_message": "\\\"" * 3000, "previous_question": "Что нужно изменить?",
+               "incident": {"problem_type": "громкость"},
+               "short_term": {"messages": [{"role": "user", "content": "уменьшить громкость"}]}}
+    assert knowledge.search_with_llm(problem, context).result == "MATCH"
+    selected = payloads[0]["context"]
+    assert payloads[0]["actual_problem"] == problem
+    assert selected["previous_question"] == "Что нужно изменить?"
+    assert selected["technical_facts"] == {"problem_type": "громкость"}
+    assert "current_message" not in selected
+    assert selected["recent_messages"] == [{"role": "user", "content": "уменьшить громкость"}]
+    assert len(json.dumps(selected, ensure_ascii=False)) <= MAX_SELECTION_CONTEXT_CHARS
 
 
 def test_verified_previous_source_is_a_hint_and_still_requires_current_model_choice():
@@ -290,7 +378,7 @@ def test_verified_previous_source_is_a_hint_and_still_requires_current_model_cho
     knowledge.selector = lambda payload: calls.append(payload) or match(OTHER)
     result = knowledge.search_with_llm("Прибор разбудил склад", {"verified_previous_source": {"file_id": OTHER}})
     assert result.result == "MATCH" and len(calls) == 1
-    assert {item["file_id"] for item in calls[0]["candidates"]} == {DOC, OTHER}
+    assert set(calls[0]["candidates"]) == {DOC, OTHER}
 
 
 def test_verified_previous_source_does_not_hide_a_better_instruction_in_small_catalogue():
@@ -302,7 +390,7 @@ def test_verified_previous_source_does_not_hide_a_better_instruction_in_small_ca
     knowledge.selector = lambda payload: payloads.append(payload) or match(OTHER)
     decision = knowledge.search_with_llm("Новая проблема", {"verified_previous_source": {"file_id": DOC}})
     assert decision.result == "MATCH" and decision.approved.document["source"]["file_id"] == OTHER
-    assert [item["file_id"] for item in payloads[0]["candidates"]] == [DOC, OTHER]
+    assert list(payloads[0]["candidates"]) == [DOC, OTHER]
 
 
 @pytest.mark.parametrize("answer", ["MATCH", "NO_KNOWLEDGE"])

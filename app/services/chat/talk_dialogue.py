@@ -32,7 +32,7 @@ from app.services.rag.openwebui import save_snapshot
 from app.services.rag.query import normalized_query, printer_kinds, scanner_kinds
 from app.services.rag.talk import (
     ApprovedTalkDocument, INSTRUCTION_SELECTION_TASK, InstructionSelection, KnowledgeUnavailable,
-    SourceSelection, TalkKnowledge, _SELECTION_TASK,
+    SourceSelection, TalkKnowledge, _SELECTION_TASK, report_failure,
 )
 from app.services.rag.success import SuccessfulTalkKnowledge, remember_success
 from app.services.ticketing.intake import _ordered_lines, parse_intake
@@ -695,9 +695,7 @@ def _replace_guide_context(flow):
 
 def _model_clarification(question):
     """Only a short informational question can leave the source-selection task."""
-    if not isinstance(question, str):
-        raise KnowledgeUnavailable("InvalidClarification", "instruction_selection")
-    question = question.strip()
+    question = question.strip() if isinstance(question, str) else ""
     if (not 5 <= len(question) <= 300 or question.count("?") != 1 or not question.endswith("?")
             or re.search(r"[\r\n<>]|(?:mailto:|file:|data:|javascript:|www\.)", question, re.I)
             or _TECHNICAL_OUTPUT.search(question) or _OPERATION_CLAIM.search(question)
@@ -705,7 +703,9 @@ def _model_clarification(question):
             or re.search(r"\b(?:парол\w*|password\w*|токен\w*|api[ _-]?key|secret\w*|"
                          r"модел\w*|маркиров\w*|шильдик\w*|производител\w*|"
                          r"отключите|сбросьте|переустановите)\b", question, re.I)):
-        raise KnowledgeUnavailable("InvalidClarification", "instruction_selection")
+        error = KnowledgeUnavailable("InvalidClarification", "instruction_selection")
+        report_failure(error)
+        raise error
     return question
 
 
@@ -1294,6 +1294,9 @@ def process_one(factory, settings, llm, knowledge=None, *, account_id=None):
             with _measure(metadata, "model_api"):
                 call = getattr(llm, "_call", None)
                 if settings.llm_backend == "openwebui":
+                    select_instruction = getattr(llm, "select_instruction", None)
+                    if callable(select_instruction):
+                        return select_instruction(payload)
                     if not callable(call):
                         raise KnowledgeUnavailable("ModelUnavailable", "instruction_selection")
                     return call(InstructionSelection, INSTRUCTION_SELECTION_TASK, payload)

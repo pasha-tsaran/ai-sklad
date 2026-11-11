@@ -40,6 +40,13 @@ class SelectionModel(MockLLM):
         self.calls = []
         self.analysis_calls = []
         self.dialogue_calls = []
+        self.selection_method_calls = 0
+
+    def select_instruction(self, payload):
+        from app.services.rag.talk import INSTRUCTION_SELECTION_TASK, InstructionSelection
+
+        self.selection_method_calls += 1
+        return self._call(InstructionSelection, INSTRUCTION_SELECTION_TASK, payload)
 
     def _call(self, schema, task, payload):
         self.calls.append({"schema": schema.__name__, "task": task, "payload": copy.deepcopy(payload)})
@@ -96,6 +103,7 @@ def test_real_process_one_requires_model_selection_even_for_unique_scanner_origi
                       rows=[(DOC, FILENAME, instruction([VOLUME]))])
     result = chat.send(QUESTION)
     assert len(chat.model.calls) == 1 and not chat.model.analysis_calls
+    assert chat.model.selection_method_calls == 1
     assert chat.model.calls[0]["schema"] == "InstructionSelection"
     assert result["flow"]["source"]["file_id"] == DOC
     assert result["flow"]["source"]["knowledge_id"] == KB
@@ -105,8 +113,8 @@ def test_real_process_one_requires_model_selection_even_for_unique_scanner_origi
     assert photographs[0].caption == VOLUME
     payload = chat.model.calls[0]["payload"]
     assert payload["actual_problem"] == QUESTION
-    assert all(item["knowledge_id"] == KB for item in payload["catalogue"])
-    assert all(item["knowledge_id"] == KB for item in payload["candidates"])
+    assert payload["knowledge_ids"] == [KB]
+    assert set(payload["candidates"]) <= set(payload["catalogue"])
 
 
 def test_model_clarification_then_short_answer_keeps_context_and_sends_instruction37(model_chat):
@@ -259,7 +267,7 @@ def test_success_memory_is_a_hint_and_does_not_bypass_new_model_selection(model_
     assert len(chat.model.calls) == 2
     assert second["flow"]["source"]["file_id"] == OTHER
     assert any(photo for _, photo in assistants(second))
-    assert all(item["knowledge_id"] == KB for item in chat.model.calls[1]["payload"]["catalogue"])
+    assert chat.model.calls[1]["payload"]["knowledge_ids"] == [KB]
 
 
 def test_explicit_wrong_guide_excludes_it_from_next_model_catalogue(model_chat):
@@ -268,7 +276,7 @@ def test_explicit_wrong_guide_excludes_it_from_next_model_catalogue(model_chat):
     first = chat.send(QUESTION)
     second = chat.send("Это не та инструкция, нужна другая настройка звука сканера", 2)
     assert len(chat.model.calls) == 2 and not chat.model.analysis_calls
-    assert DOC not in {item["file_id"] for item in chat.model.calls[1]["payload"]["catalogue"]}
+    assert DOC not in chat.model.calls[1]["payload"]["catalogue"]
     assert second["flow"]["source"]["file_id"] == OTHER
     assert second["incident"].failed_attempts == first["incident"].failed_attempts == 0
 
@@ -277,6 +285,7 @@ def test_model_payload_is_bounded_to_current_collection_and_safe_context(model_c
     chat = model_chat([decision("MATCH", file_id=DOC, evidence=VOLUME)])
     chat.send(QUESTION)
     payload = chat.model.calls[0]["payload"]
-    assert {item["file_id"] for item in payload["catalogue"]} == {DOC, OTHER}
+    assert set(payload["catalogue"]) == {DOC, OTHER}
     assert "test-key" not in json.dumps(payload, ensure_ascii=False)
-    assert all(item["knowledge_id"] == KB for item in payload["catalogue"] + payload["candidates"])
+    assert payload["knowledge_ids"] == [KB]
+    assert set(payload["candidates"]) <= set(payload["catalogue"])
