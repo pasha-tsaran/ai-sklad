@@ -70,7 +70,7 @@ def _word(word):
             word = matches[0]
     if word.startswith(("принтер", "принтр", "термопринтер")):
         return "принтер"
-    if word.startswith(("сканер", "считыват")):
+    if word.startswith(("сканер", "сканир", "отсканир", "просканир", "считыват")):
         return "сканер"
     if word.startswith("терминал") or word in {"тсд", "tsd"}:
         return "тсд"
