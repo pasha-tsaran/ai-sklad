@@ -195,10 +195,9 @@ def test_model_can_request_another_authorized_original_and_then_confirm_it():
 
 @pytest.mark.parametrize("first,second", [
     ({"result": "READ", "file_id": "00000000-0000-4000-8000-000000000777"}, None),
-    ({"result": "READ", "file_id": DOC}, None),
     ({"result": "READ", "file_id": OTHER}, {"result": "READ", "file_id": DOC}),
 ])
-def test_read_cannot_leave_scope_repeat_a_loaded_file_or_trigger_unbounded_calls(first, second):
+def test_read_cannot_leave_scope_or_trigger_unbounded_calls(first, second):
     knowledge, state = large_catalogue()
     calls = []
     knowledge.selector = lambda payload: calls.append(payload) or (first if len(calls) == 1 else second)
@@ -206,6 +205,83 @@ def test_read_cannot_leave_scope_repeat_a_loaded_file_or_trigger_unbounded_calls
         knowledge.search_with_llm("Прибор разбудил весь склад писком")
     assert len(calls) == (2 if second is not None else 1)
     assert not any("000000000777" in request.url.path for request in state["calls"])
+
+
+def test_a_loaded_source_can_be_refreshed_once_before_final_model_decision(caplog):
+    knowledge, state, _ = selection_store()
+    changed = "Повторно прочитанный оригинал содержит подтверждённую настройку громкости."
+    calls = []
+
+    def select(payload):
+        calls.append(copy.deepcopy(payload))
+        if len(calls) == 1:
+            state["data"] = instruction([changed])
+            return {"result": "READ", "file_id": DOC}
+        return match(DOC, changed)
+
+    knowledge.selector = select
+    with caplog.at_level("INFO", logger="ai-support"):
+        result = knowledge.search_with_llm("Уменьшить громкость сканера")
+    assert result.result == "MATCH" and len(calls) == 2
+    assert EVIDENCE in calls[0]["candidates"][DOC]
+    assert changed in calls[1]["candidates"][DOC]
+    assert calls[1]["read_available"] is False
+    assert result.approved.illustrations[1].caption == changed
+    fields = next(record.fields for record in caplog.records
+                  if record.message == "talk.knowledge_search" and record.fields.get("stage") == "instruction_read_request")
+    assert fields == {"stage": "instruction_read_request", "call_number": 1,
+                      "in_catalogue": True, "already_loaded": True, "extra_fields": False}
+
+
+def test_refreshing_one_of_eight_loaded_sources_keeps_the_complete_candidate_budget():
+    rows = [(DOC, "Описание устройства.md", EVIDENCE.encode())]
+    rows += [(f"00000000-0000-4000-8000-{index:012d}", f"Материал {index}.md", b"General guidance.")
+             for index in range(101, 108)]
+    knowledge, _ = scanner_provider(rows)
+    calls = []
+
+    def select(payload):
+        calls.append(payload)
+        return {"result": "READ", "file_id": DOC} if len(calls) == 1 else {"result": "NO_KNOWLEDGE"}
+
+    knowledge.selector = select
+    assert knowledge.search_with_llm("Другая настройка устройства").result == "NO_KNOWLEDGE"
+    assert len(calls) == 2
+    assert len(calls[1]["candidates"]) == 8 and calls[1]["candidate_budget_limited"] is False
+
+
+@pytest.mark.parametrize("problem", [
+    "Подключить ТСД к принтеру по wi-fi",
+    "Ты показал на фото принтер по блютуз, а другой по wi-fi, а у меня 2 принтера по wi-fi",
+])
+def test_filename_extension_does_not_hide_the_two_wifi_instruction(problem):
+    mixed = "Схема ТСД с одним принтером по Wi-Fi и другим по Bluetooth."
+    two_wifi = "Схема одного ТСД с двумя принтерами по Wi-Fi."
+    rows = [(DOC, "24-3_ТСД — принтер по Wi-Fi и принтер по Bluetooth.docx", instruction([mixed])),
+            (OTHER, "24-4_ТСД — два принтера по Wi-Fi.docx", instruction([two_wifi]))]
+    rows += [(f"00000000-0000-4000-8000-{index:012d}", f"Материал {index}.md", b"General guidance.")
+             for index in range(101, 109)]
+    knowledge, state = scanner_provider(rows, chunks=[])
+    calls = []
+    knowledge.selector = lambda payload: calls.append(copy.deepcopy(payload)) or match(OTHER, two_wifi)
+    result = knowledge.search_with_llm(problem)
+    assert result.result == "MATCH" and result.approved.document["source"]["file_id"] == OTHER
+    assert len(calls) == 1 and {DOC, OTHER} <= set(calls[0]["candidates"])
+    assert result.approved.illustrations[1].caption == two_wifi
+    assert not any(request.method == "POST" for request in state["calls"])
+
+
+def test_current_task_and_displayed_source_are_bounded_structured_context():
+    knowledge, _, _ = selection_store()
+    source = {"file_id": DOC, "filename": "Настройка принтера.docx", "private_profile": "PRIVATE-PROFILE"}
+    context = knowledge._instruction_context({
+        "active_task": "Подключить ТСД к принтеру по Wi-Fi", "shown_source": source,
+        "current_message": "У меня оба принтера по Wi-Fi", "channel_profile": {"name": "PRIVATE-PERSON"},
+    })
+    assert context["active_task"] == "Подключить ТСД к принтеру по Wi-Fi"
+    assert context["shown_source"] == {"file_id": DOC, "filename": "Настройка принтера.docx"}
+    assert context["current_message"] == "У меня оба принтера по Wi-Fi"
+    assert "PRIVATE-" not in str(context)
 
 
 @pytest.mark.parametrize("filename,excluded", [

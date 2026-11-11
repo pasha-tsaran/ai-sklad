@@ -50,10 +50,24 @@ candidates — словарь file_id: полный текст оригинал�
 Для сканера различай штрихкоды и документы; для принтера — документы А4,
 стационарный термопринтер и мобильный термопринтер. Уже известное не спрашивай.
 
+current_message содержит последнюю реплику сотрудника. context.active_task —
+задача, по которой уже показана инструкция, context.shown_source — показанный
+источник. Эти поля помогают понять уточнение и ссылку на предыдущий ответ.
+При самостоятельном новом вопросе ориентируйся на новую задачу. Сведения из
+technical_facts и истории могут относиться к прежней проблеме.
+Последние явно сообщённые условия сотрудника имеют приоритет. Различай описание
+показанной схемы и фактическое оборудование пользователя. В реплике
+«на фото Bluetooth, а у меня оба принтера по Wi-Fi» Bluetooth описывает предыдущий
+ответ; текущая конфигурация сотрудника — два принтера по Wi-Fi.
+Учитывай количество устройств и способ подключения каждого. Выбирай схему,
+покрывающую эти условия без добавления лишних устройств и интерфейсов. Если для
+выбора между схемами не хватает существенного условия, задай один короткий вопрос.
+
 Для подходящей инструкции
 верни MATCH, точный file_id из candidates и evidence — дословную непрерывную цитату
 из текста этого источника, подтверждающую нужную настройку или действие. Цитата
-должна быть короткой, до 400 символов. Не меняй
+должна быть короткой, до 400 символов. Подтверждай ею также отличительные условия
+сценария, например количество принтеров и способ подключения. Не меняй
 способ подключения, добровольно указанную модель или условия исходника. Не выбирай
 документ только по похожему слову, не дополняй его техническими сведениями из памяти.
 Одного кандидата тоже нужно проверить по смыслу. Backend проверит цитату, источник
@@ -335,16 +349,20 @@ class TalkKnowledge:
                                   payload_chars=payload_chars)
                     choice = self._instruction_selection(payload)
                     if choice.result == "READ":
-                        if (decision_number or choice.file_id not in files or choice.file_id in candidates
+                        _search_event("instruction_read_request", call_number=decision_number + 1,
+                                      in_catalogue=choice.file_id in files,
+                                      already_loaded=choice.file_id in candidates,
+                                      extra_fields=bool(choice.evidence or choice.question))
+                        if (decision_number or choice.file_id not in files
                                 or choice.evidence or choice.question):
                             raise KnowledgeUnavailable("InvalidInstructionRead", "instruction_selection")
                         approved = self._read(client, choice.file_id, files)
                         if len(approved.candidate.content) > MAX_SELECTION_SOURCE_CHARS:
                             raise KnowledgeUnavailable("SelectionSourceTooLarge", "instruction_selection")
-                        total = sum(len(item.candidate.content) for item in candidates.values())
-                        if (len(candidates) < MAX_SELECTION_CANDIDATES
-                                and total + len(approved.candidate.content) <= MAX_SELECTION_SOURCE_CHARS):
-                            candidates = {**candidates, choice.file_id: approved}
+                        updated = {**candidates, choice.file_id: approved}
+                        total = sum(len(item.candidate.content) for item in updated.values())
+                        if len(updated) <= MAX_SELECTION_CANDIDATES and total <= MAX_SELECTION_SOURCE_CHARS:
+                            candidates = updated
                         else:
                             candidates = {choice.file_id: approved}
                             budget_limited = True
@@ -372,7 +390,14 @@ class TalkKnowledge:
                  if isinstance(incident.get(name), str) and incident[name].strip()}
         previous = context.get("verified_previous_source")
         previous_id = previous.get("file_id") if isinstance(previous, dict) else None
+        shown = context.get("shown_source")
+        shown = shown if isinstance(shown, dict) else {}
+        shown = ({"file_id": shown["file_id"], "filename": shown["filename"]}
+                 if _uuid(shown.get("file_id")) and isinstance(shown.get("filename"), str)
+                 and allowed_source_filename(shown["filename"]) else {})
         fields = [
+            ("active_task", context.get("active_task")),
+            ("shown_source", shown),
             ("previous_question", context.get("previous_question")),
             ("technical_facts", facts),
             ("verified_previous_source", {"file_id": previous_id} if _uuid(previous_id) else {}),
@@ -413,7 +438,8 @@ class TalkKnowledge:
                 r"\b(?:скан\w*|штрих\w*|баркод\w*|шк|scanner|barcode)\b", normalized_query(problem)
             ) else []
             terms = _terms(problem) - {"скане", "принт", "печат", "тсд"}
-            title_hits = sorted(((len(terms & _terms(item["filename"])), key) for key, item in files.items()),
+            title_hits = sorted(((len(terms & _terms(item["filename"].rsplit(".", 1)[0].replace("_", " "))), key)
+                                 for key, item in files.items()),
                                 reverse=True)
             named_ids = [key for score, key in title_hits if score]
             selected = list(dict.fromkeys(scanner_ids + named_ids))

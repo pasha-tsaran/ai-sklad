@@ -753,6 +753,12 @@ def _support_turn(message, flow, context, llm, knowledge):
         if model_selection:
             selection_context = {**context, "current_message": message,
                                  "previous_question": flow.get("clarification_question", "")}
+            source = flow.get("source")
+            if (has_guide and isinstance(source, dict)
+                    and all(isinstance(source.get(name), str) and source[name]
+                            for name in ("file_id", "filename"))):
+                selection_context["active_task"] = flow.get("query", "")
+                selection_context["shown_source"] = {name: source[name] for name in ("file_id", "filename")}
             decision = knowledge.search_with_llm(problem, context=selection_context,
                                                  excluded=excluded, fallback_query=problem)
             if decision.result == "CLARIFY":

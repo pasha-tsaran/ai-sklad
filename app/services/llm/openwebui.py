@@ -18,11 +18,19 @@ class OpenWebUILLM:
         self.name = f"openwebui:{settings.openwebui_model}"[:255]
 
     def _call(self, schema, task, payload, *, fast_selection=False):
+        selection_schema = None
+        if fast_selection:
+            selection_schema = schema.model_json_schema()
+            allowed_ids = list(payload.get("catalogue", {}))
+            selection_schema["properties"]["file_id"] = (
+                {"anyOf": [{"type": "string", "enum": allowed_ids}, {"type": "null"}], "default": None}
+                if allowed_ids else {"type": "null", "default": None}
+            )
         # LangChain orchestrates prompt -> existing internal transport -> strict validation.
         # No cloud model, autonomous tools or external memory service is introduced.
         chain = (
             RunnableLambda(lambda value: stage_messages(schema, task, value))
-            | RunnableLambda(lambda messages: self._request(messages, selection_schema=schema)
+            | RunnableLambda(lambda messages: self._request(messages, selection_schema=selection_schema)
                              if fast_selection else self._request(messages))
             | RunnableLambda(schema.model_validate_json)
         )
@@ -49,7 +57,7 @@ class OpenWebUILLM:
                 "max_tokens": 512,
                 "params": {"think": False, "max_tokens": 512, "temperature": 0},
                 "response_format": {"type": "json_schema", "json_schema": {
-                    "name": "instruction_selection", "schema": selection_schema.model_json_schema(),
+                    "name": "instruction_selection", "schema": selection_schema,
                 }},
             })
         started = perf_counter()

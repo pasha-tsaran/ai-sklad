@@ -81,8 +81,10 @@ def test_instruction_selection_has_a_short_structured_response_with_thinking_dis
         assert body["features"]["web_search"] is False
         assert body["max_tokens"] == 512
         assert body["params"] == {"think": False, "max_tokens": 512, "temperature": 0}
+        expected_schema = InstructionSelection.model_json_schema()
+        expected_schema["properties"]["file_id"] = {"type": "null", "default": None}
         assert body["response_format"] == {"type": "json_schema", "json_schema": {
-            "name": "instruction_selection", "schema": InstructionSelection.model_json_schema(),
+            "name": "instruction_selection", "schema": expected_schema,
         }}
         return httpx.Response(200, json={
             "choices": [{"message": {"content": '{"result":"NO_KNOWLEDGE"}'}, "finish_reason": "stop"}],
@@ -117,3 +119,25 @@ def test_response_diagnostics_failure_does_not_discard_valid_selection(monkeypat
         "choices": [{"message": {"content": '{"result":"NO_KNOWLEDGE"}'}, "finish_reason": "stop"}],
     })))
     assert model.select_instruction({"catalogue": {}, "candidates": {}}).result == "NO_KNOWLEDGE"
+
+
+def test_instruction_schema_enumerates_only_each_requests_current_catalogue_ids():
+    from app.services.rag.talk import InstructionSelection
+
+    first = "00000000-0000-4000-8000-000000000001"
+    second = "00000000-0000-4000-8000-000000000002"
+    allowed = [[first], [second]]
+    calls = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        calls.append(body)
+        field = body["response_format"]["json_schema"]["schema"]["properties"]["file_id"]
+        assert field["anyOf"] == [{"type": "string", "enum": allowed[len(calls) - 1]}, {"type": "null"}]
+        return httpx.Response(200, json={"choices": [{"message": {"content": '{"result":"NO_KNOWLEDGE"}'}}]})
+
+    model = OpenWebUILLM(settings(), httpx.MockTransport(handler))
+    for file_id in (first, second):
+        assert model.select_instruction({"catalogue": {file_id: "Описание устройства.md"}}).result == "NO_KNOWLEDGE"
+    assert len(calls) == 2
+    assert "enum" not in str(InstructionSelection.model_json_schema()["properties"]["file_id"])

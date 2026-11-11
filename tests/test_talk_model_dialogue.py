@@ -14,7 +14,7 @@ from app.services.llm.mock import MockLLM
 from app.services.nextcloud.delivery import deliver_one
 from app.services.rag.talk import TalkKnowledge
 from integrations.openwebui.approved_instruction_images import read_docx_images
-from tests.test_openwebui_instruction_images import instruction
+from tests.test_openwebui_instruction_images import instruction, png
 from tests.test_scanner_original_retrieval import scanner_provider
 from tests.test_talk_delivery import Sender
 from tests.test_talk_dialogue import assistants
@@ -157,6 +157,79 @@ def test_semantic_selection_accepts_an_indirect_phrase_without_repair_word_overl
     assert len(chat.model.calls) == 1 and not chat.model.analysis_calls
     assert result["flow"]["source"]["file_id"] == DOC
     assert any(photo for _, photo in assistants(result))
+
+
+@pytest.mark.parametrize("reread_shown_source", [False, True])
+def test_two_wifi_correction_keeps_active_tsd_task_and_selects_another_original_photo(model_chat, reread_shown_source):
+    mixed_caption = "Один принтер подключается к ТСД по Wi-Fi, второй — по Bluetooth."
+    wifi_caption = "Два принтера подключаются к одному ТСД по Wi-Fi, у каждого свой сетевой адрес."
+    mixed_name = "Подключение ТСД — Wi-Fi и Bluetooth.docx"
+    wifi_name = "Подключение ТСД — два принтера Wi-Fi.docx"
+    wifi_id = "00000000-0000-4000-8000-000000000555"
+    wifi_data = instruction([wifi_caption], image_data=png("blue"))
+    problem = "Подключить ТСД к принтеру по wi-Fi"
+    correction = "Ты показал на фото 1 принтер по блютуз, а другой по wi-fi, а у меня 2 принтера по wi-fi"
+    responses = [
+        decision("MATCH", file_id=DOC, evidence=VOLUME),
+        decision("MATCH", file_id=OTHER, evidence=mixed_caption),
+    ]
+    if reread_shown_source:
+        responses.append(decision("READ", file_id=OTHER))
+    responses.append(decision("MATCH", file_id=wifi_id, evidence=wifi_caption))
+    chat = model_chat(responses, rows=[
+        (DOC, FILENAME, instruction([VOLUME])),
+        (OTHER, mixed_name, instruction([mixed_caption])),
+        (wifi_id, wifi_name, wifi_data),
+    ])
+    chat.send(QUESTION)
+    first = chat.send(problem, 2)
+    assert first["flow"]["source"]["file_id"] == OTHER
+    second = chat.send(correction, 3)
+    assert len(chat.model.calls) == 3 + int(reread_shown_source) and not chat.model.analysis_calls
+    payload = chat.model.calls[-1]["payload"]
+    assert payload["actual_problem"] == correction
+    assert payload["context"]["current_message"] == correction
+    assert payload["context"]["active_task"] == problem
+    assert payload["context"]["shown_source"] == {"file_id": OTHER, "filename": mixed_name}
+    assert payload["context"]["technical_facts"]["subject"] == QUESTION
+    assert OTHER in payload["catalogue"] and wifi_id in payload["catalogue"]
+    assert second["flow"]["source"]["file_id"] == wifi_id
+    assert not second["flow"].get("excluded") and not second["flow"].get("escalation")
+    assert second["incident"].failed_attempts == 0 and second["incident"].pending_action is None
+    assert all(attempt.status != "FAILED" for attempt in second["attempts"])
+    replies = [(text, photo) for role, text, photo in second["messages"][len(first["messages"]):]
+               if role == "assistant"]
+    assert any(wifi_caption in text for text, _ in replies)
+    assert all(mixed_caption not in text for text, _ in replies)
+    photos = [photo for _, photo in replies if photo]
+    assert len(photos) == 1
+    assert photos[0].data == read_docx_images(wifi_data)[0].data
+    assert photos[0].caption == wifi_caption
+
+
+def test_independent_question_stays_primary_while_previous_guide_is_only_context(model_chat):
+    printer_caption = "Для подключения принтера к ТСД выберите сетевой режим Wi-Fi."
+    printer_name = "Подключение принтера к ТСД.docx"
+    message = "Как подключить принтер к ТСД по Wi-Fi?"
+    chat = model_chat([
+        decision("MATCH", file_id=DOC, evidence=VOLUME),
+        decision("MATCH", file_id=OTHER, evidence=printer_caption),
+    ], rows=[
+        (DOC, FILENAME, instruction([VOLUME])),
+        (OTHER, printer_name, instruction([printer_caption])),
+    ])
+    chat.send(QUESTION)
+    result = chat.send(message, 2)
+    payload = chat.model.calls[-1]["payload"]
+    assert payload["actual_problem"] == message
+    assert payload["context"]["current_message"] == message
+    assert payload["context"]["active_task"] == QUESTION
+    assert payload["context"]["shown_source"] == {"file_id": DOC, "filename": FILENAME}
+    assert result["flow"]["source"]["file_id"] == OTHER
+    assert len(chat.model.calls) == 2 and not chat.model.analysis_calls
+    result = chat.send("Покажи фотографию ещё раз", 3)
+    assert result["flow"]["source"]["file_id"] == OTHER
+    assert len(chat.model.calls) == 2
 
 
 def test_no_knowledge_is_a_single_model_decision_without_analysis_retry(model_chat):
