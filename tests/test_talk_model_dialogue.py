@@ -117,6 +117,25 @@ def test_real_process_one_requires_model_selection_even_for_unique_scanner_origi
     assert set(payload["candidates"]) <= set(payload["catalogue"])
 
 
+def test_caption_repeated_in_source_intro_is_sent_once_with_original_photo(model_chat):
+    caption = "Для изменения громкости сканируйте только выбранный настроечный штрихкод."
+    warning = "Перед настройкой согласуйте нужный режим с ответственным специалистом."
+    source_data = instruction([caption], extra_paragraph=f"<w:p><w:r><w:t>{warning}</w:t></w:r></w:p>")
+    chat = model_chat([decision("MATCH", file_id=DOC, evidence=caption)], rows=[(DOC, FILENAME, source_data)])
+    result = chat.send(QUESTION)
+    replies = assistants(result)
+    text = "\n\n".join(text for text, _ in replies)
+    assert text.count(caption) == 1
+    assert text.count(warning) == 1
+    photos = [photo for _, photo in replies if photo]
+    assert len(photos) == 1
+    assert photos[0].data == read_docx_images(source_data)[0].data
+    assert photos[0].caption == caption
+    assert len(chat.model.calls) == 1
+    photo_index = next(index for index, (_, photo) in enumerate(replies) if photo)
+    assert caption in replies[photo_index - 1][0]
+
+
 def test_model_clarification_then_short_answer_keeps_context_and_sends_instruction37(model_chat):
     question = "Что нужно изменить у сканера — громкость, подсветку или работу в программе?"
     chat = model_chat([decision("CLARIFY", question=question),

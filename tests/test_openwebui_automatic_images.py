@@ -1193,6 +1193,80 @@ def test_caption_only_instruction_still_has_description_before_each_photo(automa
     assert message["content"].count("![") == len(captions)
 
 
+@pytest.mark.parametrize("intro_caption", [
+    "Используйте только код тихого режима на снимке.",
+    "Используйте  только\nкод тихого режима\tна снимке.",
+])
+def test_repeated_caption_is_kept_once_next_to_photo_and_unique_warning_is_kept(automatic, intro_caption):
+    caption = "Используйте только код тихого режима на снимке."
+    warning = "Перед настройкой проверьте выбранное рабочее место."
+    doc = document(captions=[caption])
+    doc["content"] = "Настройка сигнала\n\n" + intro_caption + "\n\n" + warning + "\n\nФотографии и пояснения"
+    doc["images"][0]["file_id"] = OTHER_ID
+
+    blocks = automatic.instruction_blocks(doc, doc["images"], False)
+    assert blocks[0] == (warning, None)
+    assert blocks[1][1] is doc["images"][0] and blocks[1][0].endswith(caption)
+    assert sum(image is not None for _, image in blocks) == 1
+    text = automatic.render_steps(doc, doc["images"], False)
+    assert text.count(caption) == 1 and text.count(warning) == 1
+    assert text.index(warning) < text.index(caption) < text.index("![Иллюстрация 1]")
+
+
+def test_caption_substring_does_not_remove_the_rest_of_a_source_warning(automatic):
+    caption = "Используйте только код тихого режима на снимке."
+    compound = caption + " Не сканируйте соседние коды."
+    doc = document(captions=[caption])
+    doc["content"] = compound + "\n\nФотографии и пояснения"
+    blocks = automatic.instruction_blocks(doc, doc["images"], False)
+    assert blocks[0] == (compound, None)
+    assert blocks[1][0].endswith(caption) and blocks[1][1] is doc["images"][0]
+
+
+def test_notes_matching_an_unselected_photo_are_retained_until_that_photo_is_shown(automatic):
+    captions = ["Используйте только кнопку первой панели.", "Перед изменением проверьте вторую панель."]
+    doc = document(captions=captions)
+    doc["content"] = "\n\n".join(captions) + "\n\nФотографии и пояснения"
+    for selected, other in ((0, 1), (1, 0)):
+        blocks = automatic.instruction_blocks(doc, [doc["images"][selected]], selected == 0)
+        assert blocks[0] == (captions[other], None)
+        assert blocks[1][0].endswith(captions[selected])
+        assert blocks[1][1] is doc["images"][selected]
+        assert "\n\n".join(text for text, _ in blocks).count(captions[selected]) == 1
+
+
+@pytest.mark.parametrize("distinct_note", [
+    "Используйте только суффикс 13.",
+    "используйте только суффикс #13.",
+])
+def test_caption_deduplication_preserves_distinct_punctuation_and_case(automatic, distinct_note):
+    caption = "Используйте только суффикс #13."
+    doc = document(captions=[caption])
+    doc["content"] = distinct_note + "\n\nФотографии и пояснения"
+    blocks = automatic.instruction_blocks(doc, doc["images"], False)
+    assert blocks[0] == (distinct_note, None)
+    assert blocks[1][0].endswith(caption) and blocks[1][1] is doc["images"][0]
+
+
+def test_automatic_photo_reply_deduplicates_intro_caption_and_keeps_actions_in_order(automatic, monkeypatch):
+    caption = "Используйте только переключатель «Звук» на снимке."
+    warning = "Перед началом проверьте, что выбрано ваше устройство."
+    steps = ["Откройте панель устройства.", "Выберите нужную громкость."]
+    doc = document(captions=[caption])
+    doc["content"] = "\n\n".join([caption, warning, *(
+        f"{number}. {step}" for number, step in enumerate(steps, 1)
+    ), "Фотографии и пояснения"])
+    state = RuntimeState({DOC_ID: doc})
+    result = apply_filter(automatic, monkeypatch, state, chat_body())
+    message = result["messages"][-1]
+    text = message["content"]
+    assert text.count(caption) == 1 and text.count(warning) == 1
+    assert text.index(warning) < text.index(steps[0]) < text.index(steps[1]) < text.index(caption)
+    assert text.index(caption) < text.index("![Иллюстрация 1]")
+    assert text.count("![") == 1 and final_text(message) == text
+    assert len(image_results(automatic, message)) == 1 and len(state.presentations) == 1
+
+
 def test_acrobat_entry_steps_and_caption_precede_single_inline_photo(automatic, monkeypatch):
     caption = "На снимке выделены «Дополнительно» и «Печатать как изображение»."
     doc = document(captions=[caption])

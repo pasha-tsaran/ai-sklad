@@ -3,7 +3,7 @@ title: AI Support — фотографии к ответу автоматиче�
 author: AI Support
 description: Автоматически прикладывает фотографии утверждённой инструкции и продолжает её по шагам.
 required_open_webui_version: 0.11.0
-version: 0.6.1
+version: 0.6.2
 """
 
 # Install as an admin Function (Filter), scoped to ai-support, not as a Tool.
@@ -680,7 +680,12 @@ def procedure_image_groups(document, images):
 def instruction_blocks(document, images, has_more, clarification=False):
     """Channel-neutral source text/photo pairs; WebUI and Talk share the same words."""
     blocks = []
-    notes = _source_notes(document)
+    caption_paragraphs = {" ".join(paragraph.split()) for image in images
+                          for paragraph in image["caption"].split("\n\n")}
+    # The original caption is rendered next to its photograph. Keep distinct
+    # source conditions while omitting the same paragraph from the introduction.
+    notes = "\n\n".join(paragraph for paragraph in _source_notes(document).split("\n\n")
+                        if " ".join(paragraph.split()) not in caption_paragraphs)
     if notes:
         blocks.append((notes, None))
     groups = [[] for image in images] if clarification else procedure_image_groups(document, images)
