@@ -18,19 +18,21 @@ from app.models.talk import TalkAccount, TalkInbox, TalkRoom
 from app.schemas.contracts import AnalysisResult, DialogueResult, EscalationDetails
 from app.services.chat.audit import audit
 from app.services.chat.channel_profile import channel_profile, remember_computer
+from app.services.chat.dialogue import _OPERATION_CLAIM, _TECHNICAL_OUTPUT
 from app.services.nextcloud.progress import start_progress
 from app.services.nextcloud.interruption import (
     TERMINAL_DELIVERIES, has_unfinished_guide, is_resume_request, latest_paused, pause_due_to_input,
     record_response, resume_response,
 )
-from app.services.chat.memory import load_context, remember_resolution
+from app.services.chat.memory import _redact, load_context, remember_resolution
 from app.services.chat.messages import append_message
 from app.services.chat.policies import FORM_ACTION, MAX_ATTEMPTS, TERMINAL_STATES, direct_intent
 from app.services.chat.service import messenger
 from app.services.rag.openwebui import save_snapshot
 from app.services.rag.query import normalized_query, printer_kinds, scanner_kinds
 from app.services.rag.talk import (
-    ApprovedTalkDocument, KnowledgeUnavailable, SourceSelection, TalkKnowledge, _SELECTION_TASK,
+    ApprovedTalkDocument, INSTRUCTION_SELECTION_TASK, InstructionSelection, KnowledgeUnavailable,
+    SourceSelection, TalkKnowledge, _SELECTION_TASK,
 )
 from app.services.rag.success import SuccessfulTalkKnowledge, remember_success
 from app.services.ticketing.intake import _ordered_lines, parse_intake
@@ -691,6 +693,22 @@ def _replace_guide_context(flow):
     return {"clarification_query": context, "excluded": excluded}
 
 
+def _model_clarification(question):
+    """Only a short informational question can leave the source-selection task."""
+    if not isinstance(question, str):
+        raise KnowledgeUnavailable("InvalidClarification", "instruction_selection")
+    question = question.strip()
+    if (not 5 <= len(question) <= 300 or question.count("?") != 1 or not question.endswith("?")
+            or re.search(r"[\r\n<>]|(?:mailto:|file:|data:|javascript:|www\.)", question, re.I)
+            or _TECHNICAL_OUTPUT.search(question) or _OPERATION_CLAIM.search(question)
+            or _redact(question) != question or refusal_reply(question)
+            or re.search(r"\b(?:парол\w*|password\w*|токен\w*|api[ _-]?key|secret\w*|"
+                         r"модел\w*|маркиров\w*|шильдик\w*|производител\w*|"
+                         r"отключите|сбросьте|переустановите)\b", question, re.I)):
+        raise KnowledgeUnavailable("InvalidClarification", "instruction_selection")
+    return question
+
+
 def _support_turn(message, flow, context, llm, knowledge):
     has_guide = bool(flow.get("source"))
     if has_guide and _different_instruction(message):
@@ -702,7 +720,8 @@ def _support_turn(message, flow, context, llm, knowledge):
     next_photo = bool(photo_request and _NEXT_PHOTO.search(message))
     clarification = bool(has_guide and (_current_step_question(message) or photo_request and not next_photo))
     continuation = bool(has_guide and (_step_confirmed(message) or next_photo))
-    if not clarification and not continuation:
+    model_selection = bool(getattr(knowledge, "uses_llm_selection", False))
+    if not clarification and not continuation and not model_selection:
         if followup := _scanner_clarification(message, flow, knowledge):
             return followup
         if followup := _printer_clarification(message, flow):
@@ -731,22 +750,38 @@ def _support_turn(message, flow, context, llm, knowledge):
     else:
         problem = _problem_query(message, flow)
         excluded = flow.get("excluded", [])
-        # Retrieval has the actual report already. Avoid a generation round trip
-        # whenever an approved matching instruction can be found directly.
-        approved = knowledge.search(problem, excluded=excluded, fallback_query=problem)
-        if approved is None:
-            try:
-                analysis = AnalysisResult.model_validate(llm.analyze_context(problem, context))
-                if analysis.intent == "REQUEST_HUMAN":
-                    return Turn("HUMAN", flow={"clarification_query": problem, "excluded": excluded})
-                query = analysis.search_query or problem
-                if _normalized(query) != _normalized(problem):
-                    approved = knowledge.search(query, excluded=excluded, fallback_query=problem)
-            except KnowledgeUnavailable:
-                raise
-            except Exception:
-                # Generated repair advice is never required for source-based replies.
-                analysis = None
+        if model_selection:
+            selection_context = {**context, "current_message": message,
+                                 "previous_question": flow.get("clarification_question", "")}
+            decision = knowledge.search_with_llm(problem, context=selection_context,
+                                                 excluded=excluded, fallback_query=problem)
+            if decision.result == "CLARIFY":
+                question = _model_clarification(decision.question)
+                return Turn("REPLY", [(question, None)], flow={
+                    "clarification_query": problem, "clarification_keys": ["MODEL"],
+                    "clarification_question": question, "excluded": excluded,
+                })
+            if decision.result == "NO_KNOWLEDGE":
+                return Turn("NO_KNOWLEDGE", flow={"clarification_query": problem,
+                                                  "clarification_keys": flow.get("clarification_keys", []),
+                                                  "excluded": excluded})
+            if decision.result != "MATCH" or decision.approved is None:
+                raise KnowledgeUnavailable("InvalidInstructionDecision", "instruction_selection")
+            approved = decision.approved
+        else:
+            approved = knowledge.search(problem, excluded=excluded, fallback_query=problem)
+            if approved is None:
+                try:
+                    analysis = AnalysisResult.model_validate(llm.analyze_context(problem, context))
+                    if analysis.intent == "REQUEST_HUMAN":
+                        return Turn("HUMAN", flow={"clarification_query": problem, "excluded": excluded})
+                    query = analysis.search_query or problem
+                    if _normalized(query) != _normalized(problem):
+                        approved = knowledge.search(query, excluded=excluded, fallback_query=problem)
+                except KnowledgeUnavailable:
+                    raise
+                except Exception:
+                    analysis = None
         if approved is None:
             asked = flow.get("clarification_keys", [])
             if followup := _analysis_clarification(analysis, problem, flow):
@@ -1258,6 +1293,10 @@ def process_one(factory, settings, llm, knowledge=None, *, account_id=None):
         def select_source(payload):
             with _measure(metadata, "model_api"):
                 call = getattr(llm, "_call", None)
+                if settings.llm_backend == "openwebui":
+                    if not callable(call):
+                        raise KnowledgeUnavailable("ModelUnavailable", "instruction_selection")
+                    return call(InstructionSelection, INSTRUCTION_SELECTION_TASK, payload)
                 return call(SourceSelection, _SELECTION_TASK, payload) if callable(call) else {"file_id": None}
 
         cached_knowledge = SuccessfulTalkKnowledge(
@@ -1265,7 +1304,8 @@ def process_one(factory, settings, llm, knowledge=None, *, account_id=None):
             claimed["principal"], claimed["context"],
         )
         timed_knowledge = _TimedProxy(cached_knowledge, metadata,
-                                      {"search": "search", "read": "read", "is_current": "verify"})
+                                      {"search": "search", "search_with_llm": "search",
+                                       "read": "read", "is_current": "verify"})
         with _measure(metadata, "route"):
             paused = None
             if is_resume_request(claimed["message"]) and not claimed["media"]:

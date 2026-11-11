@@ -106,6 +106,10 @@ class SuccessfulTalkKnowledge:
         self.principal, self.context = principal, context
         self.last_cache_key, self.cache_hit = None, False
 
+    @property
+    def uses_llm_selection(self):
+        return bool(getattr(self.delegate, "uses_llm_selection", False))
+
     def _forget(self, key):
         with self.factory() as session, session.begin():
             row = session.scalar(select(SuccessfulRetrieval).filter_by(user_id=self.principal, **key))
@@ -145,6 +149,33 @@ class SuccessfulTalkKnowledge:
                     pass
                 self._forget(self.last_cache_key)
         return self.delegate.search(query, excluded=excluded, fallback_query=fallback_query)
+
+    def search_with_llm(self, query, context=None, excluded=(), fallback_query=None):
+        """A previous success can nominate a source for the model to check again."""
+        problem = fallback_query if isinstance(fallback_query, str) and fallback_query.strip() else query
+        self.last_cache_key = cache_key(self.settings, problem, self.context)
+        self.cache_hit = False
+        selection_context = dict(context or self.context)
+        verified = None
+        if self.last_cache_key:
+            source = self._lookup(self.last_cache_key, excluded)
+            if source:
+                try:
+                    approved = self.delegate.read(source["file_id"])
+                except KnowledgeUnavailable:
+                    approved = None
+                if approved is not None and approved.document["source"] == source:
+                    verified = source
+                    selection_context["verified_previous_source"] = {
+                        "file_id": source["file_id"], "sha256": source["sha256"],
+                    }
+                else:
+                    self._forget(self.last_cache_key)
+        decision = self.delegate.search_with_llm(query, context=selection_context,
+                                                 excluded=excluded, fallback_query=fallback_query)
+        self.cache_hit = bool(verified and decision.approved is not None
+                              and decision.approved.document["source"] == verified)
+        return decision
 
     def read(self, file_id):
         return self.delegate.read(file_id)
