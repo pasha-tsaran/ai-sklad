@@ -11,6 +11,7 @@ from sqlalchemy.orm import aliased
 from app.models import Conversation, Delivery, Incident, Message, MessageAttachment, TalkAccount, TalkRoom
 from app.services.chat.messages import append_message
 from app.services.nextcloud.interruption import TERMINAL_DELIVERIES, pause_due_to_input
+from integrations.openwebui.approved_instruction_images import is_withdrawn_source_filename
 
 
 def split_text(content, limit=32_000):
@@ -241,6 +242,14 @@ def deliver_one(factory, settings, client=None):
         blocked = set()
         delivery = None
         for row in rows:
+            if row.status == "PENDING" and is_withdrawn_source_filename((row.provenance or {}).get("filename")):
+                cancelled = session.execute(update(Delivery).where(
+                    Delivery.id == row.id, Delivery.status == "PENDING",
+                ).values(status="CANCELLED", error_code="WithdrawnInstruction"))
+                if cancelled.rowcount == 1:
+                    session.get(Message, row.message_id).delivery_status = "CANCELLED"
+                else:
+                    session.refresh(row)
             if current_account_id and row.status == "PENDING":
                 bound_room = session.scalar(select(TalkRoom).where(
                     TalkRoom.account_id == current_account_id, TalkRoom.room_token == row.room_token,

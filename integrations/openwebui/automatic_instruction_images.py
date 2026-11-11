@@ -3,7 +3,7 @@ title: AI Support — фотографии к ответу автоматиче�
 author: AI Support
 description: Автоматически прикладывает фотографии утверждённой инструкции и продолжает её по шагам.
 required_open_webui_version: 0.11.0
-version: 0.6.0
+version: 0.6.1
 """
 
 # Install as an admin Function (Filter), scoped to ai-support, not as a Tool.
@@ -13,6 +13,7 @@ import json
 import logging
 import math
 import re
+import unicodedata
 from contextlib import contextmanager
 from time import perf_counter
 from typing import Literal
@@ -330,9 +331,30 @@ def is_side_dialogue(message):
                for name, _, result in tool_results(message))
 
 
+def is_withdrawn_source_filename(filename):
+    if not isinstance(filename, str):
+        return False
+    normalized = unicodedata.normalize("NFKC", filename).casefold().replace("ё", "е").strip()
+    canonical = " ".join(re.findall(r"[a-zа-я0-9]+", normalized))
+    return canonical == "33 сканер штрихкодов в базе адрес docx"
+
+
+def allowed_source_filename(filename):
+    """Standalone copy of the tool's source policy; prefixes do not grant or deny access."""
+    if not isinstance(filename, str) or not filename.strip():
+        return False
+    normalized = unicodedata.normalize("NFKC", filename).casefold().replace("ё", "е").strip()
+    return (normalized.endswith((".docx", ".xlsx", ".md", ".txt", ".pdf"))
+            and not is_withdrawn_source_filename(normalized))
+
+
 def _allowed_file(file_id, filename):
-    return (_uuid(file_id) and isinstance(filename, str) and bool(filename.strip())
-            and not filename.casefold().startswith(("ит_", "справочник_")))
+    return _uuid(file_id) and allowed_source_filename(filename)
+
+
+def _allowed_result(result):
+    source = result.get("source") if isinstance(result, dict) else None
+    return isinstance(source, dict) and _allowed_file(source.get("file_id"), source.get("filename"))
 
 
 def selected_source(message):
@@ -392,6 +414,9 @@ _QUERY_NOISE = {
 def search_terms(text):
     terms = set()
     for word in _normal(text).split():
+        if word == "шк":
+            terms.add("штрих")
+            continue
         if word in _QUERY_NOISE or word.isdigit() or (len(word) < 3 and word != "1с"):
             continue
         if word.startswith(("изображ", "картин", "рисунк")):
@@ -401,6 +426,42 @@ def search_terms(text):
         else:
             terms.add(word[:5])
     return terms
+
+
+def equipment_type_question(query):
+    """Resolve the device type and goal before a broad word match can choose a guide."""
+    text = _normal(query)
+    scanner = bool(re.search(r"\b(?:сканер\w*|штрих\w*|шк)\b", text))
+    barcode = bool(re.search(r"\b(?:штрих\w*|шк|barcode)\b", text))
+    document = bool(re.search(r"\b(?:документ\w*|планшетн\w*|мфу)\b", text))
+    if scanner and not barcode and not document and not re.search(r"\b(?:1с|адрес)\b", text):
+        return "Вы имеете в виду сканер штрихкодов или сканер документов (планшетный)?"
+    specific = re.search(
+        r"\b(?:1с|адрес|громк\w*|звук\w*|сигнал\w*|подсвет\w*|ярк\w*|луч|суффикс\w*|"
+        r"префикс\w*|раскладк\w*|кодировк\w*|базов\w*|обязательн\w*|"
+        r"не\s+(?:читает|считывает|сканирует|передает)|ошибк\w*)\b", text,
+    )
+    if scanner and barcode and not specific:
+        return "Что именно нужно настроить или что происходит при считывании штрихкода?"
+    printer = bool(re.search(r"\b(?:принтер\w*|термопринтер\w*)\b", text))
+    if (re.search(r"\bтермопринтер\w*\b", text)
+            and not re.search(r"\b(?:стационарн\w*|мобильн\w*)\b", text)):
+        return "Это стационарный термопринтер или мобильный термопринтер?"
+    printer_kind = re.search(r"\b(?:а4|a4|документ\w*|acrobat|pdf|термопринтер\w*|"
+                             r"этикет\w*|мобильн\w*|стационарн\w*)\b", text)
+    if printer and not printer_kind:
+        return "Это принтер документов А4, стационарный термопринтер или мобильный термопринтер?"
+    return None
+
+
+def _purpose_covered(query, text):
+    problem, content = _normal(query), _normal(text)
+    groups = (
+        (r"\b(?:громк\w*|звук\w*|пищ\w*|писк\w*|beep\w*|volume)\b",
+         r"\b(?:громк\w*|звук\w*|сигнал\w*|пищ\w*|писк\w*|beep\w*|volume)\b"),
+        (r"\b(?:подсвет\w*|ярк\w*|луч)\b", r"\b(?:подсвет\w*|ярк\w*|луч|illumination|brightness)\b"),
+    )
+    return all(not re.search(wanted, problem) or re.search(evidence, content) for wanted, evidence in groups)
 
 
 def choose_search_source(query, chunks):
@@ -415,13 +476,16 @@ def choose_search_source(query, chunks):
         file_id, filename = chunk.get("file_id"), chunk.get("source")
         if not _allowed_file(file_id, filename):
             continue
-        entry = grouped.setdefault(file_id, {"title": set(), "content": set()})
+        entry = grouped.setdefault(file_id, {"title": set(), "content": set(), "text": []})
         entry["title"].update(search_terms(filename))
         entry["content"].update(search_terms(str(chunk.get("content", ""))[:50_000]))
+        entry["text"].append(filename + "\n" + str(chunk.get("content", ""))[:50_000])
     ranked = []
     for file_id, entry in grouped.items():
         title_hits, content_hits = terms & entry["title"], terms & entry["content"]
-        if not title_hits or len(title_hits | content_hits) < 2:
+        hits = title_hits | content_hits
+        if (len(hits) < 2 or not hits.difference({"скане", "штрих", "принт", "печат", "подкл", "настр"})
+                or not _purpose_covered(query, "\n".join(entry["text"]))):
             continue
         ranked.append((len(title_hits) * 3 + len(content_hits), file_id))
     ranked.sort(reverse=True)
@@ -461,7 +525,12 @@ def problem_query(messages, user_entries):
         return text
     # A short answer to the immediately preceding clarification belongs to that
     # question, not to an arbitrary older incident in this chat.
-    if len(_normal(text).split()) <= 4 and len(user_entries) >= 2:
+    normalized = _normal(text)
+    type_answer = (len(normalized.split()) <= 12
+                   and bool(re.search(r"\b(?:сканер\w*|термопринтер\w*|принтер\w*|планшетн\w*)\b", normalized))
+                   and not re.search(r"\b(?:как|почему|где|нужн\w*|хочу|настро\w*|подключ\w*|"
+                                     r"другой|другая|не\s+работает)\b", normalized))
+    if (len(normalized.split()) <= 4 or type_answer) and len(user_entries) >= 2:
         previous_index, previous = next(((i, messages[i]) for i in range(index - 1, -1, -1)
                                          if messages[i].get("role") == "assistant"
                                          and not is_side_dialogue(messages[i])), (0, {}))
@@ -759,7 +828,7 @@ def _finish_timings(body, metadata, outlet_started, native_timings, show):
     pipeline_ms = (_milliseconds((outlet_started - inlet_end) * 1000)
                    if type(inlet_end) in {int, float} and outlet_started is not None else None)
     inlet_ms = _milliseconds(state.get("inlet_ms"))
-    report = {"version": "0.6.0", "route": state.get("route", "support"),
+    report = {"version": "0.6.1", "route": state.get("route", "support"),
               "inlet_ms": inlet_ms, "pipeline_ms": pipeline_ms, "outlet_ms": outlet_ms,
               "total_ms": round(inlet_ms + pipeline_ms + outlet_ms, 3)
               if all(value is not None for value in (inlet_ms, pipeline_ms, outlet_ms)) else None,
@@ -798,11 +867,27 @@ def neutral_response(body, index, text):
 
 def limit_clarifications(body, index):
     text = body["messages"][index].get("content", "")
-    if not isinstance(text, str) or text.count("?") <= 1:
+    if not isinstance(text, str) or "?" not in text:
         return body
     # Limit question-only replies. Never cut procedural steps, quoted warnings or
     # code to obtain a shorter answer; source rendering below handles procedures.
     if re.search(r"(?m)^\s*\d+[.)]\s|```|(?:нажмите|откройте|выберите|введите|удалите|снимите)", text.casefold()):
+        return body
+    if re.search(r"\b(?:модел\w*|марк\w*)\b", text.casefold()):
+        users = [(i, item) for i, item in enumerate(body["messages"][:index]) if item.get("role") == "user"]
+        problem = _normal(problem_query(body["messages"], users)) if users else ""
+        if re.search(r"\b(?:сканер\w*|штрих\w*|шк)\b", problem):
+            question = ("Что именно нужно изменить или что происходит при считывании штрихкода?"
+                        if re.search(r"\b(?:штрих\w*|шк)\b", problem) else
+                        "Вы имеете в виду сканер штрихкодов или сканер документов (планшетный)?")
+        elif re.search(r"\b(?:принтер\w*|термопринтер\w*|печат\w*)\b", problem):
+            question = ("Что именно нужно настроить или что происходит при печати?"
+                        if re.search(r"\b(?:термопринтер\w*|мобильн\w*|стационарн\w*|а4|a4)\b", problem) else
+                        "Это принтер документов А4, стационарный термопринтер или мобильный термопринтер?")
+        else:
+            question = "Какой тип оборудования вы имеете в виду?"
+        return neutral_response(body, index, question)
+    if text.count("?") <= 1:
         return body
     return neutral_response(body, index, text.split("?", 1)[0].rstrip() + "?")
 
@@ -860,7 +945,8 @@ class _Runtime:
 
     async def read(self, file_id):
         result = _json(await self.read_tool["callable"](file_id=file_id))
-        if isinstance(result, dict) and result.get("source", {}).get("knowledge_id") in self.allowed_knowledge_ids:
+        if (_allowed_result(result)
+                and result.get("source", {}).get("knowledge_id") in self.allowed_knowledge_ids):
             return result
         return {"status": "error", "code": "unapproved_collection"}
 
@@ -913,7 +999,7 @@ class _Runtime:
             arguments["__allow_continuation__"] = True
         result = _json(await self.image_tool["callable"](**arguments))
         if (isinstance(result, dict) and (result.get("displayed") is not True
-                or result.get("source", {}).get("knowledge_id") in self.allowed_knowledge_ids)):
+                or _allowed_result(result) and result.get("source", {}).get("knowledge_id") in self.allowed_knowledge_ids)):
             return result
         return {"status": "error", "displayed": False, "code": "unapproved_collection"}
 
@@ -932,7 +1018,7 @@ class _Runtime:
                 attached.add(match.group(1))
         source = result.get("source", {})
         images = result.get("images", [])
-        if (not images or len(images) > 6 or not _uuid(source.get("file_id"))
+        if (not images or len(images) > 6 or not _allowed_result(result)
                 or source.get("knowledge_id") not in self.allowed_knowledge_ids):
             return False
         for image in images:
@@ -1242,7 +1328,7 @@ class Filter:
                     # A duplicate old completed endpoint may omit tools. Keep an
                     # already processed delivery only if private PNG proof survives.
                     for name, _, result in tool_results(messages[current_index]):
-                        if (name == IMAGE_TOOL and isinstance(result, dict)
+                        if (name == IMAGE_TOOL and _allowed_result(result)
                                 and result.get("_ai_support_flow", {}).get("processed")
                                 and await _timed(metadata, "verify", runtime.verify(messages[current_index], result))):
                             return body
@@ -1256,7 +1342,7 @@ class Filter:
             existing = None
             # Render a real manual delivery once; repeated outlet runs do not upload/render twice.
             for name, arguments, result in tool_results(current):
-                if (name == IMAGE_TOOL and isinstance(result, dict) and result.get("displayed") is True
+                if (name == IMAGE_TOOL and _allowed_result(result) and result.get("displayed") is True
                         and await _timed(metadata, "verify", runtime.verify(current, result))):
                     if (result.get("_ai_support_flow", {}).get("processed")
                             and result.get("_ai_support_flow", {}).get("layout") == "inline"):
@@ -1264,6 +1350,9 @@ class Filter:
                     existing = (arguments, result)
                     break
                 if name == IMAGE_TOOL and isinstance(result, dict) and result.get("status") == "delivery_unknown":
+                    if is_withdrawn_source_filename(result.get("source", {}).get("filename")):
+                        return neutral_response(body, current_index,
+                                                "Эта инструкция исключена из базы знаний. Опишите текущую задачу, чтобы найти актуальный материал.")
                     return body
             dialogue_checked = not keep_current and not existing and not requires_support(user_text)
             if dialogue_checked:
@@ -1278,6 +1367,9 @@ class Filter:
                         record_call(updated["messages"][current_index], DIALOGUE_TOOL, {}, {"route": routed["route"]})
                         return updated
             query = problem_query(messages, user_entries)
+            question = equipment_type_question(query) if not keep_current and not existing else None
+            if question:
+                return neutral_response(body, current_index, question)
             if not keep_current and not search_terms(query) and not has_technical_actions(current.get("content", "")):
                 if dialogue_checked:
                     _owned_timing(metadata, "social")
@@ -1296,7 +1388,7 @@ class Filter:
                 if is_side_dialogue(message):
                     continue
                 for name, arguments, result in reversed(list(tool_results(message))):
-                    if (name == IMAGE_TOOL and isinstance(result, dict) and result.get("displayed") is True
+                    if (name == IMAGE_TOOL and _allowed_result(result) and result.get("displayed") is True
                             and await _timed(metadata, "verify", runtime.verify(message, result))):
                         previous = (message, arguments, result)
                         break
@@ -1343,13 +1435,16 @@ class Filter:
                                 {"query": query, "count": 8}, search_trace)
                     return updated
             document = await _timed(metadata, "read", runtime.read(file_id))
-            if (not isinstance(document, dict) or document.get("status") != "ready"
+            if (not _allowed_result(document) or document.get("status") != "ready"
                     or document.get("source", {}).get("file_id") != file_id):
                 if pinned or existing:
                     return neutral_response(body, current_index,
                                             "Не удалось проверить текущую инструкцию. Я не могу заменить её другой процедурой без подтверждённых сведений.")
                 completion = "Не удалось прочитать утверждённую инструкцию"
                 return missing_source_reply(body, current_index, unavailable=True)
+            if not _purpose_covered(query, document["source"]["filename"] + "\n" + document.get("content", "")):
+                completion = "Подходящая инструкция не найдена"
+                return missing_source_reply(body, current_index)
             old_hash = previous[2].get("source", {}).get("sha256") if pinned else None
             if old_hash and document["source"].get("sha256") != old_hash:
                 text = "Инструкция изменилась. Не могу продолжить прежнюю последовательность без проверки актуального документа."
@@ -1405,7 +1500,7 @@ class Filter:
                                 else "Текст инструкции доступен, но изображение сейчас получить не удалось."))
                 return updated
             source_images = {image["number"]: image["caption"] for image in document.get("images", [])}
-            if (result.get("source", {}).get("file_id") != file_id
+            if (not _allowed_result(result) or result.get("source", {}).get("file_id") != file_id
                     or result.get("source", {}).get("sha256") != document["source"].get("sha256")
                     or not result.get("images")
                     or any(source_images.get(image.get("number")) != image.get("caption")

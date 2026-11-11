@@ -97,13 +97,15 @@ def test_rejects_unexplained_or_external_pictures(data):
         read_docx(data)
 
 
-def test_original_size_revocation_and_admin_scope():
+def test_original_size_revocation_and_withdrawn_source():
     data = docx()
     with pytest.raises(ValueError, match="too large"):
         OpenWebUIKnowledge(remote_settings(knowledge_max_file_bytes=1000),
                            document_transport(data + b"a" * 2000)).search("PDF", set())
     assert OpenWebUIKnowledge(remote_settings(), document_transport(data, revoke=True)).search("PDF", set()) == []
-    assert OpenWebUIKnowledge(remote_settings(), document_transport(data, "ИТ_прошивка.docx")).search("PDF", set()) == []
+    assert OpenWebUIKnowledge(remote_settings(), document_transport(
+        data, "33_Сканер штрихкодов в базе АДРЕС.docx",
+    )).search("PDF", set()) == []
 
 
 def test_xlsx_rows_keep_cell_values_and_reject_formulas():

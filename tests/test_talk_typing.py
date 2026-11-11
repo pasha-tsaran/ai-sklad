@@ -475,9 +475,38 @@ def test_close_timeout_includes_wait_for_inflight_lock_and_never_allows_restart(
 
 
 def test_blocked_hpb_write_times_out_aborts_own_socket_and_cannot_send_late_typing(native, monkeypatch):
+    import app.services.nextcloud.typing as typing
+
     server, socket, client = native
     server.mode = "external"
-    aborted, writer_finished = threading.Event(), threading.Event()
+    aborted, writer_entered, writer_finished = threading.Event(), threading.Event(), threading.Event()
+    completion_waits = []
+    real_event = threading.Event
+
+    class ObservedEvent:
+        def __init__(self):
+            self.event = real_event()
+
+        def __getattr__(self, name):
+            return getattr(self.event, name)
+
+        def wait(self, timeout=None):
+            if timeout is None:  # Thread.start() waits on its own startup event.
+                return self.event.wait(timeout)
+            assert writer_entered.wait(timeout=2)
+            result = self.event.wait(timeout)
+            completion_waits.append((timeout, result))
+            return result
+
+    original_frame = typing._Session.frame
+
+    def observe_completion_wait(session, value):
+        if value.get("type") != "message":
+            return original_frame(session, value)
+        with monkeypatch.context() as frame_patch:
+            frame_patch.setattr(typing.threading, "Event", ObservedEvent)
+            return original_frame(session, value)
+
     class RawSocket:
         def shutdown(self, how):
             aborted.set()
@@ -489,15 +518,16 @@ def test_blocked_hpb_write_times_out_aborts_own_socket_and_cannot_send_late_typi
     def blocked(raw):
         frame = json.loads(raw)
         if frame.get("type") == "message":
+            writer_entered.set()
             assert aborted.wait(timeout=1)
             writer_finished.set()
             raise OSError("owned socket interrupted")
         original(raw)
     monkeypatch.setattr(socket, "send", blocked)
+    monkeypatch.setattr(typing._Session, "frame", observe_completion_wait)
     monkeypatch.setattr("app.services.nextcloud.typing.WS_SEND_TIMEOUT", 0.02)
-    started = time.monotonic()
     assert not client.set_typing(ROOM, expected_employee=EMPLOYEE, active=True)
-    assert time.monotonic() - started < 0.8
+    assert completion_waits == [(0.02, False)]
     assert aborted.is_set() and writer_finished.wait(timeout=1)
     assert not any(frame.get("type") == "message" for frame in socket.sent)
     assert socket.closed and not client._sessions and not server.sessions

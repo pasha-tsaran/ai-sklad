@@ -84,12 +84,12 @@ def citation(file_id=DOC_ID, filename="33_Supermag — операции.docx"):
 
 SCANNER_QUERY = "В 1С адрес сканера неверный. Как настроить адрес сканера?"
 SCANNER_FILENAME = "33_1С — адрес сканера.docx"
-OBSERVED_SCANNER_ID = "6f768431-86be-4a8e-8cb8-72154d80735a"
+OBSERVED_SCANNER_ID = "00000000-0000-4000-8000-000000000034"
 SCANNER_SETUP_REQUEST = (
     "Работаю в 1С АДРЕС версии 1.0.53. Нужно настроить сканер штрихкодов для моего рабочего места. "
     "Драйвер уже установлен. Я плохо разбираюсь в настройках. С чего начать?"
 )
-SCANNER_SETUP_FILENAME = "33_Сканер штрихкодов в базе АДРЕС.docx"
+SCANNER_SETUP_FILENAME = "34_Настройка сканера штрихкодов в 1С.docx"
 
 
 def search_chunk(file_id=DOC_ID, filename=SCANNER_FILENAME, content=None, **extra):
@@ -412,12 +412,12 @@ def test_failed_fallback_never_leaves_hallucinated_technical_steps(automatic, mo
 
 
 @pytest.mark.parametrize("chunk", [
-    search_chunk(filename="ИТ_1С — адрес сканера.docx"),
-    search_chunk(filename="СПРАВОЧНИК_1С — адрес сканера.docx"),
+    search_chunk(filename="33_Сканер штрихкодов в базе АДРЕС.docx"),
+    search_chunk(filename="Неподдерживаемый файл.exe"),
     search_chunk(file_id="not-a-file-uuid"),
     search_chunk(type="external"),
 ])
-def test_fallback_rejects_staff_only_external_and_invalid_sources(automatic, monkeypatch, chunk):
+def test_fallback_rejects_withdrawn_external_unsupported_and_invalid_sources(automatic, monkeypatch, chunk):
     state = RuntimeState()
     state.search_result = {"status": "ok", "chunks": [chunk]}
     body = chat_body(messages=[{"id": "user-1", "role": "user", "content": SCANNER_QUERY},
@@ -571,11 +571,12 @@ def test_one_cited_document_is_selected_from_multiple_search_sources(automatic, 
 
 
 @pytest.mark.parametrize("filename", ["ИТ_настройка.docx", "СПРАВОЧНИК_администрирование.docx"])
-def test_staff_only_sources_are_not_automatically_displayed(automatic, monkeypatch, filename):
-    state = RuntimeState()
+def test_approved_sources_with_technical_prefixes_are_displayed(automatic, monkeypatch, filename):
+    state = RuntimeState({DOC_ID: document(filename=filename)})
     original = chat_body(answer(filename=filename))
-    assert_no_unverified_steps(apply_filter(automatic, monkeypatch, state, original), original)
-    assert not state.reads and not state.shows
+    result = apply_filter(automatic, monkeypatch, state, original)
+    assert state.reads == [DOC_ID] and state.shows[0][0] == DOC_ID
+    assert "Фотографии" not in result["messages"][-1]["content"]
 
 
 @pytest.mark.parametrize("filename", ["Инструкция.md", "Справочник.xlsx", "Инструкция.pdf"])
@@ -863,7 +864,7 @@ def test_question_only_reply_without_source_is_limited_to_one_clarification(auto
     current = answer(read=False, content="Какая у вас модель принтера? Как подключён принтер?")
     result = apply_filter(automatic, monkeypatch, state, chat_body(current))
     message = result["messages"][-1]
-    assert message["content"] == "Какая у вас модель принтера?"
+    assert message["content"] == "Какой тип оборудования вы имеете в виду?"
     assert final_text(message) == message["content"]
     assert not state.reads and not state.shows
 
@@ -1479,7 +1480,7 @@ def test_explicit_foreign_knowledge_request_finishes_without_authorizing_or_sear
     "Нужно настроить сканер штрихкодов в базе АДРЕС. Драйвер установлен.",
     "В Adobe Acrobat Reader PDF печатается без изображений. Остальные документы печатаются нормально.",
     "Не ищи в других базах знаний. Помоги настроить сканер в 1С АДРЕС.",
-    "Используй только базу «AI Support (склад) — инструкции 1 линии технической поддержки». Настрой сканер.",
+    "Используй только базу «AI Support (склад) — инструкции 1 линии технической поддержки». Настрой сканер штрихкодов в 1С.",
 ])
 def test_scoped_technical_requests_keep_the_existing_text_and_original_photo_response(
         automatic, monkeypatch, user_text):

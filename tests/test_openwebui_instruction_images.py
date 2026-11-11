@@ -12,7 +12,7 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from uuid import UUID
 from xml.sax.saxutils import escape
-from zipfile import ZIP_DEFLATED, ZipFile
+from zipfile import ZIP_DEFLATED, ZipFile, ZipInfo
 
 import pytest
 from PIL import Image, PngImagePlugin
@@ -50,7 +50,10 @@ def office(parts):
     result = io.BytesIO()
     with ZipFile(result, "w", ZIP_DEFLATED) as archive:
         for path, content in parts.items():
-            archive.writestr(path, content)
+            # Identical instruction fixtures must keep the same source hash
+            # even when two operations cross the ZIP clock's two-second tick.
+            entry = ZipInfo(path, date_time=(2026, 1, 1, 0, 0, 0))
+            archive.writestr(entry, content, compress_type=ZIP_DEFLATED)
     return result.getvalue()
 
 
@@ -661,10 +664,10 @@ def test_forged_admin_role_from_tool_context_is_not_trusted(image_tool, monkeypa
 
 
 @pytest.mark.parametrize("filename", ["ИТ_прошивка.docx", "СПРАВОЧНИК_администрирование.docx"])
-def test_staff_only_documents_are_excluded(image_tool, monkeypatch, filename):
+def test_filename_prefix_does_not_override_approved_collection_access(image_tool, monkeypatch, filename):
     source_store(image_tool, monkeypatch, filename=filename)
-    with pytest.raises(image_tool.ToolError):
-        run(image_tool._OpenWebUI().source(SOURCE_ID, "employee", [KNOWLEDGE_ID]))
+    selected = run(image_tool._OpenWebUI().source(SOURCE_ID, "employee", [KNOWLEDGE_ID]))
+    assert selected.file.filename == filename and selected.knowledge_id == KNOWLEDGE_ID
 
 
 def test_collection_uuid_does_not_substitute_for_file_uuid(image_tool, monkeypatch):
@@ -836,8 +839,7 @@ def test_reader_uses_complete_server_extracted_text_for_approved_non_docx(image_
 
 @pytest.mark.parametrize("content,code", [
     (None, "unavailable_text"), ("", "unavailable_text"), ("x" * 200001, "text_too_large"),
-    ("Только для ИТ. Установка системного драйвера.", "restricted_instruction"),
-], ids=["missing", "empty", "too-large", "restricted"])
+], ids=["missing", "empty", "too-large"])
 def test_non_docx_reader_never_invents_or_truncates_unavailable_text(image_tool, monkeypatch, content, code):
     runtime = FakeRuntime(image_tool)
     runtime.file.filename = "Инструкция.md"
@@ -960,12 +962,15 @@ def test_search_forces_approved_scope_and_filters_foreign_results_even_for_admin
     assert type(elapsed) in {int, float} and math.isfinite(elapsed) and 0 <= elapsed <= 3_600_000
     assert result == {"status": "ok", "knowledge_ids": [KNOWLEDGE_ID], "chunks": [
         {"content": "Разрешённый результат.", "source": "Сканер.docx", "file_id": SOURCE_ID},
+        {"content": "INTERNAL_KNOWLEDGE_CANARY", "source": "ИТ_Администратору.docx",
+         "file_id": "00000000-0000-4000-8000-000000000098"},
     ]}
     assert state.queries[0]["__model_knowledge__"] == [{"type": "collection", "id": KNOWLEDGE_ID}]
     assert state.queries[0]["knowledge_ids"] == [KNOWLEDGE_ID]
     assert state.queries[0]["__user__"] == {"id": "employee", "role": role}
     assert state.queries[0]["count"] == 8 and state.queries[0]["__request__"] is request
-    assert "CANARY" not in json.dumps(result)
+    assert "FOREIGN_KNOWLEDGE_CANARY" not in json.dumps(result)
+    assert "NOTE_KNOWLEDGE_CANARY" not in json.dumps(result)
 
 
 @pytest.mark.parametrize("case", ["missing_collection", "no_permission", "pending_user"])

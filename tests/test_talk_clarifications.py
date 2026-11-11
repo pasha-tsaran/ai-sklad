@@ -100,7 +100,7 @@ def test_named_volume_task_is_specific_and_does_not_trigger_generic_scanner_ques
     assert not model.calls
 
 
-def test_kind_question_mentions_only_models_from_approved_barcode_inventory(talk):
+def test_kind_question_asks_type_without_turning_catalogue_models_into_requirements(talk):
     class CatalogKnowledge(Knowledge):
         def scanner_context(self):
             return {"status": "ok", "sources": [
@@ -112,12 +112,13 @@ def test_kind_question_mentions_only_models_from_approved_barcode_inventory(talk
     talk.incoming("Не работает сканер")
     talk.process(knowledge, model)
     reply = assistants(talk.snapshot())[-1][0]
-    assert "Zebra DS2208" in reply
+    assert "сканер штрихкодов" in reply and "сканер документов" in reply
+    assert "Zebra DS2208" not in reply and "модел" not in reply.casefold()
     assert "Hallucinated" not in reply and "HP ScanJet" not in reply
     assert not knowledge.searches and not model.calls
 
 
-def test_goal_question_can_name_program_from_approved_scanner_inventory(talk):
+def test_goal_question_includes_settings_without_assuming_a_program(talk):
     class CatalogKnowledge(Knowledge):
         def scanner_context(self):
             return {"status": "ok", "sources": [
@@ -127,7 +128,8 @@ def test_goal_question_can_name_program_from_approved_scanner_inventory(talk):
     knowledge, model = CatalogKnowledge(), NoGeneration()
     talk.incoming("Настройка сканера ШК")
     talk.process(knowledge, model)
-    assert "1С АДРЕС" in assistants(talk.snapshot())[-1][0]
+    reply = assistants(talk.snapshot())[-1][0]
+    assert "1С АДРЕС" not in reply and "громкость" in reply and "подсветку" in reply
     assert not knowledge.searches and not model.calls
 
 
@@ -173,7 +175,7 @@ def test_new_printer_question_does_not_inherit_unanswered_scanner_clarification(
     assert len(talk.snapshot()["attempts"]) == 1 and not model.calls
 
 
-def test_one_clarification_turn_reads_equipment_inventory_only_once(talk):
+def test_plain_type_question_needs_no_equipment_catalogue_request(talk):
     class CatalogKnowledge(Knowledge):
         inventories = 0
 
@@ -186,4 +188,4 @@ def test_one_clarification_turn_reads_equipment_inventory_only_once(talk):
     knowledge = CatalogKnowledge()
     talk.incoming("Не работает сканер")
     talk.process(knowledge, NoGeneration())
-    assert knowledge.inventories == 1
+    assert knowledge.inventories == 0

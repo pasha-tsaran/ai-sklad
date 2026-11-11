@@ -38,7 +38,7 @@ def approved(count=8, file_id=DOC):
     text = "Перед началом закройте незавершённую операцию.\n\n" + "\n\n".join(
         f"{i}. Выберите панель {label}." for i, label in enumerate(labels[:count], 1)
     ) + "\n\nФотографии и пояснения"
-    source = {"file_id": file_id, "filename": "33_Сканер штрихкодов в базе АДРЕС.docx", "knowledge_id": KB,
+    source = {"file_id": file_id, "filename": "34_Тестовая инструкция сканера штрихкодов.docx", "knowledge_id": KB,
               "sha256": hashlib.sha256(text.encode()).hexdigest()}
     pictures = {image["number"]: Illustration(f"illustration-{image['number']:02d}.png", image["caption"], "image/png",
                                               png("red" if image["number"] % 2 else "blue")) for image in images}
@@ -503,7 +503,7 @@ def test_factual_clarification_is_not_repeated_or_used_to_spend_an_attempt(talk)
 
     knowledge = Knowledge()
     knowledge.missing = True
-    for seq, text in enumerate(["Принтер не печатает", "HP"], 1):
+    for seq, text in enumerate(["Устройство не работает", "HP"], 1):
         talk.incoming(text, seq)
         talk.process(knowledge, Factual())
     state = talk.snapshot()

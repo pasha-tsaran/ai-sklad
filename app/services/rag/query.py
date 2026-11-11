@@ -68,7 +68,7 @@ def _word(word):
         matches = get_close_matches(word, _KEYWORDS, n=1, cutoff=0.87)
         if matches and word[:2] == matches[0][:2]:
             word = matches[0]
-    if word.startswith(("принтер", "принтр")):
+    if word.startswith(("принтер", "принтр", "термопринтер")):
         return "принтер"
     if word.startswith(("сканер", "считыват")):
         return "сканер"
@@ -80,6 +80,8 @@ def _word(word):
         return "настройка"
     if word.startswith(("штрих", "баркод")) or word == "шк":
         return "штрихкод"
+    if word.startswith(("подсвет", "ярк")) or word in {"луч", "луча"}:
+        return "подсветка"
     if word.startswith(("изображ", "картин", "рисунк")):
         return "изображение"
     if word.startswith(("акробат", "acrobat")):
@@ -137,6 +139,23 @@ def scanner_kinds(value):
     return kinds
 
 
+def printer_kinds(value):
+    """Identify explicitly described printer types without requiring a model."""
+    text = normalized_query(value)
+    kinds = set()
+    if re.search(r"\b(?:принтер\w*\s+(?:для\s+)?(?:документ\w*|[аa]4)|"
+                 r"(?:лазерн\w*|струйн\w*)\s+принтер\w*|[аa]4\s+принтер\w*)\b", text):
+        kinds.add("document")
+    if re.search(r"\b(?:(?:мобильн\w*|переносн\w*|портативн\w*)\s+"
+                 r"(?:(?:термо)?принтер\w*|tsc|urovo|alpha)|"
+                 r"(?:термо)?принтер\w*\s+(?:мобильн\w*|переносн\w*|портативн\w*))\b", text):
+        kinds.add("thermal_mobile")
+    if re.search(r"\b(?:(?:стационарн\w*|настольн\w*)\s+(?:термо)?принтер\w*|"
+                 r"(?:термо)?принтер\w*\s+(?:стационарн\w*|настольн\w*))\b", text):
+        kinds.add("thermal_stationary")
+    return kinds
+
+
 def _task_covered(problem, text):
     """Require the named task/feature, not just generic equipment overlap.
 
@@ -159,12 +178,17 @@ def _task_covered(problem, text):
         required.append(("очеред",))
     if mentions(problem_words, ("громк", "звук", "пищ", "писк", "зуммер")):
         required.append(("громк", "звук", "пищ", "писк", "зуммер", "сигнал", "beep", "sound", "volume"))
+    if mentions(problem_words, ("подсвет", "луч", "ярк")):
+        required.append(("подсвет", "луч", "ярк", "illumination", "brightness", "light"))
     # Printing with visible defects is not the same task as a queue which does
     # not print at all. Require evidence about print quality/materials rather
     # than permitting a generic 'printer/printing' match to authorize cleanup.
     if (mentions(problem_words, ("принтер", "печать"))
             and mentions(problem_words, _QUALITY_SYMPTOMS)):
         required.append(_QUALITY_EVIDENCE)
+    if (mentions(problem_words, ("принтер", "печать"))
+            and mentions(problem_words, ("зажев", "замят", "застря", "застрев", "жует"))):
+        required.append(("зажев", "замят", "застря", "застрев", "жует", "jam"))
     # A request to connect is different from a symptom report which merely
     # states that the device is already connected.
     if re.search(r"\b(?:подключ(?:ить|ите|и|ение\w*)|соединить|соединени\w*|сопрячь|сопряжени\w*)\b",
@@ -185,6 +209,9 @@ def source_compatible(problem, text, *, complete=False):
     wanted_scanners, supplied_scanners = scanner_kinds(problem), scanner_kinds(text)
     if wanted_scanners and (supplied_scanners and not wanted_scanners.issubset(supplied_scanners)
                             or complete and not wanted_scanners.issubset(supplied_scanners)):
+        return False
+    wanted_printers, supplied_printers = printer_kinds(problem), printer_kinds(text)
+    if wanted_printers and supplied_printers and not wanted_printers.issubset(supplied_printers):
         return False
     required = _terms(problem) & {"принт", "скане", "тсд"}
     available = _terms(text)

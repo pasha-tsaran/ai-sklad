@@ -196,6 +196,10 @@ def test_ambiguous_write_blocks_later_text_and_photos_only_for_its_room(factory)
     second = bind(factory, token="roomtwo", employee="employee-two")
     enqueue(factory, first, [("Первая попытка", photograph()), ("Не отправлять повторно", None)])
     enqueue(factory, second, [("Другой сотрудник", None)])
+    with factory() as session, session.begin():
+        for bound, day in ((first, 1), (second, 2)):
+            for message in session.scalars(select(Message).where(Message.incident_id == bound.incident)):
+                message.created_at = datetime(2026, 1, day, tzinfo=timezone.utc)
     failing = Sender(failure=True)
     assert deliver_one(factory, settings(), failing)
     sender = Sender()

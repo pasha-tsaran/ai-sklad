@@ -28,7 +28,7 @@ from app.services.chat.messages import append_message
 from app.services.chat.policies import FORM_ACTION, MAX_ATTEMPTS, TERMINAL_STATES, direct_intent
 from app.services.chat.service import messenger
 from app.services.rag.openwebui import save_snapshot
-from app.services.rag.query import normalized_query
+from app.services.rag.query import normalized_query, printer_kinds, scanner_kinds
 from app.services.rag.talk import (
     ApprovedTalkDocument, KnowledgeUnavailable, SourceSelection, TalkKnowledge, _SELECTION_TASK,
 )
@@ -64,13 +64,17 @@ INTAKE_QUESTIONS = {
     "additional_info": "Опишите проблему: что происходит и какая помощь нужна.",
 }
 CLARIFY_QUESTIONS = {
-    "DEVICE_MODEL": "Какое устройство не работает? Напишите его название и модель, если она указана на корпусе.",
+    "DEVICE_TYPE": "О каком типе оборудования идёт речь — сканер штрихкодов, сканер документов, принтер документов А4 или термопринтер?",
+    "DEVICE_MODEL": "О каком типе оборудования идёт речь — сканер штрихкодов, сканер документов, принтер документов А4 или термопринтер?",
     "CONNECTION": "Как устройство подключено: кабелем USB к компьютеру, сетевым кабелем или по Wi-Fi?",
     "ERROR_TEXT": "Какой точный текст ошибки вы видите? Перепишите его, пожалуйста.",
     "SYMPTOMS": "Опишите, что именно не работает и что появляется на экране.",
-    "SCANNER_KIND": "Вы имеете в виду сканер штрихкодов или сканер документов? Если знаете модель, напишите её.",
-    "SCANNER_GOAL": "Что именно нужно настроить у сканера: работу в программе или отдельный параметр? Напишите желаемый результат своими словами.",
+    "SCANNER_KIND": "Вы имеете в виду сканер штрихкодов или сканер документов (например, планшетный)?",
+    "SCANNER_GOAL": "Что именно нужно настроить у сканера — работу в программе, громкость, подсветку или другое? Напишите желаемый результат своими словами.",
     "SCANNER_SYMPTOMS": "Что происходит при сканировании: код не считывается, считывается неверно или не появляется в нужной программе?",
+    "PRINTER_KIND": "Это принтер документов А4, стационарный термопринтер для этикеток или мобильный термопринтер?",
+    "PRINTER_GOAL": "Что нужно сделать с принтером — подключить его, изменить настройку печати или решить конкретную проблему?",
+    "PRINTER_SYMPTOMS": "Что происходит при печати — задание не печатается, печатается неверно или нужна другая настройка?",
 }
 _PHOTO_REQUEST = re.compile(
     r"\b(?:покажи(?:те)?|повтори(?:те)?|пришли(?:те)?|отправь(?:те)?)\s+"
@@ -286,7 +290,7 @@ def _current_step_question(message):
 def _technical_message(message):
     canonical = normalized_query(message)
     return bool(requires_support(message) or requires_support(canonical)
-                or re.search(r"\b(?:fortigate|forticlient|bluetooth)\b", canonical))
+                or re.search(r"\b(?:fortigate|forticlient|bluetooth|термопринтер\w*)\b", canonical))
 
 
 def _free_support_request(message):
@@ -418,10 +422,26 @@ def _problem_query(message, flow):
     previous = flow.get("clarification_query")
     if re.match(r"\s*(?:как|почему|зачем|когда|кто|что\s+делать|другой\s+вопрос|другая\s+проблема)\b", message, re.I):
         return message[:6000]
+    answer = normalized_query(message)
+    keys = flow.get("clarification_keys", [])
+    if "PRINTER_KIND" in keys and len(answer.split()) <= 3:
+        if re.match(r"^(?:мобильн\w*|переносн\w*|портативн\w*)$", answer):
+            message += "\nМобильный термопринтер"
+        elif re.match(r"^(?:стационарн\w*|настольн\w*)$", answer):
+            message += "\nСтационарный термопринтер"
+        elif answer in {"а4", "a4", "документов", "для документов"}:
+            message += "\nПринтер документов А4"
+    if "SCANNER_KIND" in keys and answer in {"документов", "документы", "планшетный", "планшетный сканер"}:
+        message += "\nСканер документов"
     if flow.get("clarification_keys") and any(key.startswith("SCANNER_") for key in flow["clarification_keys"]):
         latest = normalized_query(message)
         if (re.search(r"\b(?:принтер\w*|тсд|nextcloud|fortigate|forticlient|outlook|почт\w*)\b", latest)
                 and not re.search(r"\b(?:сканер\w*|штрих\w*|баркод\w*|шк)\b", latest)):
+            return message[:6000]
+    if flow.get("clarification_keys") and any(key.startswith("PRINTER_") for key in flow["clarification_keys"]):
+        latest = normalized_query(message)
+        if (re.search(r"\b(?:сканер\w*|штрих\w*|баркод\w*|шк|nextcloud|fortigate|forticlient|outlook|почт\w*)\b", latest)
+                and not re.search(r"\b(?:(?:термо)?принтер\w*|печат\w*)\b", latest)):
             return message[:6000]
     if previous:
         previous = _without_previous_connection(previous, message)
@@ -506,39 +526,6 @@ def _scanner_inventory(knowledge):
     return sources[:30] if isinstance(sources, list) else []
 
 
-def _scanner_question(key, knowledge, sources=None):
-    """Enrich questions only with the current approved originals' inventory."""
-    question = CLARIFY_QUESTIONS[key]
-    sources = _scanner_inventory(knowledge) if sources is None else sources
-
-    def names(field, kind=None):
-        result = []
-        for source in sources[:30]:
-            if not isinstance(source, dict):
-                continue
-            categories = source.get("categories", [])
-            if kind and (not isinstance(categories, list) or kind not in categories):
-                continue
-            values = source.get(field, [])
-            if not isinstance(values, list):
-                continue
-            for value in values[:20]:
-                if (isinstance(value, str) and 2 <= len(value) <= 80
-                        and re.fullmatch(r"[A-Za-zА-Яа-яЁё0-9][A-Za-zА-Яа-яЁё0-9 ._/-]*", value)
-                        and value not in result):
-                    result.append(value)
-        return result[:3]
-
-    if key == "SCANNER_KIND" and (models := names("models", "barcode")):
-        return ("Вы имеете в виду сканер штрихкодов (в инструкциях: " + ", ".join(models)
-                + ") или сканер документов? Если ваша модель другая, напишите её.")
-    if key == "SCANNER_GOAL" and (applications := names("applications", "barcode")):
-        return ("Что именно нужно настроить: работу сканера в программе ("
-                + ", ".join(applications) + ") или отдельный параметр самого сканера? "
-                "Напишите желаемый результат своими словами.")
-    return question
-
-
 def _scanner_model_kind(text, sources):
     for source in sources:
         if not isinstance(source, dict) or not isinstance(source.get("models"), list):
@@ -583,18 +570,16 @@ def _scanner_clarification(message, flow, knowledge):
     program = bool(re.search(r"\b(?:1[сc]|адрес)\b", text))
     concrete = bool(re.search(
         r"\b(?:громк\w*|звук\w*|звуков\w*|сигнал\w*|суффикс\w*|префикс\w*|"
-        r"раскладк\w*|кодировк\w*|enter|перенос\w*|красн\w*|мига\w*|морга\w*|"
+        r"раскладк\w*|кодировк\w*|подсвет\w*|луч\w*|ярк\w*|базов\w*|enter|перенос\w*|красн\w*|мига\w*|морга\w*|"
         r"не\s+(?:читает|считывает|сканирует|передает|появляется)|неверн\w*|ошибк\w*)\b", text,
     ))
-    inventory = None
-    if not barcode and not document and not program:
-        inventory = _scanner_inventory(knowledge)
-        kind = _scanner_model_kind(text, inventory)
+    if not barcode and not document and not program and re.search(r"\b[a-zа-я]+[-_]?\d+\w*\b", text):
+        kind = _scanner_model_kind(text, _scanner_inventory(knowledge))
         barcode, document = kind == "barcode", kind == "document"
     # A correction is about a different desired result, even if the old source
     # happened to be a guide to adding the scanner in 1C.
     if correction and not re.search(
-        r"\b(?:1[сc]|адрес|громк\w*|звук\w*|суффикс\w*|префикс\w*|раскладк\w*|кодировк\w*)\b", latest,
+        r"\b(?:1[сc]|адрес|громк\w*|звук\w*|подсвет\w*|луч\w*|ярк\w*|базов\w*|суффикс\w*|префикс\w*|раскладк\w*|кодировк\w*)\b", latest,
     ):
         key = "SCANNER_GOAL"
     elif not barcode and not document and not program:
@@ -609,7 +594,7 @@ def _scanner_clarification(message, flow, knowledge):
         # source, and must not cause the same broad question to loop forever.
         question = "Коротко опишите, что хотите изменить или что происходит при работе со сканером. Можно привести пример."
     else:
-        question = _scanner_question(key, knowledge, sources=inventory)
+        question = CLARIFY_QUESTIONS[key]
         asked.append(key)
     return Turn("REPLY", [(question, None)], flow={
         "clarification_query": problem, "clarification_keys": asked,
@@ -617,14 +602,110 @@ def _scanner_clarification(message, flow, knowledge):
     })
 
 
+def _printer_clarification(message, flow):
+    problem = _problem_query(message, flow)
+    text = normalized_query(problem)
+    if not re.search(r"\b(?:(?:термо)?принтер\w*|печат\w*)\b", text):
+        return None
+    # A named application, model, or precise operation already constrains the
+    # source. Keep those established paths fast and ask only for a missing type.
+    concrete = re.search(
+        r"\b(?:pdf|acrobat|outlook|очеред\w*|калибр\w*|риббон\w*|картридж\w*|"
+        r"полос\w*|блед\w*|тонер\w*|зажев\w*|замят\w*|застря\w*|bluetooth|wifi|usb|ethernet|тсд|"
+        r"[a-zа-я]+[-_]?\d{2,}[a-zа-я0-9_-]*)\b", text,
+    )
+    kind = printer_kinds(problem)
+    if concrete:
+        return None
+    asked = list(flow.get("clarification_keys", []))
+    if kind:
+        if re.search(r"\b(?:настро\w*|настрой\w*)\b", text):
+            key = "PRINTER_GOAL"
+        elif re.search(r"\bне\s+работает\b", text):
+            key = "PRINTER_SYMPTOMS"
+        else:
+            return None
+    elif "PRINTER_KIND" in asked:
+        key = "PRINTER_SYMPTOMS"
+    else:
+        key = "PRINTER_KIND"
+    if key in asked:
+        return None
+    question = CLARIFY_QUESTIONS[key]
+    if key == "PRINTER_KIND" and re.search(r"\bтермопринтер\w*\b", text):
+        question = "Это стационарный термопринтер для этикеток или мобильный термопринтер?"
+    return Turn("REPLY", [(question, None)], flow={
+        "clarification_query": problem, "clarification_keys": asked + [key],
+        "excluded": flow.get("excluded", []),
+    })
+
+
+def _analysis_clarification(analysis, problem, flow):
+    if analysis is None or analysis.clarification_key is None:
+        return None
+    key = "DEVICE_TYPE" if analysis.clarification_key == "DEVICE_MODEL" else analysis.clarification_key
+    asked = list(flow.get("clarification_keys", []))
+    already_asked = key in asked or key == "DEVICE_TYPE" and any(
+        known in asked for known in ("DEVICE_MODEL", "SCANNER_KIND", "PRINTER_KIND")
+    )
+    typed = bool(scanner_kinds(problem) or printer_kinds(problem))
+    scanner_program = bool(re.search(r"\bсканер\w*\b", normalized_query(problem))
+                           and re.search(r"\b(?:1[сc]|адрес)\b", normalized_query(problem)))
+    if already_asked or key == "DEVICE_TYPE" and (typed or scanner_program):
+        return None
+    return Turn("REPLY", [(CLARIFY_QUESTIONS[key], None)], flow={
+        "clarification_query": problem, "clarification_keys": asked + [key],
+        "excluded": flow.get("excluded", []),
+    })
+
+
+def _different_instruction(message):
+    return bool(re.search(
+        r"(?:\b(?:инструкци\w*|решени\w*|ответ)\s+(?:мне\s+)?не\s+подход\w*\b|"
+        r"\b(?:неправильн\w*|неподходящ\w*)\s+инструкци\w*\b|"
+        r"\bинструкци\w*\s+(?:неправильн\w*|неподходящ\w*)\b|"
+        r"\b(?:не\s+(?:та|эта|подходящая)\s+инструкци\w*|(?:нужна|нужен|покажи\w*|дай\w*)\s+"
+        r"друг\w*\s+(?:инструкци\w*|решени\w*|ответ))\b)", message.casefold(),
+    ))
+
+
+def _replace_guide_context(flow):
+    previous = flow.get("query", "")
+    excluded = list(dict.fromkeys(flow.get("excluded", []) + [flow["source"]["file_id"]]))
+    if "barcode" in scanner_kinds(previous):
+        context = "Настройка сканера штрихкодов"
+    elif "document" in scanner_kinds(previous):
+        context = "Настройка сканера документов"
+    elif re.search(r"\bсканер\w*\b", normalized_query(previous)):
+        context = "Настройка сканера"
+    elif printer_kinds(previous) == {"thermal_mobile"}:
+        context = "Настройка мобильного термопринтера"
+    elif printer_kinds(previous) == {"thermal_stationary"}:
+        context = "Настройка стационарного термопринтера"
+    elif printer_kinds(previous) == {"document"}:
+        context = "Настройка принтера документов А4"
+    elif re.search(r"\b(?:(?:термо)?принтер\w*|печат\w*)\b", normalized_query(previous)):
+        context = "Настройка принтера"
+    else:
+        context = ""
+    return {"clarification_query": context, "excluded": excluded}
+
+
 def _support_turn(message, flow, context, llm, knowledge):
     has_guide = bool(flow.get("source"))
+    if has_guide and _different_instruction(message):
+        replacement = _replace_guide_context(flow)
+        message = "\n".join(part for part in (replacement["clarification_query"], message) if part)
+        flow = {"excluded": replacement["excluded"]}
+        has_guide = False
     photo_request = bool(_PHOTO_REQUEST.search(message) or _NEXT_PHOTO.search(message))
     next_photo = bool(photo_request and _NEXT_PHOTO.search(message))
     clarification = bool(has_guide and (_current_step_question(message) or photo_request and not next_photo))
     continuation = bool(has_guide and (_step_confirmed(message) or next_photo))
     if not clarification and not continuation:
         if followup := _scanner_clarification(message, flow, knowledge):
+            return followup
+        if followup := _printer_clarification(message, flow):
             return followup
     if continuation and not flow.get("has_more"):
         return Turn("REPLY", [("Удалось решить проблему? Напишите «Помогло» или «Не помогло».", None)])
@@ -668,11 +749,8 @@ def _support_turn(message, flow, context, llm, knowledge):
                 analysis = None
         if approved is None:
             asked = flow.get("clarification_keys", [])
-            if analysis and analysis.clarification_key and analysis.clarification_key not in asked:
-                return Turn("REPLY", [(CLARIFY_QUESTIONS[analysis.clarification_key], None)], flow={
-                    "clarification_query": problem, "clarification_keys": asked + [analysis.clarification_key],
-                    "excluded": flow.get("excluded", []),
-                })
+            if followup := _analysis_clarification(analysis, problem, flow):
+                return followup
             return Turn("NO_KNOWLEDGE", flow={"clarification_query": problem,
                                               "clarification_keys": asked, "excluded": excluded})
         if (flow.get("source", {}).get("file_id") == approved.document["source"]["file_id"]
@@ -785,7 +863,7 @@ def _text_turn(message, flow, context, previous_pending, llm, knowledge, setting
         return Turn("FAILED")
     if _step_confirmed(message) and not flow:
         return Turn("REPLY", [("Опишите, пожалуйста, с какой рабочей проблемой нужна помощь.", None)])
-    pinned = (flow.get("source") and (_step_confirmed(message) or _current_step_question(message)
+    pinned = (flow.get("source") and (_step_confirmed(message) or _current_step_question(message) or _different_instruction(message)
                                       or _PHOTO_REQUEST.search(message) or _NEXT_PHOTO.search(message))) or (
         flow.get("clarification_query") and len(message.split()) <= 8
     )

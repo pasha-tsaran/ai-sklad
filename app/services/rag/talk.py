@@ -16,7 +16,9 @@ from app.services.rag.equipment import scanner_facts, scanner_filename
 from app.services.rag.interface import Candidate
 from app.services.rag.knowledge_files import KnowledgeFilesError, list_knowledge_files
 from app.services.rag.query import choose_source, retrieval_query, source_compatible
-from integrations.openwebui.approved_instruction_images import MAX_SOURCE_BYTES, MAX_TEXT_CHARS, read_docx_images, read_docx_text
+from integrations.openwebui.approved_instruction_images import (
+    MAX_SOURCE_BYTES, MAX_TEXT_CHARS, allowed_source_filename, read_docx_images, read_docx_text,
+)
 
 
 class SourceSelection(BaseModel):
@@ -88,9 +90,7 @@ def _uuid(value):
 
 def _employee_file(item):
     name = item.get("filename", "")
-    return (_uuid(item.get("id")) and isinstance(name, str)
-            and not name.casefold().startswith(("ит_", "справочник_"))
-            and name.casefold().endswith((".docx", ".xlsx", ".md", ".txt", ".pdf")))
+    return _uuid(item.get("id")) and allowed_source_filename(name)
 
 
 class TalkKnowledge:
@@ -315,7 +315,7 @@ class TalkKnowledge:
         except KnowledgeUnavailable:
             return False
 
-    def check(self, query="Настройка сканера штрихкодов в 1С АДРЕС 1.0.53"):
+    def check(self, query="Сканер штрихкодов: настройка громкости и подсветки"):
         """Read-only end-to-end check of scoped membership, search and original photos."""
         try:
             with self._client() as client:

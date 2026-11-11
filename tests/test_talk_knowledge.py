@@ -128,11 +128,18 @@ def test_foreign_vector_metadata_never_authorizes_a_file_outside_allowed_collect
     assert all("/files/" not in request.url.path for request in state["calls"])
 
 
-@pytest.mark.parametrize("filename", ["ИТ_05_Acrobat.docx", "СПРАВОЧНИК_Acrobat.docx", "Acrobat.exe"])
-def test_administrative_and_unsupported_uploads_are_excluded_before_retrieval(filename):
+@pytest.mark.parametrize("filename", ["33_Сканер штрихкодов в базе АДРЕС.docx", "Acrobat.exe"])
+def test_withdrawn_and_unsupported_uploads_are_excluded_before_retrieval(filename):
     knowledge, state = provider(filename=filename)
     assert knowledge.search(QUERY) is None
     assert len(state["calls"]) == 1
+
+
+@pytest.mark.parametrize("filename", ["ИТ_05_Acrobat.docx", "СПРАВОЧНИК_Acrobat.docx"])
+def test_prefix_does_not_hide_an_instruction_from_the_approved_collection(filename):
+    knowledge, _ = provider(filename=filename)
+    approved = knowledge.search(QUERY)
+    assert approved is not None and approved.document["source"]["filename"] == filename
 
 
 def test_concise_analysis_query_has_one_bounded_full_problem_fallback():

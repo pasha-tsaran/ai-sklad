@@ -10,7 +10,9 @@ from pydantic import BaseModel, ConfigDict
 from app.models import KnowledgeChunk, KnowledgeDocument, Solution
 from app.services.rag.interface import Candidate
 from app.services.rag.documents import read_docx, read_xlsx
+from app.services.rag.knowledge_files import list_knowledge_files
 from app.services.llm.prompts import KNOWLEDGE_SELECTION_TASK, stage_messages
+from integrations.openwebui.approved_instruction_images import is_withdrawn_source_filename
 
 
 class Selection(BaseModel):
@@ -32,10 +34,20 @@ class OpenWebUIKnowledge:
         for collection in self.settings.openwebui_knowledge_ids:
             response = client.get(self.base + "/api/v1/knowledge/" + quote(collection, safe=""))
             response.raise_for_status()
-            # Fail closed on an incompatible server response, never search all knowledge.
-            for item in response.json()["files"]:
-                if str(item.get("filename", "")).startswith(("ИТ_", "СПРАВОЧНИК_")):
-                    continue  # Reference/admin uploads are searchable in WebUI, not automatic employee solutions.
+            metadata = response.json()
+            if (metadata.get("id", collection) != collection
+                    or (metadata.get("meta") or {}).get("source") == "external"):
+                raise ValueError("KnowledgeScopeMismatch")
+            items = metadata.get("files")
+            if items is None or any(isinstance(item, dict) and "filename" not in item for item in items):
+                items = list_knowledge_files(client, self.base, collection)
+            if not isinstance(items, list):
+                raise ValueError("InvalidKnowledgeResponse")
+            for item in items:
+                if not isinstance(item, dict):
+                    raise ValueError("InvalidKnowledgeResponse")
+                if is_withdrawn_source_filename(item.get("filename")):
+                    continue
                 files[item["id"]] = item
         return files
 

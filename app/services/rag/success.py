@@ -12,6 +12,7 @@ from sqlalchemy import select
 from app.models import Conversation, Feedback, Incident, SolutionAttempt, SuccessfulRetrieval, now
 from app.services.rag.query import normalized_query, source_compatible
 from app.services.rag.talk import KnowledgeUnavailable
+from integrations.openwebui.approved_instruction_images import allowed_source_filename
 
 _HASH = re.compile(r"^[0-9a-f]{64}$")
 _KEY_FIELDS = {"scope_hash", "query_hash", "context_hash"}
@@ -59,8 +60,7 @@ def _valid_source(settings, source):
     name = source["filename"]
     return (source["knowledge_id"] in settings.openwebui_knowledge_ids
             and isinstance(source["sha256"], str) and _HASH.fullmatch(source["sha256"])
-            and isinstance(name, str) and not name.casefold().startswith(("ит_", "справочник_"))
-            and name.casefold().endswith((".docx", ".xlsx", ".md", ".txt", ".pdf")))
+            and allowed_source_filename(name))
 
 
 def _proof(session, principal, incident_id, source):

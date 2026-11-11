@@ -41,7 +41,7 @@ class AnalysisResult(StrictModel):
     problem_type: str | None = Field(default=None, max_length=100)
     equipment_model: str | None = Field(default=None, max_length=255)
     search_query: str = Field(max_length=1000)
-    clarification_key: Literal["DEVICE_MODEL", "CONNECTION", "ERROR_TEXT", "SYMPTOMS"] | None = None
+    clarification_key: Literal["DEVICE_TYPE", "DEVICE_MODEL", "CONNECTION", "ERROR_TEXT", "SYMPTOMS"] | None = None
 
 
 class DialogueResult(StrictModel):

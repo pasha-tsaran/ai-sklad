@@ -3,7 +3,7 @@ title: AI Support — фотографии утверждённых инстру
 author: AI Support
 description: Ищет и читает утверждённые инструкции, показывает исходные фотографии DOCX.
 required_open_webui_version: 0.11.0
-version: 0.3.1
+version: 0.3.2
 license: MIT
 """
 
@@ -16,6 +16,7 @@ import json
 import logging
 import posixpath
 import re
+import unicodedata
 import warnings
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -40,6 +41,24 @@ W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 R = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
 A = "{http://schemas.openxmlformats.org/drawingml/2006/main}"
 WP = "{http://schemas.openxmlformats.org/drawingml/2006/wordprocessingDrawing}"
+_SUPPORTED_SOURCE_SUFFIXES = (".docx", ".xlsx", ".md", ".txt", ".pdf")
+_WITHDRAWN_SOURCE = "33 сканер штрихкодов в базе адрес docx"
+
+
+def is_withdrawn_source_filename(filename):
+    if not isinstance(filename, str):
+        return False
+    normalized = unicodedata.normalize("NFKC", filename).casefold().replace("ё", "е").strip()
+    canonical = " ".join(re.findall(r"[a-zа-я0-9]+", normalized))
+    return canonical == _WITHDRAWN_SOURCE
+
+
+def allowed_source_filename(filename):
+    """Collection membership grants access; an explicitly withdrawn source stays retired."""
+    if not isinstance(filename, str) or not filename.strip():
+        return False
+    normalized = unicodedata.normalize("NFKC", filename).casefold().replace("ё", "е").strip()
+    return normalized.endswith(_SUPPORTED_SOURCE_SUFFIXES) and not is_withdrawn_source_filename(normalized)
 
 
 def _measure_tool(method):
@@ -167,9 +186,6 @@ def read_docx_images(data):
                     relations[rid] = node
             if list(document.iter(W + "pict")):
                 raise ToolError("unsupported_document", "Старые VML-иллюстрации нужно преобразовать в обычные рисунки DOCX.")
-            text = " ".join(node.text or "" for node in document.iter(W + "t"))
-            if re.search(r"\bтолько\s+для\s+ит\b", text.casefold()):
-                raise ToolError("restricted_instruction", "Документ содержит раздел только для специалистов ИТ.")
             pictures, total_bytes = [], 0
             for drawing in document.iter(W + "drawing"):
                 blips = list(drawing.iter(A + "blip"))
@@ -292,8 +308,6 @@ def _extracted_text(source):
         raise ToolError("unavailable_text", "В утверждённом файле нет доступного извлечённого текста.")
     if len(content) > MAX_TEXT_CHARS:
         raise ToolError("text_too_large", "Текст исходной инструкции слишком велик для чтения целиком.")
-    if re.search(r"\bтолько\s+для\s+ит\b", content.casefold()):
-        raise ToolError("restricted_instruction", "Документ содержит раздел только для специалистов ИТ.")
     return content
 
 
@@ -354,8 +368,8 @@ class _OpenWebUI:
                     break
         if knowledge_id is None:
             raise ToolError("access_denied", "Файл недоступен в разрешённой базе знаний.")
-        if file.filename.casefold().startswith(("ит_", "справочник_")):
-            raise ToolError("restricted_instruction", "Эта инструкция предназначена для специалистов ИТ.")
+        if not allowed_source_filename(file.filename):
+            raise ToolError("withdrawn_instruction", "Эта инструкция исключена из используемой базы знаний.")
         return Source(user, file, knowledge_id)
 
     async def read_original(self, source):
@@ -472,7 +486,7 @@ class Tools:
                     else:
                         source = recorded[0]
                 except ToolError as exc:
-                    if exc.code in {"access_denied", "restricted_instruction"}:
+                    if exc.code in {"access_denied", "restricted_instruction", "withdrawn_instruction"}:
                         continue
                     raise
                 content = chunk["content"]
@@ -502,6 +516,8 @@ class Tools:
         file_id = str(UUID(file_id))
         runtime = _OpenWebUI()
         source = await runtime.source(file_id, user["id"], allowed)
+        if not allowed_source_filename(source.file.filename):
+            raise ToolError("withdrawn_instruction", "Эта инструкция исключена из используемой базы знаний.")
         signature = _signature(source)
         if source.file.filename.lower().endswith(".docx"):
             original = await runtime.read_original(source)

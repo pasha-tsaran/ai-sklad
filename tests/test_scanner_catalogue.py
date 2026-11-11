@@ -4,7 +4,7 @@ import pytest
 
 from app.services.rag.query import scanner_kinds, source_compatible
 from app.services.rag.talk import KnowledgeUnavailable
-from tests.test_talk_knowledge import DOC, OTHER, provider
+from tests.test_talk_knowledge import DOC, provider
 
 
 def test_catalogue_reads_originals_and_uses_source_backed_model_without_generation():
@@ -26,12 +26,16 @@ def test_forged_model_in_filename_is_not_promoted_to_source_backed_hint():
     assert result["sources"][0]["applications"] == ["1С АДРЕС"]
 
 
-def test_administrative_and_foreign_files_do_not_supply_clarification_models():
-    knowledge, state = provider(filename="ИТ_37_Zebra DS2208 сканер.md")
-    state["files"].append({"id": OTHER, "filename": "СПРАВОЧНИК_сканер.md"})
+def test_withdrawn_instruction_does_not_supply_clarification_models():
+    knowledge, state = provider(filename="33_Сканер штрихкодов в базе АДРЕС.docx")
     result = knowledge.scanner_context()
     assert result == {"status": "ok", "sources": [], "categories": [], "models": []}
     assert not any("/files/" in request.url.path for request in state["calls"])
+
+
+def test_source_prefix_does_not_remove_scanner_model_facts_from_approved_knowledge():
+    knowledge, _ = provider(filename="ИТ_37_Zebra DS2208 сканер.md", data="Сканер штрихкодов Zebra DS2208.".encode())
+    assert knowledge.scanner_context()["models"] == ["Zebra DS2208"]
 
 
 def test_revoked_catalogue_source_cannot_supply_an_equipment_hint():
