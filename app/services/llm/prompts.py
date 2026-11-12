@@ -138,18 +138,19 @@ NO_KNOWLEDGE с пустыми списками источников, фрагм
 
 _STAGE_TEMPLATE = ChatPromptTemplate.from_messages(
     [
-        ("system", "{policy}\n\nТекущая задача:\n{task}\n\nJSON Schema: {schema}"),
+        ("system", "{policy}\n\nТекущая задача:\n{task}{schema}"),
         ("human", "{payload}"),
     ]
 )
 
 
-def stage_messages(schema, task: str, payload: dict) -> list[dict[str, str]]:
+def stage_messages(schema, task: str, payload: dict, *, include_schema: bool = True) -> list[dict[str, str]]:
     """Build provider-neutral LangChain messages for the existing WebUI transport."""
     messages = _STAGE_TEMPLATE.format_messages(
         policy=COMMON_POLICY,
         task=task,
-        schema=json.dumps(schema.model_json_schema(), ensure_ascii=False),
+        schema="\n\nJSON Schema: " + json.dumps(schema.model_json_schema(), ensure_ascii=False)
+        if include_schema else "",
         payload=json.dumps(payload, ensure_ascii=False),
     )
     return [

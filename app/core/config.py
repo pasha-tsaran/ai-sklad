@@ -2,7 +2,7 @@ from functools import lru_cache
 from typing import Literal
 from urllib.parse import urlsplit
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -14,6 +14,7 @@ class Settings(BaseSettings):
     openwebui_base_url: str = "https://ai.collant.ru"
     openwebui_api_key: SecretStr = SecretStr("")
     openwebui_model: str = "ai-support"
+    openwebui_num_ctx: int | None = Field(default=None, ge=2048, le=131072)
     knowledge_backend: Literal["openwebui", "demo"] = "openwebui"
     openwebui_knowledge_ids: list[str] = Field(default_factory=list)
     knowledge_max_chars: int = Field(default=200000, ge=1000, le=200000)
@@ -44,6 +45,11 @@ class Settings(BaseSettings):
     memory_max_messages: int = Field(default=12, ge=2, le=40)
     memory_max_chars: int = Field(default=12000, ge=2000, le=24000)
     memory_retention_days: int = Field(default=90, ge=1, le=365)
+
+    @field_validator("openwebui_num_ctx", mode="before")
+    @classmethod
+    def empty_context_uses_provider_default(cls, value):
+        return None if value == "" else value
 
     @model_validator(mode="after")
     def validate_credentials(self):

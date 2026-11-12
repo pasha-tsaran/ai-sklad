@@ -83,15 +83,16 @@ def test_default_selector_uses_real_model_transport_with_scoped_catalogue_and_no
         assert payload["params"]["max_tokens"] == payload["max_tokens"] == 512
         system = payload["messages"][0]["content"]
         assert INSTRUCTION_SELECTION_TASK in system
-        assert '"title": "InstructionSelection"' in system
-        assert '"additionalProperties": false' in system
+        assert "JSON Schema: " not in system
+        schema = payload["response_format"]["json_schema"]["schema"]
+        assert schema["title"] == "InstructionSelection" and schema["additionalProperties"] is False
         source_payload = json.loads(payload["messages"][-1]["content"])
         assert source_payload["actual_problem"] == "The scanner is too loud."
         assert source_payload["knowledge_ids"] == [KB]
-        assert source_payload["catalogue"] == {DOC: state["files"][0]["filename"]}
-        assert EVIDENCE in source_payload["candidates"][DOC]
+        assert source_payload["catalogue"] == {"s1": state["files"][0]["filename"]}
+        assert EVIDENCE in source_payload["candidates"]["s1"]
         return httpx.Response(200, json={
-            "choices": [{"message": {"content": json.dumps(match())}}],
+            "choices": [{"message": {"content": json.dumps(match("s1"))}}],
         })
 
     knowledge.transport = httpx.MockTransport(handler)

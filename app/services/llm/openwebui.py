@@ -38,7 +38,7 @@ class OpenWebUILLM:
         # LangChain orchestrates prompt -> existing internal transport -> strict validation.
         # No cloud model, autonomous tools or external memory service is introduced.
         chain = (
-            RunnableLambda(lambda value: stage_messages(schema, task, value))
+            RunnableLambda(lambda value: stage_messages(schema, task, value, include_schema=not fast_selection))
             | RunnableLambda(lambda messages: self._request(messages, selection_schema=selection_schema)
                              if fast_selection else self._request(messages))
             | RunnableLambda(schema.model_validate_json)
@@ -59,12 +59,14 @@ class OpenWebUILLM:
             "response_format": {"type": "json_object"},
             "messages": messages,
         }
+        if self.settings.openwebui_num_ctx is not None:
+            body["params"] = {"num_ctx": self.settings.openwebui_num_ctx}
         if selection_schema is not None:
             # Open WebUI 0.11 forwards params through native Ollama options.
             # Selection needs a small grounded JSON decision and a short quote.
             body.update({
                 "max_tokens": 512,
-                "params": {"think": False, "max_tokens": 512, "temperature": 0},
+                "params": {**body.get("params", {}), "think": False, "max_tokens": 512, "temperature": 0},
                 "response_format": {"type": "json_schema", "json_schema": {
                     "name": "instruction_selection", "schema": selection_schema,
                 }},
@@ -103,7 +105,41 @@ class OpenWebUILLM:
     def select_instruction(self, payload):
         from app.services.rag.talk import INSTRUCTION_SELECTION_TASK, InstructionSelection
 
-        return self._call(InstructionSelection, INSTRUCTION_SELECTION_TASK, payload, fast_selection=True)
+        # Request-local codes keep the catalogue and response grammar small.
+        # Original texts and source evidence remain byte-for-byte unchanged.
+        catalogue = payload.get("catalogue", {})
+        aliases = {file_id: f"s{number}" for number, file_id in enumerate(catalogue, 1)}
+        originals = {alias: file_id for file_id, alias in aliases.items()}
+        candidates = payload.get("candidates", {})
+        if any(file_id not in aliases for file_id in candidates):
+            raise ValueError("UnknownInstructionCandidate")
+        wire_payload = {
+            **payload,
+            "catalogue": {aliases[file_id]: name for file_id, name in catalogue.items()},
+            "candidates": {aliases[file_id]: content for file_id, content in candidates.items()},
+        }
+        context = payload.get("context")
+        if isinstance(context, dict):
+            wire_context = dict(context)
+            for name in ("shown_source", "verified_previous_source"):
+                source = context.get(name)
+                if isinstance(source, dict) and "file_id" in source:
+                    if source["file_id"] in aliases:
+                        wire_context[name] = {**source, "file_id": aliases[source["file_id"]]}
+                    else:
+                        wire_context.pop(name, None)
+            wire_payload["context"] = wire_context
+        choice = self._call(InstructionSelection, INSTRUCTION_SELECTION_TASK, wire_payload, fast_selection=True)
+        decoded = choice.model_dump()
+        source_ids = [choice.file_id] if choice.file_id is not None else []
+        source_ids.extend(alternative.file_id for alternative in choice.alternatives)
+        if any(source_id not in originals for source_id in source_ids):
+            raise ValueError("UnknownInstructionSourceAlias")
+        if choice.file_id is not None:
+            decoded["file_id"] = originals[choice.file_id]
+        for alternative in decoded["alternatives"]:
+            alternative["file_id"] = originals[alternative["file_id"]]
+        return InstructionSelection.model_validate(decoded)
 
     def interpret_instruction_offer(self, message, offered):
         return self._call(InstructionOfferReply, INSTRUCTION_OFFER_TASK,
