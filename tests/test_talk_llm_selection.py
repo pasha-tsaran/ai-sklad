@@ -24,6 +24,12 @@ def match(file_id=DOC, evidence=EVIDENCE):
     return {"result": "MATCH", "file_id": file_id, "evidence": evidence}
 
 
+def related(*sources):
+    return {"result": "RELATED", "alternatives": [
+        {"file_id": file_id, "evidence": evidence} for file_id, evidence in sources
+    ]}
+
+
 def selection_store():
     knowledge, state = provider(filename="Параметры устройства.docx", data=instruction([EVIDENCE]), chunks=[])
     decisions = []
@@ -268,7 +274,167 @@ def test_filename_extension_does_not_hide_the_two_wifi_instruction(problem):
     assert result.result == "MATCH" and result.approved.document["source"]["file_id"] == OTHER
     assert len(calls) == 1 and {DOC, OTHER} <= set(calls[0]["candidates"])
     assert result.approved.illustrations[1].caption == two_wifi
-    assert not any(request.method == "POST" for request in state["calls"])
+    assert sum(request.method == "POST" for request in state["calls"]) == 1
+
+
+@pytest.mark.parametrize("problem,filename,evidence", [
+    ("Хочу подключить принтер по Bluetooth", "Подключение принтера по Wi-Fi.docx",
+     "В инструкции описано подключение принтера через сеть Wi-Fi."),
+    ("Как найти письмо в Outlook?", "Поиск писем в веб-почте.docx",
+     "Инструкция описывает поиск писем в браузерном интерфейсе почтового ящика."),
+    ("Как изменить текст в PDF?", "Редактирование документа Word.docx",
+     "В инструкции рассматривается изменение текста в документе Word."),
+])
+def test_source_backed_alternatives_work_for_different_instruction_topics(problem, filename, evidence):
+    source_data = instruction([evidence])
+    knowledge, _ = scanner_provider([(DOC, filename, source_data)])
+    calls = []
+    knowledge.selector = lambda payload: calls.append(payload) or related((DOC, evidence))
+    result = knowledge.search_with_llm(problem)
+    assert result.result == "RELATED" and result.approved is None and result.question == ""
+    assert len(result.alternatives) == 1 and len(calls) == 1
+    approved = result.alternatives[0]
+    assert approved.document["source"]["file_id"] == DOC
+    assert approved.document["source"]["filename"] == filename
+    assert approved.document["source"]["knowledge_id"] == KB
+    assert approved.illustrations[1].data == read_docx_images(source_data)[0].data
+
+
+@pytest.mark.parametrize("response", [
+    {"result": "RELATED"},
+    {"result": "RELATED", "file_id": DOC, "alternatives": [{"file_id": DOC, "evidence": EVIDENCE}]},
+    {"result": "RELATED", "question": "Выполнить другую настройку?",
+     "alternatives": [{"file_id": DOC, "evidence": EVIDENCE}]},
+    {"result": "RELATED", "evidence": EVIDENCE,
+     "alternatives": [{"file_id": DOC, "evidence": EVIDENCE}]},
+    related((DOC, EVIDENCE), (DOC, EVIDENCE)),
+    related((DOC, EVIDENCE), (DOC, EVIDENCE), (DOC, EVIDENCE), (DOC, EVIDENCE)),
+    related((OTHER, EVIDENCE)),
+    related((DOC, "Выдуманная цитата из другого руководства.")),
+    related((DOC, "Кратко")),
+    related((DOC, "x" * 201)),
+    {"result": "RELATED", "alternatives": [{"file_id": DOC, "evidence": EVIDENCE,
+                                               "answer": "Выдуманная последовательность действий."}]},
+])
+def test_alternative_choice_cannot_forge_scope_quotes_shapes_or_unbounded_lists(response):
+    knowledge, state, _ = selection_store()
+    knowledge.selector = lambda payload: response
+    with pytest.raises(KnowledgeUnavailable):
+        knowledge.search_with_llm("Другая настройка устройства")
+    assert not any(OTHER in request.url.path for request in state["calls"])
+
+
+@pytest.mark.parametrize("response", [
+    {**match(), "alternatives": [{"file_id": DOC, "evidence": EVIDENCE}]},
+    {"result": "CLARIFY", "question": "Что нужно изменить?",
+     "alternatives": [{"file_id": DOC, "evidence": EVIDENCE}]},
+    {"result": "NO_KNOWLEDGE", "alternatives": [{"file_id": DOC, "evidence": EVIDENCE}]},
+    {"result": "READ", "file_id": DOC, "alternatives": [{"file_id": DOC, "evidence": EVIDENCE}]},
+])
+def test_other_decision_types_cannot_carry_unhandled_alternatives(response):
+    knowledge, _, _ = selection_store()
+    knowledge.selector = lambda payload: response
+    with pytest.raises(KnowledgeUnavailable):
+        knowledge.search_with_llm("Другая настройка устройства")
+
+
+@pytest.mark.parametrize("change", ["bytes", "membership"])
+def test_offered_alternative_has_the_same_fresh_original_ownership_proof_as_a_match(change):
+    knowledge, state, _ = selection_store()
+
+    def select(payload):
+        if change == "bytes":
+            state["data"] = instruction([EVIDENCE + " Исходник изменился."])
+        else:
+            state["files"] = []
+        return related((DOC, EVIDENCE))
+
+    knowledge.selector = select
+    with pytest.raises(KnowledgeUnavailable):
+        knowledge.search_with_llm("Другая настройка устройства")
+
+
+def test_alternatives_are_all_validated_before_any_offer_is_returned():
+    other_evidence = "Другая инструкция содержит отдельные подтверждённые условия настройки."
+    knowledge, _ = scanner_provider([
+        (DOC, "Один вариант.docx", instruction([EVIDENCE])),
+        (OTHER, "Другой вариант.docx", instruction([other_evidence])),
+    ])
+    knowledge.selector = lambda payload: related((DOC, EVIDENCE), (OTHER, "Недостоверная цитата из другого файла."))
+    with pytest.raises(KnowledgeUnavailable, match="InstructionEvidenceMismatch"):
+        knowledge.search_with_llm("Другая настройка устройства")
+
+
+def test_model_can_read_a_catalogue_original_and_offer_it_as_a_verified_alternative():
+    knowledge, _ = large_catalogue()
+    calls = []
+
+    def select(payload):
+        calls.append(payload)
+        return {"result": "READ", "file_id": OTHER} if len(calls) == 1 else related((OTHER, EVIDENCE))
+
+    knowledge.selector = select
+    result = knowledge.search_with_llm("Прибор разбудил весь склад писком")
+    assert result.result == "RELATED" and len(calls) == 2
+    assert [source.document["source"]["file_id"] for source in result.alternatives] == [OTHER]
+
+
+def test_new_generic_filename_is_discovered_by_contents_despite_an_existing_title_hit():
+    evidence = "Поиск корреспонденции по адресу отправителя выполняется в почтовом клиенте."
+    rows = [(DOC, "Outlook — уведомления.md", "Настройка уведомлений приложения.".encode())]
+    rows += [(f"00000000-0000-4000-8000-{index:012d}", f"Материал {index}.md", b"Other guidance.")
+             for index in range(101, 109)]
+    knowledge, state = scanner_provider(rows, chunks=[(OTHER, evidence)])
+    calls = []
+
+    def select(payload):
+        calls.append(copy.deepcopy(payload))
+        return match(OTHER, evidence) if OTHER in payload["candidates"] else {"result": "NO_KNOWLEDGE"}
+
+    knowledge.selector = select
+    problem = "В Outlook нужно найти письмо по отправителю"
+    assert knowledge.search_with_llm(problem).result == "NO_KNOWLEDGE"
+    state["files"].append({"id": OTHER, "filename": "Справочный материал сотрудника.md"})
+    state["originals"][OTHER] = evidence.encode()
+    result = knowledge.search_with_llm(problem)
+    assert result.result == "MATCH" and result.approved.document["source"]["file_id"] == OTHER
+    assert OTHER not in calls[0]["catalogue"]
+    assert {DOC, OTHER} <= set(calls[1]["candidates"])
+    assert sum(request.method == "POST" for request in state["calls"]) == 2
+
+
+def test_missing_vector_hits_still_keep_named_scanner_originals_in_a_large_catalogue():
+    rows = [(DOC, "Настройка сканера.docx", instruction([EVIDENCE]))]
+    rows += [(f"00000000-0000-4000-8000-{index:012d}", f"Материал {index}.md", b"Other guidance.")
+             for index in range(101, 110)]
+    knowledge, state = scanner_provider(rows, chunks=[])
+    calls = []
+    knowledge.selector = lambda payload: calls.append(payload) or match()
+    assert knowledge.search_with_llm("У сканера надо уменьшить громкость").result == "MATCH"
+    assert DOC in calls[0]["candidates"]
+    assert sum(request.method == "POST" for request in state["calls"]) == 1
+
+
+@pytest.mark.parametrize("read_another", [False, True])
+def test_complete_catalogue_and_ranked_window_can_report_absence_without_a_false_budget_error(read_another):
+    rows = [(f"00000000-0000-4000-8000-{index:012d}", f"Справочник Outlook {index}.md",
+             "Общие сведения о календаре приложения.".encode()) for index in range(101, 111)]
+    knowledge, _ = scanner_provider(rows, chunks=[(key, "Общие сведения о календаре приложения.")
+                                                for key, _, _ in rows[:8]])
+    calls = []
+
+    def select(payload):
+        calls.append(copy.deepcopy(payload))
+        return ({"result": "READ", "file_id": rows[-1][0]}
+                if read_another and len(calls) == 1 else {"result": "NO_KNOWLEDGE"})
+
+    knowledge.selector = select
+    result = knowledge.search_with_llm("В Outlook нужно восстановить вложение")
+    assert result.result == "NO_KNOWLEDGE"
+    assert len(calls) == (2 if read_another else 1)
+    assert all(len(payload["catalogue"]) == 10 for payload in calls)
+    assert all(payload["candidate_budget_limited"] is False for payload in calls)
+    assert len(calls[0]["candidates"]) == 8 and calls[0]["unread_count"] == 2
 
 
 def test_current_task_and_displayed_source_are_bounded_structured_context():

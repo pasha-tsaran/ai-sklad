@@ -5,9 +5,12 @@ from langchain_core.runnables import RunnableLambda
 from langsmith import tracing_context
 
 from app.core.logging import event
-from app.schemas.contracts import AnalysisResult, AnswerResult, DialogueResult, EscalationExtraction, FollowupResult, SummaryResult
+from app.schemas.contracts import (
+    AnalysisResult, AnswerResult, DialogueResult, EscalationExtraction, FollowupResult, InstructionOfferReply, SummaryResult,
+)
 from app.services.llm.prompts import (
-    ANALYZE_TASK, COMPOSE_TASK, DIALOGUE_TASK, ESCALATION_EXTRACTION_TASK, FOLLOWUP_TASK, SUMMARY_TASK, stage_messages,
+    ANALYZE_TASK, COMPOSE_TASK, DIALOGUE_TASK, ESCALATION_EXTRACTION_TASK, FOLLOWUP_TASK,
+    INSTRUCTION_OFFER_TASK, SUMMARY_TASK, stage_messages,
 )
 
 
@@ -22,10 +25,16 @@ class OpenWebUILLM:
         if fast_selection:
             selection_schema = schema.model_json_schema()
             allowed_ids = list(payload.get("catalogue", {}))
-            selection_schema["properties"]["file_id"] = (
-                {"anyOf": [{"type": "string", "enum": allowed_ids}, {"type": "null"}], "default": None}
-                if allowed_ids else {"type": "null", "default": None}
-            )
+            if "file_id" in selection_schema["properties"]:
+                selection_schema["properties"]["file_id"] = (
+                    {"anyOf": [{"type": "string", "enum": allowed_ids}, {"type": "null"}], "default": None}
+                    if allowed_ids else {"type": "null", "default": None}
+                )
+            alternative_schema = selection_schema.get("$defs", {}).get("InstructionAlternative")
+            if alternative_schema and allowed_ids:
+                alternative_schema["properties"]["file_id"]["enum"] = allowed_ids
+            if "alternatives" in selection_schema["properties"] and not allowed_ids:
+                selection_schema["properties"]["alternatives"]["maxItems"] = 0
         # LangChain orchestrates prompt -> existing internal transport -> strict validation.
         # No cloud model, autonomous tools or external memory service is introduced.
         chain = (
@@ -95,6 +104,10 @@ class OpenWebUILLM:
         from app.services.rag.talk import INSTRUCTION_SELECTION_TASK, InstructionSelection
 
         return self._call(InstructionSelection, INSTRUCTION_SELECTION_TASK, payload, fast_selection=True)
+
+    def interpret_instruction_offer(self, message, offered):
+        return self._call(InstructionOfferReply, INSTRUCTION_OFFER_TASK,
+                          {"message": message, "offered": offered}, fast_selection=True)
 
     def analyze(self, message):
         return self.analyze_context(message, {})

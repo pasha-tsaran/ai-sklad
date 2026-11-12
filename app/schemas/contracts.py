@@ -49,6 +49,12 @@ class DialogueResult(StrictModel):
     reply: str = Field(default="", max_length=800)
 
 
+class InstructionOfferReply(StrictModel):
+    result: Literal["ACCEPT", "REJECT", "NEW_REQUEST", "UNCLEAR"]
+    choice: StrictInt | None = Field(default=None, ge=1, le=3)
+    evidence: str = Field(default="", max_length=300)
+
+
 class FollowupResult(StrictModel):
     result: Literal["EXCERPT", "NO_KNOWLEDGE"]
     source_chunk_ids: list[str] = Field(default_factory=list, max_length=1)

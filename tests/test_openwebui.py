@@ -83,6 +83,7 @@ def test_instruction_selection_has_a_short_structured_response_with_thinking_dis
         assert body["params"] == {"think": False, "max_tokens": 512, "temperature": 0}
         expected_schema = InstructionSelection.model_json_schema()
         expected_schema["properties"]["file_id"] = {"type": "null", "default": None}
+        expected_schema["properties"]["alternatives"]["maxItems"] = 0
         assert body["response_format"] == {"type": "json_schema", "json_schema": {
             "name": "instruction_selection", "schema": expected_schema,
         }}
@@ -134,6 +135,8 @@ def test_instruction_schema_enumerates_only_each_requests_current_catalogue_ids(
         calls.append(body)
         field = body["response_format"]["json_schema"]["schema"]["properties"]["file_id"]
         assert field["anyOf"] == [{"type": "string", "enum": allowed[len(calls) - 1]}, {"type": "null"}]
+        nested = body["response_format"]["json_schema"]["schema"]["$defs"]["InstructionAlternative"]
+        assert nested["properties"]["file_id"]["enum"] == allowed[len(calls) - 1]
         return httpx.Response(200, json={"choices": [{"message": {"content": '{"result":"NO_KNOWLEDGE"}'}}]})
 
     model = OpenWebUILLM(settings(), httpx.MockTransport(handler))
@@ -141,3 +144,20 @@ def test_instruction_schema_enumerates_only_each_requests_current_catalogue_ids(
         assert model.select_instruction({"catalogue": {file_id: "Описание устройства.md"}}).result == "NO_KNOWLEDGE"
     assert len(calls) == 2
     assert "enum" not in str(InstructionSelection.model_json_schema()["properties"]["file_id"])
+
+
+def test_natural_offer_reply_uses_fast_json_and_quotes_the_employees_own_consent():
+    def handler(request):
+        body = json.loads(request.content)
+        assert body["params"]["think"] is False
+        schema = body["response_format"]["json_schema"]["schema"]
+        assert schema["title"] == "InstructionOfferReply" and "file_id" not in schema["properties"]
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps({
+            "result": "ACCEPT", "choice": 2, "evidence": "второй вариант подойдет",
+        })}}]})
+
+    model = OpenWebUILLM(settings(), httpx.MockTransport(handler))
+    result = model.interpret_instruction_offer("Пожалуй, второй вариант подойдет", [
+        {"number": 1, "filename": "Первая инструкция.md"}, {"number": 2, "filename": "Вторая инструкция.md"},
+    ])
+    assert result.result == "ACCEPT" and result.choice == 2

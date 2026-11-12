@@ -15,7 +15,7 @@ from app.models import (
     AuditEvent, Conversation, Delivery, Feedback, Incident, Message, SolutionAttempt, User, now,
 )
 from app.models.talk import TalkAccount, TalkInbox, TalkRoom
-from app.schemas.contracts import AnalysisResult, DialogueResult, EscalationDetails
+from app.schemas.contracts import AnalysisResult, DialogueResult, EscalationDetails, InstructionOfferReply
 from app.services.chat.audit import audit
 from app.services.chat.channel_profile import channel_profile, remember_computer
 from app.services.chat.dialogue import _OPERATION_CLAIM, _TECHNICAL_OUTPUT
@@ -48,6 +48,7 @@ UNAVAILABLE = "Сейчас не удалось проверить базу зн
 CHANGED = "Инструкция изменилась или доступ к ней недоступен. Продолжение приостановлено до проверки актуального источника."
 ESCALATION_MENU = ("Как продолжим?\n1 — оформить письмо в техническую поддержку.\n"
                    "2 — продолжить диалог с ботом.\n\nМожно ответить цифрой или словами. Заявка пока не отправлена.")
+OFFER_CHOICE = "Какой вариант подходит? Напишите его номер или «нет»."
 RESUME_GUIDE = ("Продолжим с ботом с того же шага. Заявка не отправлена. "
                 "Напишите, что не получается, или «Готово», если выполнили показанные действия.")
 BACK_TO_BOT = "Продолжим с ботом. Опишите, с каким вопросом нужна помощь."
@@ -457,6 +458,8 @@ def _problem_query(message, flow):
 def _resume_turn(flow, context, llm, knowledge):
     saved = flow.get("escalation", {}).get("resume", {})
     restored = copy.deepcopy(saved.get("flow", {key: value for key, value in flow.items() if key != "escalation"}))
+    if restored.get("declined_instruction_offer"):
+        return Turn("RESUME", [(BACK_TO_BOT, None)], flow={}, resume={})
     # An explicit empty problem is significant: personal data collected after
     # the menu opened must never become a knowledge-search query on cancellation.
     if "query" in saved:
@@ -700,6 +703,8 @@ def _model_clarification(question):
             or re.search(r"[\r\n<>]|(?:mailto:|file:|data:|javascript:|www\.)", question, re.I)
             or _TECHNICAL_OUTPUT.search(question) or _OPERATION_CLAIM.search(question)
             or _redact(question) != question or refusal_reply(question)
+            or re.search(r"\b(?:в\s+(?:нашей\s+)?базе\s+знан\w*|наш[её]л\w*|"
+                         r"найден\w*\s+инструкц\w*|есть\s+(?:похож\w*\s+)?инструкц\w*)\b", question, re.I)
             or re.search(r"\b(?:парол\w*|password\w*|токен\w*|api[ _-]?key|secret\w*|"
                          r"модел\w*|маркиров\w*|шильдик\w*|производител\w*|"
                          r"отключите|сбросьте|переустановите)\b", question, re.I)):
@@ -771,6 +776,17 @@ def _support_turn(message, flow, context, llm, knowledge):
                 return Turn("NO_KNOWLEDGE", flow={"clarification_query": problem,
                                                   "clarification_keys": flow.get("clarification_keys", []),
                                                   "excluded": excluded})
+            if decision.result == "RELATED":
+                choices = [copy.deepcopy(item.document["source"]) for item in decision.alternatives]
+                if not choices or not all(knowledge.is_current(source) for source in choices):
+                    raise KnowledgeUnavailable("InvalidInstructionOffer", "instruction_selection")
+                text = "В нашей базе есть похожие инструкции. Возможно, вы имели в виду один из этих вариантов?\n\n"
+                text += "\n".join(f"{index}. {source['filename']}" for index, source in enumerate(choices, 1))
+                text += "\n\nНапишите номер подходящего варианта или «нет», если они вам не подходят."
+                return Turn("REPLY", [(text, None)], flow={
+                    "instruction_offer": {"problem": problem, "choices": choices},
+                    "clarification_query": problem, "excluded": excluded,
+                })
             if decision.result != "MATCH" or decision.approved is None:
                 raise KnowledgeUnavailable("InvalidInstructionDecision", "instruction_selection")
             approved = decision.approved
@@ -805,6 +821,10 @@ def _support_turn(message, flow, context, llm, knowledge):
                      "excluded": flow.get("excluded", []) if flow else []}
         if retrieval_key := getattr(knowledge, "last_cache_key", None):
             next_flow["retrieval_key"] = retrieval_key
+    return _guide_reply(approved, selected, next_flow, knowledge, clarification, analysis)
+
+
+def _guide_reply(approved, selected, next_flow, knowledge, clarification=False, analysis=None):
     if not knowledge.is_current(approved.document["source"]):
         return Turn("REPLY", [(CHANGED, None)])
     if not selected:
@@ -813,6 +833,73 @@ def _support_turn(message, flow, context, llm, knowledge):
                     approved, next_flow, analysis)
     return Turn("GUIDE", _photo_blocks(approved, selected, next_flow["has_more"], clarification),
                 approved, next_flow, analysis)
+
+
+def _instruction_offer_turn(message, flow, context, llm, knowledge, settings):
+    offer = flow["instruction_offer"]
+    choices = offer.get("choices", [])
+    if not isinstance(choices, list) or not 1 <= len(choices) <= 3:
+        raise KnowledgeUnavailable("InvalidSavedInstructionOffer", "instruction_selection")
+    normalized = _normalized(message).replace("ё", "е")
+    if normalized in {"отмена", "отменить", "вернуться к боту", "продолжить с ботом", "продолжить диалог с ботом"}:
+        return Turn("REPLY", [(BACK_TO_BOT, None)], flow={})
+    index = None
+    rejected = normalized in {"нет", "не подходит", "не подходят", "ни один", "ни один не подходит",
+                              "нет не подходит", "не то", "это не то", "ничего не подходит",
+                              "ни один вариант не подходит"}
+    if "?" not in message and normalized in {"1", "2", "3", "первый", "второй", "третий"}:
+        index = {"1": 1, "2": 2, "3": 3, "первый": 1, "второй": 2, "третий": 3}[normalized]
+    elif "?" not in message and normalized in {"да", "да подходит", "подходит", "этот подходит", "давайте", "да именно это"}:
+        index = 1 if len(choices) == 1 else None
+    elif not rejected and not _PHOTO_REQUEST.search(message):
+        interpret = getattr(llm, "interpret_instruction_offer", None)
+        if callable(interpret):
+            offered = [{"number": number, "filename": source["filename"]}
+                       for number, source in enumerate(choices, 1)]
+            try:
+                result = InstructionOfferReply.model_validate(interpret(message, offered))
+            except Exception as error:
+                report_failure(KnowledgeUnavailable(type(error).__name__, "offer_interpretation"))
+                return Turn("REPLY", [(OFFER_CHOICE, None)])
+            if result.result in {"ACCEPT", "REJECT"}:
+                if not result.evidence or result.evidence not in message:
+                    report_failure(KnowledgeUnavailable("InvalidOfferConsent", "offer_interpretation"))
+                    return Turn("REPLY", [(OFFER_CHOICE, None)])
+                if result.result == "ACCEPT":
+                    index = result.choice
+                    if index is None:
+                        raise KnowledgeUnavailable("InvalidOfferChoice", "instruction_selection")
+                else:
+                    if result.choice is not None:
+                        raise KnowledgeUnavailable("InvalidOfferChoice", "instruction_selection")
+                    rejected = True
+            elif result.choice is not None or result.evidence:
+                raise KnowledgeUnavailable("InvalidOfferReply", "instruction_selection")
+            elif result.result == "NEW_REQUEST":
+                turn = _text_turn(message, {}, context, None, llm, knowledge, settings)
+                turn.flow = turn.flow if turn.flow is not None else flow
+                return turn
+        elif _technical_message(message):
+            turn = _text_turn(message, {}, context, None, llm, knowledge, settings)
+            turn.flow = turn.flow if turn.flow is not None else flow
+            return turn
+    if rejected:
+        return Turn("NO_KNOWLEDGE", flow={"clarification_query": offer.get("problem", ""),
+                                          "declined_instruction_offer": True,
+                                          "excluded": flow.get("excluded", [])})
+    if index is None or not 1 <= index <= len(choices):
+        return Turn("REPLY", [(OFFER_CHOICE, None)])
+    source = choices[index - 1]
+    approved = knowledge.read(source["file_id"])
+    if approved.document["source"] != source:
+        return Turn("REPLY", [(CHANGED, None)], flow={"clarification_query": offer.get("problem", "")})
+    selected = applicable_images(approved.document, source["filename"])
+    query = f"Пользователь выбрал инструкцию «{source['filename']}»."
+    next_flow = {"source": source, "selection": selected, "shown": selected[:6], "query": query,
+                 "has_more": len(selected) > 6, "next_offset": 6 if len(selected) > 6 else None,
+                 "excluded": flow.get("excluded", [])}
+    # Confirmation of an alternative cannot train a shortcut for the original query.
+    return _guide_reply(approved, selected[:6], next_flow, knowledge)
 
 
 def _media_failure(error_code):
@@ -878,6 +965,17 @@ def _text_turn(message, flow, context, previous_pending, llm, knowledge, setting
         # Everything else here is employee data for the pending letter. It must
         # not be classified as chat or used to search for another instruction.
         return _intake_turn(message, flow, llm, context)
+    if flow.get("instruction_offer"):
+        if intent == "HUMAN":
+            return Turn("HUMAN")
+        if reply := _simple_social(message):
+            return Turn("REPLY", [(reply, None)])
+        try:
+            return _instruction_offer_turn(message, flow, context, llm, knowledge, settings)
+        except Exception as error:
+            if isinstance(error, KnowledgeUnavailable):
+                report_failure(error)
+            return Turn("REPLY", [(UNAVAILABLE, None)])
     if _return_to_bot(message):
         if flow.get("source"):
             return Turn("REPLY", [("Продолжим с ботом. Напишите, что не получается на текущем шаге, "
@@ -1068,6 +1166,8 @@ def _offer_escalation(session, incident, reason, flow, context):
             # simply because the employee backs out of the support menu.
             problem = _last_problem(saved_flow, context)
             saved_flow = {"clarification_query": problem, "excluded": saved_flow.get("excluded", [])} if problem else {}
+            if flow.get("declined_instruction_offer"):
+                saved_flow["declined_instruction_offer"] = True
         resume = {"flow": saved_flow, "state": incident.state if pending else "DIAGNOSING",
                   "result": incident.result if pending else None}
     problem = resume["query"] if "query" in resume else _last_problem(resume["flow"], context)
@@ -1083,6 +1183,8 @@ def _offer_escalation(session, incident, reason, flow, context):
                          "утверждённой инструкции. Требуется помощь специалиста технической поддержки."),
         "NO_MORE_SOLUTIONS": "Других подходящих утверждённых решений нет.",
     }.get(reason)
+    if flow.get("declined_instruction_offer"):
+        prefix = "Для описанной ситуации подходящая утверждённая инструкция не найдена. Предложенные варианты вам не подошли."
     _deliver(session, incident, [((prefix + "\n\n" if prefix else "") + ESCALATION_MENU, None)])
     audit(session, incident.id, "incident.escalation_choice_requested", reason=reason)
     return {**flow, "escalation": {"stage": "CHOICE", "resume": resume}}
@@ -1295,7 +1397,7 @@ def process_one(factory, settings, llm, knowledge=None, *, account_id=None):
                 TIMING_MARKER: {"message_id": claimed["inbox_id"], "stages_ms": {}, "stage_calls": {}}}
     try:
         timed_llm = _TimedProxy(llm, metadata, {"dialogue": "model_api", "analyze_context": "model_api",
-                                               "extract_escalation": "model_api"})
+                                               "extract_escalation": "model_api", "interpret_instruction_offer": "model_api"})
         def select_source(payload):
             with _measure(metadata, "model_api"):
                 call = getattr(llm, "_call", None)
