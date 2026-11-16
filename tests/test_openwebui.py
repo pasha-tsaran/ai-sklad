@@ -86,6 +86,10 @@ def test_instruction_selection_has_a_short_structured_response_with_thinking_dis
         expected_schema = InstructionSelection.model_json_schema()
         expected_schema["properties"]["file_id"] = {"type": "null", "default": None}
         expected_schema["properties"]["alternatives"]["maxItems"] = 0
+        expected_schema["properties"].pop("covered_goals")
+        expected_schema["properties"].pop("missing_goal_ids")
+        expected_schema["$defs"].pop("InstructionGoalCoverage")
+        expected_schema["properties"]["result"]["enum"].remove("PARTIAL")
         assert body["response_format"] == {"type": "json_schema", "json_schema": {
             "name": "instruction_selection", "schema": expected_schema,
         }}

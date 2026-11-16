@@ -26,8 +26,11 @@ from app.services.nextcloud.interruption import (
 )
 from app.services.chat.memory import _redact, load_context, remember_resolution
 from app.services.chat.messages import append_message
-from app.services.chat.policies import FORM_ACTION, MAX_ATTEMPTS, TERMINAL_STATES, direct_intent, requests_support_form
+from app.services.chat.policies import (
+    FORM_ACTION, MAX_ATTEMPTS, TERMINAL_STATES, direct_intent, requests_support_form, resolution_feedback,
+)
 from app.services.chat.service import messenger
+from app.services.chat.task_state import task_query, update_task_state
 from app.services.rag.openwebui import save_snapshot
 from app.services.rag.query import normalized_query, printer_kinds, scanner_kinds
 from app.services.rag.talk import (
@@ -237,6 +240,8 @@ def _simple_social(message):
 
 def _feedback_kind(message, flow=None):
     """Accept an explicit reported outcome, never infer it from a short 'yes'."""
+    if (flow or {}).get("source") and (reported := resolution_feedback(message)):
+        return reported
     if "?" in message:
         return None
     normalized = _normalized(message).replace("ё", "е")
@@ -737,6 +742,10 @@ def _confirmation_turn(approved, guide_flow, summary, *, remembered=False):
     summary = re.sub(r"([\\`*_{}\[\]()<>])", r"\\\1", summary)
     intro = "В прошлый раз с таким вопросом вы решали задачу" if remembered else "Я понял задачу так"
     text = f"{intro} — {summary}.\n\nПравильно я понял? Подтвердите или коротко поправьте меня."
+    if guide_flow.get("coverage_mode") == "partial":
+        text = (f"Я понял задачу так — {summary}.\n\n"
+                + _partial_boundary(guide_flow)
+                + "\n\nПоказать подтверждённую часть инструкции с фотографиями?")
     return Turn("REPLY", [(text, None)], flow={
         "understanding_confirmation": {"source": copy.deepcopy(approved.document["source"]),
                                       "guide_flow": copy.deepcopy(guide_flow), "summary": summary},
@@ -744,6 +753,13 @@ def _confirmation_turn(approved, guide_flow, summary, *, remembered=False):
         "opening_query": guide_flow.get("opening_query", guide_flow["query"]),
         "excluded": guide_flow.get("excluded", []),
     })
+
+
+def _partial_boundary(flow):
+    covered = ", ".join(flow["covered_goals"])
+    missing = ", ".join(flow["missing_goals"])
+    return (f"В найденной инструкции подтверждено — {covered}.\n"
+            f"Для действий «{missing}» подтверждённых шагов в найденных материалах пока нет.")
 
 
 def _guide_flow(approved, problem, opening_query, excluded):
@@ -764,13 +780,23 @@ def _understanding_turn(message, flow, context, llm, knowledge, settings):
         return Turn("REPLY", [(BACK_TO_BOT, None)], flow={})
     accepted = normalized in {"да", "верно", "правильно", "все верно", "все правильно", "да верно",
                               "да все верно", "да все правильно", "именно", "именно так", "подтверждаю"}
+    affirmation_words = set(normalized.split())
+    if (affirmation_words and affirmation_words <= {
+            "да", "ага", "верно", "правильно", "все", "так", "именно", "понял", "поняли",
+            "вы", "меня", "подтверждаю", "совершенно", "абсолютно",
+    } and affirmation_words.intersection({"да", "ага", "верно", "правильно", "подтверждаю"})):
+        accepted = True
     rejected = normalized in {"нет", "неверно", "неправильно", "не то", "это не то", "не так"}
     correction = {"clarification_query": flow["clarification_query"], "clarification_keys": ["MODEL"],
                   "opening_query": "",
                   "excluded": flow.get("excluded", [])}
+    if flow.get("task_state"):
+        correction["task_state"] = copy.deepcopy(flow["task_state"])
     if rejected:
         correction["clarification_question"] = UNDERSTANDING_CORRECTION
         return Turn("REPLY", [(UNDERSTANDING_CORRECTION, None)], flow=correction)
+    if re.match(r"\s*(?:нет|неправильно|неверно)\b[.!,:\s]+\S", message, re.I) and _technical_message(message):
+        return _support_turn(message, correction, context, llm, knowledge)
     if not accepted:
         if _PHOTO_REQUEST.search(message):
             return Turn("REPLY", [(UNDERSTANDING_CHOICE, None)])
@@ -813,11 +839,110 @@ def _understanding_turn(message, flow, context, llm, knowledge, settings):
 
 
 def _support_turn(message, flow, context, llm, knowledge):
+    """Understand employee facts before retrieval, without document-driven guesses."""
+    if not _confirmation_enabled(knowledge) or not callable(getattr(llm, "understand_task", None)):
+        return _retrieve_support_turn(message, flow, context, llm, knowledge)
+    photo_navigation = (_PHOTO_REQUEST.search(message) or _NEXT_PHOTO.search(message)) and set(
+        _normalized(message).split()
+    ) <= {"покажи", "покажите", "пришли", "пришлите", "отправь", "отправьте", "повтори", "повторите",
+          "фото", "фотографию", "фотографии", "картинку", "картинки", "изображение", "изображения",
+          "скриншот", "мне", "пожалуйста", "еще", "раз", "следующее", "следующую", "следующие",
+          "этот", "это", "эту", "предыдущее", "предыдущую", "предыдущие", "текущую", "к", "этому", "шагу"}
+    if flow.get("source") and (_step_confirmed(message) or photo_navigation):
+        return _retrieve_support_turn(message, flow, context, llm, knowledge)
+    if not flow:
+        remembered = _remembered_support_turn(message, context, knowledge)
+        if remembered:
+            return remembered
+    previous_question = flow.get("clarification_question", "")
+    previous_state = flow.get("task_state")
+    if previous_state is None and flow:
+        short_term = context.get("short_term", {})
+        messages = [row["content"] for row in short_term.get("messages", [])
+                    if row.get("role") == "user" and isinstance(row.get("content"), str)]
+        messages = messages[-11:]
+        while messages and sum(map(len, messages)) > 6000:
+            messages.pop(0)
+        if messages:
+            previous_state = {"facts": [], "goals": {}, "messages": messages}
+    try:
+        state = update_task_state(message[:6000], previous_state, previous_question, llm)
+    except Exception as error:
+        failure = KnowledgeUnavailable(type(error).__name__, "task_understanding")
+        report_failure(failure)
+        raise failure from error
+    next_flow = copy.deepcopy(flow)
+    if state["new_task"]:
+        next_flow = {}
+    answered = list(next_flow.get("answered_questions", []))
+    if previous_question and not state["new_task"]:
+        answered.append(previous_question)
+    next_flow.update(task_state=state, answered_questions=list(dict.fromkeys(answered))[-8:])
+    question = state.get("question", "")
+    field_name = state.get("question_field")
+    known = {fact["key"] for fact in state["facts"]}
+    generic_equipment = {"сканер", "принтер", "устройство", "оборудование", "техника"}
+    if any(fact["key"] == "equipment_type" and _normalized(fact["value"]) in generic_equipment
+           for fact in state["facts"]):
+        known.discard("equipment_type")
+    hardware = any(fact["key"] == "scope" and fact["value"] == "hardware" for fact in state["facts"])
+    answered_field = (field_name in known or field_name == "goal" and len(state["goals"]) > 1
+                      or field_name == "application" and hardware and bool(state["goals"]))
+    repeated = question and any(_normalized(question) == _normalized(item) for item in answered)
+    if question and not answered_field and not repeated:
+        question = _model_clarification(question)
+        next_flow.update(clarification_query=task_query(state) or message[:6000],
+                         clarification_keys=["MODEL"], clarification_question=question,
+                         opening_query=next_flow.get("opening_query", message))
+        return Turn("REPLY", [(question, None)], flow=next_flow)
+    problem = task_query(state)
+    if not state["goals"]:
+        question = "Что именно нужно сделать? Опишите желаемый результат своими словами."
+        next_flow.update(clarification_query=problem or message[:6000], clarification_keys=["MODEL"],
+                         clarification_question=question, opening_query=next_flow.get("opening_query", message))
+        return Turn("REPLY", [(question, None)], flow=next_flow)
+    next_flow["task_query"] = problem
+    next_flow.pop("required_source", None)
+    previous = flow.get("task_state", {})
+    facts = {(item["key"], _normalized(item["value"])) for item in state["facts"]}
+    previous_facts = {(item["key"], _normalized(item["value"])) for item in previous.get("facts", [])}
+    goals = [(key, _normalized(goal["text"])) for key, goal in state["goals"].items()]
+    previous_goals = [(key, _normalized(goal["text"])) for key, goal in previous.get("goals", {}).items()]
+    same_task = facts == previous_facts and goals == previous_goals
+    # Step difficulties can retain verified source navigation. New facts/goals
+    # and corrections must select against the entire updated task again.
+    if not (same_task and _current_step_question(message)):
+        next_flow.pop("source", None)
+    turn = _retrieve_support_turn(message, next_flow, context, llm, knowledge)
+    retained = turn.flow if turn.flow is not None else next_flow
+    retained.update(task_state=state, answered_questions=next_flow["answered_questions"], task_query=problem)
+    if confirmation := retained.get("understanding_confirmation"):
+        confirmation["guide_flow"].update(task_state=copy.deepcopy(state), task_query=problem,
+                                          answered_questions=next_flow["answered_questions"])
+    turn.flow = retained
+    return turn
+
+
+def _remembered_support_turn(message, context, knowledge, excluded=()):
+    hint_method = getattr(knowledge, "confirmation_hint", None)
+    hint = hint_method(message, excluded=excluded) if callable(hint_method) else None
+    if hint:
+        approved = knowledge.read(hint["source"]["file_id"])
+        if approved.document["source"] == hint["source"]:
+            next_flow = _guide_flow(approved, hint["problem"], message, list(excluded))
+            next_flow["retrieval_key"] = cache_key(knowledge.settings, hint["problem"], context)
+            return _confirmation_turn(approved, next_flow, hint["problem"], remembered=True)
+    return None
+
+
+def _retrieve_support_turn(message, flow, context, llm, knowledge):
     has_guide = bool(flow.get("source"))
     if has_guide and _different_instruction(message):
         replacement = _replace_guide_context(flow)
         message = "\n".join(part for part in (replacement["clarification_query"], message) if part)
-        flow = {"excluded": replacement["excluded"]}
+        flow = {**{key: copy.deepcopy(flow[key]) for key in (
+            "task_state", "task_query", "answered_questions", "opening_query",
+        ) if key in flow}, "excluded": replacement["excluded"]}
         has_guide = False
     photo_request = bool(_PHOTO_REQUEST.search(message) or _NEXT_PHOTO.search(message))
     next_photo = bool(photo_request and _NEXT_PHOTO.search(message))
@@ -825,14 +950,9 @@ def _support_turn(message, flow, context, llm, knowledge):
     continuation = bool(has_guide and (_step_confirmed(message) or next_photo))
     model_selection = bool(getattr(knowledge, "uses_llm_selection", False))
     if _confirmation_enabled(knowledge) and not flow.get("source") and not flow.get("clarification_query"):
-        hint_method = getattr(knowledge, "confirmation_hint", None)
-        hint = hint_method(message, excluded=flow.get("excluded", [])) if callable(hint_method) else None
-        if hint:
-            approved = knowledge.read(hint["source"]["file_id"])
-            if approved.document["source"] == hint["source"]:
-                next_flow = _guide_flow(approved, hint["problem"], message, flow.get("excluded", []))
-                next_flow["retrieval_key"] = cache_key(knowledge.settings, hint["problem"], context)
-                return _confirmation_turn(approved, next_flow, hint["problem"], remembered=True)
+        if not flow.get("task_state") and (remembered := _remembered_support_turn(
+                message, context, knowledge, flow.get("excluded", []))):
+            return remembered
     if not clarification and not continuation and not model_selection:
         if followup := _scanner_clarification(message, flow, knowledge):
             return followup
@@ -862,7 +982,7 @@ def _support_turn(message, flow, context, llm, knowledge):
                          "next_offset": offset + len(selected) if offset + len(selected) < len(eligible) else None,
                          "shown": selected}
     else:
-        problem = _problem_query(message, flow)
+        problem = flow.get("task_query") or _problem_query(message, flow)
         excluded = flow.get("excluded", [])
         opening_query = flow.get("opening_query", message)
         if has_guide or (problem == message[:6000] and problem != flow.get("clarification_query")):
@@ -871,6 +991,18 @@ def _support_turn(message, flow, context, llm, knowledge):
         if model_selection:
             selection_context = {**context, "current_message": message,
                                  "previous_question": flow.get("clarification_question", "")}
+            if state := flow.get("task_state"):
+                selection_context.update(
+                    requested_goals={key: goal["text"] for key, goal in state["goals"].items()},
+                    task_state={"facts": [{"key": fact["key"], "value": fact["value"]}
+                                          for fact in state["facts"]],
+                                "goals": {key: goal["text"] for key, goal in state["goals"].items()}},
+                    answered_questions=flow.get("answered_questions", []),
+                )
+            if chosen := flow.get("required_source"):
+                selection_context["verified_previous_source"] = {
+                    "file_id": chosen["file_id"], "sha256": chosen["sha256"],
+                }
             source = flow.get("source")
             if (has_guide and isinstance(source, dict)
                     and all(isinstance(source.get(name), str) and source[name]
@@ -879,6 +1011,16 @@ def _support_turn(message, flow, context, llm, knowledge):
                 selection_context["shown_source"] = {name: source[name] for name in ("file_id", "filename")}
             decision = knowledge.search_with_llm(problem, context=selection_context,
                                                  excluded=excluded, fallback_query=problem)
+            previous_questions = [flow.get("clarification_question", ""), *flow.get("answered_questions", [])]
+            if (decision.result == "CLARIFY" and any(
+                    _normalized(decision.question) == _normalized(question)
+                    for question in previous_questions if question)):
+                decision = knowledge.search_with_llm(
+                    problem, context={**selection_context, "clarification_retry": True},
+                    excluded=excluded, fallback_query=problem,
+                )
+                if decision.result == "CLARIFY":
+                    raise KnowledgeUnavailable("RepeatedInstructionClarification", "instruction_selection")
             if getattr(decision, "new_request", False):
                 problem, opening_query = message[:6000], message
             if decision.result == "CLARIFY":
@@ -897,6 +1039,8 @@ def _support_turn(message, flow, context, llm, knowledge):
                                                   "clarification_keys": flow.get("clarification_keys", []),
                                                   "excluded": excluded, "opening_query": opening_query})
             if decision.result == "RELATED":
+                if flow.get("required_source"):
+                    return Turn("NO_KNOWLEDGE", flow={"clarification_query": problem})
                 choices = [copy.deepcopy(item.document["source"]) for item in decision.alternatives]
                 if not choices or not all(knowledge.is_current(source) for source in choices):
                     raise KnowledgeUnavailable("InvalidInstructionOffer", "instruction_selection")
@@ -907,9 +1051,12 @@ def _support_turn(message, flow, context, llm, knowledge):
                     "instruction_offer": {"problem": problem, "choices": choices},
                     "clarification_query": problem, "excluded": excluded, "opening_query": opening_query,
                 })
-            if decision.result != "MATCH" or decision.approved is None:
+            if decision.result not in {"MATCH", "PARTIAL"} or decision.approved is None:
                 raise KnowledgeUnavailable("InvalidInstructionDecision", "instruction_selection")
             approved = decision.approved
+            if (flow.get("required_source")
+                    and approved.document["source"] != flow["required_source"]):
+                raise KnowledgeUnavailable("InstructionOfferSourceChanged", "instruction_selection")
             understanding = getattr(decision, "understanding", "")
         else:
             approved = knowledge.search(problem, excluded=excluded, fallback_query=problem)
@@ -935,13 +1082,19 @@ def _support_turn(message, flow, context, llm, knowledge):
                 and flow["source"] != approved.document["source"]):
             return Turn("REPLY", [(CHANGED, None)])
         next_flow = _guide_flow(approved, problem, opening_query, excluded)
+        if state := flow.get("task_state"):
+            next_flow["task_state"] = copy.deepcopy(state)
+            next_flow["understanding"] = ", затем ".join(goal["text"] for goal in state["goals"].values())
+        if model_selection and decision.result == "PARTIAL":
+            next_flow.update(coverage_mode="partial", covered_goals=list(decision.covered_goals),
+                             missing_goals=list(decision.missing_goals))
         selected = next_flow["shown"]
-        if understanding:
+        if understanding and not flow.get("task_state"):
             next_flow["understanding"] = understanding
         retrieval_key = getattr(knowledge, "last_cache_key", None)
         if model_selection and getattr(decision, "new_request", False):
             retrieval_key = cache_key(knowledge.settings, problem, context)
-        if retrieval_key:
+        if retrieval_key and next_flow.get("coverage_mode") != "partial":
             next_flow["retrieval_key"] = retrieval_key
     return _guide_reply(approved, selected, next_flow, knowledge, clarification, analysis)
 
@@ -952,11 +1105,18 @@ def _guide_reply(approved, selected, next_flow, knowledge, clarification=False, 
     if _confirmation_enabled(knowledge) and not next_flow.get("understanding_confirmed"):
         summary = next_flow.get("understanding") or next_flow["query"]
         return _confirmation_turn(approved, next_flow, summary)
+    partial = next_flow.get("coverage_mode") in {"partial", "partial_completed"}
+    action = "REPEAT_GUIDE" if next_flow.get("coverage_mode") == "partial_completed" else "GUIDE"
     if not selected:
         text = approved.document["content"].split("Фотографии и пояснения", 1)[0].strip()
-        return Turn("GUIDE", [(text + "\n\nУдалось выполнить эти действия?", None)],
+        if partial:
+            text = _partial_boundary(next_flow) + "\n\n" + text
+        return Turn(action, [(text + "\n\nУдалось выполнить эти действия?", None)],
                     approved, next_flow, analysis)
-    return Turn("GUIDE", _photo_blocks(approved, selected, next_flow["has_more"], clarification),
+    blocks = _photo_blocks(approved, selected, next_flow["has_more"], clarification)
+    if partial:
+        blocks.insert(0, (_partial_boundary(next_flow), None))
+    return Turn(action, blocks,
                 approved, next_flow, analysis)
 
 
@@ -1018,6 +1178,17 @@ def _instruction_offer_turn(message, flow, context, llm, knowledge, settings):
     approved = knowledge.read(source["file_id"])
     if approved.document["source"] != source:
         return Turn("REPLY", [(CHANGED, None)], flow={"clarification_query": offer.get("problem", "")})
+    if flow.get("task_state", {}).get("goals"):
+        # Consent chooses a source to check, without proving that it supports
+        # every outstanding action or changing the employee's equipment facts.
+        recheck = {key: copy.deepcopy(flow[key]) for key in (
+            "task_state", "task_query", "opening_query", "answered_questions", "excluded",
+        ) if key in flow}
+        recheck.update(required_source=copy.deepcopy(source),
+                       task_query=flow.get("task_query") or offer["problem"])
+        turn = _retrieve_support_turn(message, recheck, context, llm, knowledge)
+        turn.flow = {**recheck, **(turn.flow or {})}
+        return turn
     selected = applicable_images(approved.document, source["filename"])
     query = f"Пользователь выбрал инструкцию «{source['filename']}»."
     next_flow = {"source": source, "selection": selected, "shown": selected[:6], "query": query,
@@ -1128,9 +1299,13 @@ def _text_turn(message, flow, context, previous_pending, llm, knowledge, setting
         return Turn("HUMAN")
     if reply := _simple_social(message):
         return Turn("REPLY", [(reply, None)])
-    if feedback := _feedback_kind(message, flow):
+    completed_part = flow.get("coverage_mode") == "partial_completed"
+    if completed_part and resolution_feedback(message) == "SUCCESS":
+        return Turn("REPLY", [("Спасибо, результат этой части уже учтён. " + _partial_boundary(flow), None)])
+    feedback = None if completed_part else _feedback_kind(message, flow)
+    if feedback:
         if feedback == "SUCCESS":
-            return Turn("SUCCESS")
+            return Turn("PARTIAL_SUCCESS" if flow.get("coverage_mode") == "partial" else "SUCCESS")
         if flow.get("source") and context.get("incident", {}).get("failed_attempts", 0) < MAX_ATTEMPTS - 1:
             search_flow = {"excluded": list(dict.fromkeys(flow.get("excluded", []) + [flow["source"]["file_id"]]))}
             try:
@@ -1367,6 +1542,9 @@ def _finish(factory, turn, claimed, llm, settings):
             if not resume_response(session, room, incident, inbox, turn.resume or {}):
                 _deliver(session, incident, [("Предыдущий ответ уже завершён или его нельзя безопасно продолжить. "
                                                 "Напишите, с чем нужна помощь.", None)])
+        elif turn.action == "REPEAT_GUIDE":
+            _deliver(session, incident, turn.blocks, source=turn.approved.document["source"])
+            room.flow = turn.flow
         elif turn.action in {"GUIDE", "RETRY_GUIDE"}:
             if turn.action == "RETRY_GUIDE" and pending:
                 pending.status = "FAILED"
@@ -1419,14 +1597,29 @@ def _finish(factory, turn, claimed, llm, settings):
                     else:
                         incident.description = (incident.description + "\n" + turn.flow["query"]).strip()[-8000:]
                 room.flow = turn.flow
-        elif turn.action in {"SUCCESS", "FAILED"}:
+        elif turn.action in {"SUCCESS", "PARTIAL_SUCCESS", "FAILED"}:
             if not pending:
                 _deliver(session, incident, [("Сначала опишите, что не работает, чтобы я мог подобрать инструкцию.", None)])
             else:
-                helped = turn.action == "SUCCESS"
+                helped = turn.action in {"SUCCESS", "PARTIAL_SUCCESS"}
                 pending.status = "SUCCEEDED" if helped else "FAILED"
                 session.add(Feedback(attempt_id=pending.id, helped=helped, comment=""))
-                if helped:
+                if turn.action == "PARTIAL_SUCCESS":
+                    remaining = ", ".join((room.flow or {}).get("missing_goals", []))
+                    saved = copy.deepcopy(room.flow)
+                    saved["opening_query"] = ""
+                    state = saved.get("task_state")
+                    if state:
+                        state["goals"] = {key: goal for key, goal in state["goals"].items()
+                                          if goal["text"] in saved["missing_goals"]}
+                        state["question"], state["question_field"] = "", None
+                        saved["task_query"] = task_query(state)
+                    room.flow = {**saved, "coverage_mode": "partial_completed"}
+                    incident.state, incident.pending_action, incident.result = "DIAGNOSING", None, "PARTIAL"
+                    _deliver(session, incident, [("Спасибо за обратную связь. Подтверждённая часть выполнена. "
+                        f"Для действий «{remaining}» подтверждённых шагов пока нет. "
+                        "Для помощи специалиста напишите «оператор».", None)])
+                elif helped:
                     incident.state, incident.pending_action, incident.closed_at = "RESOLVED", None, now()
                     session.flush()
                     remember_resolution(session, incident, settings)
@@ -1541,6 +1734,7 @@ def process_one(factory, settings, llm, knowledge=None, *, account_id=None):
                 TIMING_MARKER: {"message_id": claimed["inbox_id"], "stages_ms": {}, "stage_calls": {}}}
     try:
         timed_llm = _TimedProxy(llm, metadata, {"dialogue": "model_api", "analyze_context": "model_api",
+                                               "understand_task": "model_api",
                                                "extract_escalation": "model_api", "interpret_instruction_offer": "model_api",
                                                "interpret_understanding_reply": "model_api"})
         def select_source(payload):

@@ -7,11 +7,11 @@ from langsmith import tracing_context
 from app.core.logging import event
 from app.schemas.contracts import (
     AnalysisResult, AnswerResult, DialogueResult, EscalationExtraction, FollowupResult, InstructionOfferReply, SummaryResult,
-    UnderstandingReply,
+    SupportTaskUnderstanding, UnderstandingReply,
 )
 from app.services.llm.prompts import (
     ANALYZE_TASK, COMPOSE_TASK, DIALOGUE_TASK, ESCALATION_EXTRACTION_TASK, FOLLOWUP_TASK,
-    INSTRUCTION_OFFER_TASK, SUMMARY_TASK, UNDERSTANDING_REPLY_TASK, stage_messages,
+    INSTRUCTION_OFFER_TASK, SUMMARY_TASK, SUPPORT_TASK_TASK, UNDERSTANDING_REPLY_TASK, stage_messages,
 )
 
 
@@ -21,7 +21,11 @@ class OpenWebUILLM:
         self.transport = transport
         self.name = f"openwebui:{settings.openwebui_model}"[:255]
 
-    def _call(self, schema, task, payload, *, fast_selection=False):
+    def _call(self, schema, task, payload, *, fast_selection=False, max_output_tokens=None):
+        if max_output_tokens is not None and (
+            type(max_output_tokens) is not int or not 128 <= max_output_tokens <= 1536
+        ):
+            raise ValueError("InvalidOutputTokenBudget")
         selection_schema = None
         if fast_selection:
             selection_schema = schema.model_json_schema()
@@ -36,18 +40,40 @@ class OpenWebUILLM:
                 alternative_schema["properties"]["file_id"]["enum"] = allowed_ids
             if "alternatives" in selection_schema["properties"] and not allowed_ids:
                 selection_schema["properties"]["alternatives"]["maxItems"] = 0
+            if "covered_goals" in selection_schema["properties"] and not payload.get("requested_goals"):
+                selection_schema["properties"].pop("covered_goals")
+                selection_schema["properties"].pop("missing_goal_ids")
+                selection_schema.get("$defs", {}).pop("InstructionGoalCoverage", None)
+                selection_schema["properties"]["result"]["enum"].remove("PARTIAL")
+            coverage = selection_schema.get("$defs", {}).get("InstructionGoalCoverage")
+            if coverage and payload.get("requested_goals"):
+                goal_ids = list(payload["requested_goals"])
+                coverage["properties"]["goal_id"]["enum"] = goal_ids
+                selection_schema["properties"]["missing_goal_ids"]["items"]["enum"] = goal_ids
+            task_goal = selection_schema.get("$defs", {}).get("SupportTaskGoal")
+            if task_goal:
+                goal_ids = list(payload.get("previous_state", {}).get("goals", {}))
+                task_goal["properties"]["goal_id"] = (
+                    {"anyOf": [{"type": "string", "enum": goal_ids}, {"type": "null"}], "default": None}
+                    if goal_ids else {"type": "null", "default": None}
+                )
+            if payload.get("allow_clarification") is False and "result" in selection_schema["properties"]:
+                selection_schema["properties"]["result"]["enum"].remove("CLARIFY")
         # LangChain orchestrates prompt -> existing internal transport -> strict validation.
         # No cloud model, autonomous tools or external memory service is introduced.
+        request_options = {"selection_schema": selection_schema}
+        if max_output_tokens is not None:
+            request_options["max_output_tokens"] = max_output_tokens
         chain = (
             RunnableLambda(lambda value: stage_messages(schema, task, value, include_schema=not fast_selection))
-            | RunnableLambda(lambda messages: self._request(messages, selection_schema=selection_schema)
+            | RunnableLambda(lambda messages: self._request(messages, **request_options)
                              if fast_selection else self._request(messages))
             | RunnableLambda(schema.model_validate_json)
         )
         with tracing_context(enabled=False, parent=False):
             return chain.invoke(payload, config={"callbacks": []})
 
-    def _request(self, messages, *, selection_schema=None):
+    def _request(self, messages, *, selection_schema=None, max_output_tokens=None):
         body = {
             "model": self.settings.openwebui_model,
             "stream": False,
@@ -65,9 +91,10 @@ class OpenWebUILLM:
         if selection_schema is not None:
             # Open WebUI 0.11 forwards params through native Ollama options.
             # Selection needs a small grounded JSON decision and a short quote.
+            output_limit = max_output_tokens if max_output_tokens is not None else 512
             body.update({
-                "max_tokens": 512,
-                "params": {**body.get("params", {}), "think": False, "max_tokens": 512, "temperature": 0},
+                "max_tokens": output_limit,
+                "params": {**body.get("params", {}), "think": False, "max_tokens": output_limit, "temperature": 0},
                 "response_format": {"type": "json_schema", "json_schema": {
                     "name": "instruction_selection", "schema": selection_schema,
                 }},
@@ -91,6 +118,7 @@ class OpenWebUILLM:
             reason = choice.get("finish_reason")
             try:
                 event("llm.instruction_response", total_ms=round((perf_counter() - started) * 1000, 3),
+                      response_schema=selection_schema.get("title"),
                       input_chars=sum(len(message["content"]) for message in messages),
                       output_chars=len(content) if isinstance(content, str) else None,
                       finish_reason=reason if reason in {"stop", "length", "tool_calls", "content_filter"} else "other",
@@ -119,6 +147,13 @@ class OpenWebUILLM:
             "catalogue": {aliases[file_id]: name for file_id, name in catalogue.items()},
             "candidates": {aliases[file_id]: content for file_id, content in candidates.items()},
         }
+        if "candidate_image_numbers" in payload:
+            image_numbers = payload["candidate_image_numbers"]
+            if not isinstance(image_numbers, dict) or any(file_id not in candidates for file_id in image_numbers):
+                raise ValueError("UnknownInstructionImageCandidate")
+            wire_payload["candidate_image_numbers"] = {
+                aliases[file_id]: numbers for file_id, numbers in image_numbers.items()
+            }
         context = payload.get("context")
         if isinstance(context, dict):
             wire_context = dict(context)
@@ -130,7 +165,11 @@ class OpenWebUILLM:
                     else:
                         wire_context.pop(name, None)
             wire_payload["context"] = wire_context
-        choice = self._call(InstructionSelection, INSTRUCTION_SELECTION_TASK, wire_payload, fast_selection=True)
+        call_options = {"fast_selection": True}
+        goals = payload.get("requested_goals")
+        if goals:
+            call_options["max_output_tokens"] = 768 if len(goals) <= 2 else 1024 if len(goals) <= 4 else 1536
+        choice = self._call(InstructionSelection, INSTRUCTION_SELECTION_TASK, wire_payload, **call_options)
         decoded = choice.model_dump()
         source_ids = [choice.file_id] if choice.file_id is not None else []
         source_ids.extend(alternative.file_id for alternative in choice.alternatives)
@@ -155,6 +194,11 @@ class OpenWebUILLM:
         elif not reply.evidence or reply.evidence not in message:
             raise ValueError("InvalidUnderstandingEvidence")
         return reply
+
+    def understand_task(self, message, previous_state, previous_question):
+        return self._call(SupportTaskUnderstanding, SUPPORT_TASK_TASK, {
+            "message": message, "previous_state": previous_state, "previous_question": previous_question,
+        }, fast_selection=True, max_output_tokens=1536)
 
     def analyze(self, message):
         return self.analyze_context(message, {})

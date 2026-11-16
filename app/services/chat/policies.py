@@ -46,6 +46,61 @@ _NEGATED_REQUEST_SUFFIX = re.compile(
 _CONDITIONAL_REQUEST_PREFIX = re.compile(r"\b(?:если|когда|вдруг)\b")
 _QUOTED_TEXT = re.compile(r'«[^»]*»|“[^”]*”|"[^"\n]*"')
 
+_FAILED_OUTCOME = re.compile(
+    r"\b(?:не\s+(?:помогло|сработало|заработало|работает)|"
+    r"ничего\s+не\s+изменилось|проблема\s+(?:осталась|сохраняется)|"
+    r"не\s+удалось\s+(?:решить|устранить)\s+проблему)\b"
+)
+_SUCCESSFUL_OUTCOME = re.compile(
+    r"\b(?:помогло|сработало|заработало|все\s+работает|"
+    r"(?:теперь|сейчас)\s+(?:все\s+)?работает|"
+    r"проблема\s+(?:решена|устранена)|вопрос\s+решен|"
+    r"удалось\s+(?:решить|устранить)\s+проблему)\b"
+)
+_UNCERTAIN_OUTCOME = re.compile(
+    r"\b(?:если|вдруг|надеюсь|возможно|кажется|похоже|скажи|напиши|ответь|"
+    r"не\s+уверен\w*)\b"
+)
+_PARTIAL_OUTCOME = re.compile(
+    r"\b(?:но|однако|частично|кроме|остал(?:ось|ся|ась|ись)|"
+    r"еще\s+(?:нужно|надо)|не\s+полностью|не\s+до\s+конца|не\s+все)\b"
+)
+_COMPLETION_ACKNOWLEDGEMENTS = {
+    "да", "ну", "ура", "спасибо", "большое", "благодарю", "вас", "вам", "за", "помощь",
+    "отлично", "хорошо", "вот", "все", "правильно", "верно", "теперь", "уже", "наконец", "то",
+    "получилось", "удалось",
+}
+
+
+def resolution_feedback(message: str) -> str | None:
+    """Recognize a reported overall outcome after an active instruction.
+
+    Goal consent and completion of an individual step remain separate dialogue
+    actions. The caller must check that the employee has received a guide.
+    """
+    text = _QUOTED_TEXT.sub(" ", message.casefold().replace("ё", "е"))
+    if "?" in text:
+        return None
+    normalized = " ".join(re.sub(r"[^\w\s]", " ", text).split())
+    if _UNCERTAIN_OUTCOME.search(normalized):
+        return None
+    failed = bool(_FAILED_OUTCOME.search(normalized))
+    remaining = _FAILED_OUTCOME.sub(" ", normalized)
+    succeeded = bool(_SUCCESSFUL_OUTCOME.search(remaining))
+    if failed:
+        progress = bool(re.search(r"(?<!не )\b(?:удалось|получилось)\b", remaining))
+        return None if succeeded or progress else "FAILED"
+    if _PARTIAL_OUTCOME.search(normalized):
+        return None
+    if succeeded:
+        return "SUCCESS"
+    words = set(normalized.split())
+    has_completion = bool(words & {"удалось", "получилось"})
+    has_closure = bool(words & {"спасибо", "благодарю", "все"})
+    if has_completion and has_closure and words <= _COMPLETION_ACKNOWLEDGEMENTS:
+        return "SUCCESS"
+    return None
+
 
 def requests_support_form(message: str) -> bool:
     """Recognize a current request to prepare support mail in ordinary wording."""

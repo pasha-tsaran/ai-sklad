@@ -780,3 +780,203 @@ def test_selection_mode_is_explicitly_available_only_for_real_model_backend():
     knowledge.settings.llm_backend = "openwebui"
     assert knowledge.uses_llm_selection is True
     assert InstructionSelection.model_validate(match()).result == "MATCH"
+
+
+RESET_GOAL = "Сбросить устройство к заводским настройкам"
+VOLUME_GOAL = "Увеличить громкость устройства"
+VOLUME_EVIDENCE = "Для максимальной громкости отсканируйте настроечный код на этой иллюстрации."
+RESET_EVIDENCE = "Для заводского сброса используйте исходный код сброса на этой иллюстрации."
+REQUESTED_GOALS = {"reset": RESET_GOAL, "volume": VOLUME_GOAL}
+
+
+def goal_coverage(goal_id, evidence, *, support_kind="IMAGE", image_numbers=None):
+    return {"goal_id": goal_id, "evidence": evidence, "support_kind": support_kind,
+            "image_numbers": [1] if image_numbers is None else image_numbers}
+
+
+def goal_selection(result, covered, missing=()):
+    return {"result": result, "file_id": DOC, "covered_goals": covered, "missing_goal_ids": list(missing)}
+
+
+def test_partial_volume_instruction_cannot_claim_the_requested_factory_reset():
+    data = instruction([VOLUME_EVIDENCE])
+    knowledge, state = scanner_provider([(DOC, "Настроечные коды.docx", data)])
+    calls = []
+
+    def select(payload):
+        calls.append(payload)
+        assert payload["requested_goals"] == REQUESTED_GOALS
+        assert payload["candidate_image_numbers"] == {DOC: [1]}
+        return goal_selection("PARTIAL", [goal_coverage("volume", VOLUME_EVIDENCE)], ["reset"])
+
+    knowledge.selector = select
+    result = knowledge.search_with_llm("Сначала сбросить настройки, затем увеличить громкость", {
+        "requested_goals": REQUESTED_GOALS,
+        "task_state": {"facts": {"configuration_target": "само устройство", "program_connected": True}},
+    })
+    assert result.result == "PARTIAL" and result.approved.document["source"]["file_id"] == DOC
+    assert result.covered_goals == (VOLUME_GOAL,) and result.missing_goals == (RESET_GOAL,)
+    assert result.approved.illustrations[1].data == read_docx_images(data)[0].data
+    assert calls[0]["context"]["task_state"]["facts"]["program_connected"] is True
+    assert all(request.method == "GET" for request in state["calls"])
+
+
+def test_complete_match_requires_a_verbatim_proof_for_every_requested_goal():
+    data = instruction([RESET_EVIDENCE, VOLUME_EVIDENCE])
+    knowledge, _ = scanner_provider([(DOC, "Полная настройка.docx", data)])
+    knowledge.selector = lambda payload: goal_selection("MATCH", [
+        goal_coverage("volume", VOLUME_EVIDENCE, image_numbers=[2]),
+        goal_coverage("reset", RESET_EVIDENCE, image_numbers=[1]),
+    ])
+    result = knowledge.search_with_llm("Сброс и увеличение громкости", {"requested_goals": REQUESTED_GOALS})
+    assert result.result == "MATCH" and result.covered_goals == (RESET_GOAL, VOLUME_GOAL)
+    assert result.missing_goals == () and set(result.approved.illustrations) == {1, 2}
+
+
+@pytest.mark.parametrize("response", [
+    goal_selection("MATCH", [goal_coverage("volume", VOLUME_EVIDENCE)]),
+    goal_selection("MATCH", [goal_coverage("volume", VOLUME_EVIDENCE)], ["reset"]),
+    goal_selection("PARTIAL", [goal_coverage("volume", VOLUME_EVIDENCE)]),
+    goal_selection("PARTIAL", [], ["reset", "volume"]),
+    goal_selection("PARTIAL", [goal_coverage("volume", VOLUME_EVIDENCE)], ["reset", "reset"]),
+    goal_selection("PARTIAL", [goal_coverage("volume", VOLUME_EVIDENCE)], ["reset", "other"]),
+    goal_selection("PARTIAL", [goal_coverage("volume", VOLUME_EVIDENCE)], ["reset", "volume"]),
+    goal_selection("PARTIAL", [goal_coverage("volume", VOLUME_EVIDENCE), goal_coverage("volume", VOLUME_EVIDENCE)],
+                   ["reset"]),
+    goal_selection("PARTIAL", [goal_coverage("other", VOLUME_EVIDENCE)], ["reset"]),
+])
+def test_unaccounted_duplicate_or_forged_goals_never_become_a_complete_instruction(response):
+    knowledge, _ = scanner_provider([(DOC, "Настройка.docx", instruction([VOLUME_EVIDENCE]))])
+    knowledge.selector = lambda payload: response
+    with pytest.raises(KnowledgeUnavailable, match="InvalidInstructionCoverage"):
+        knowledge.search_with_llm("Сброс и громкость", {"requested_goals": REQUESTED_GOALS})
+
+
+def test_external_reference_without_the_actual_programming_code_is_not_image_proof():
+    content = ("Для настройки может понадобиться штрихкод заводского сброса. "
+               "Внешняя страница с кодами отдельно не проверялась.")
+    knowledge, _ = scanner_provider([(DOC, "Программная настройка.md", content.encode())])
+    knowledge.selector = lambda payload: goal_selection("MATCH", [goal_coverage("reset", content)])
+    with pytest.raises(KnowledgeUnavailable, match="InstructionImageEvidenceMismatch"):
+        knowledge.search_with_llm("Заводской сброс", {"requested_goals": {"reset": RESET_GOAL}})
+
+
+@pytest.mark.parametrize("image_numbers", [[], [0], [2], [1, 1]])
+def test_image_coverage_requires_existing_distinct_original_numbers(image_numbers):
+    knowledge, _ = scanner_provider([(DOC, "Настройка.docx", instruction([VOLUME_EVIDENCE]))])
+    knowledge.selector = lambda payload: goal_selection("MATCH", [
+        goal_coverage("volume", VOLUME_EVIDENCE, image_numbers=image_numbers),
+    ])
+    with pytest.raises(KnowledgeUnavailable, match="InstructionImageEvidenceMismatch"):
+        knowledge.search_with_llm("Увеличить громкость", {"requested_goals": {"volume": VOLUME_GOAL}})
+
+
+def test_an_available_but_unrelated_photo_does_not_prove_the_goal():
+    data = instruction(["На снимке показано подключение устройства к программе."],
+                       extra_paragraph=f"<w:p><w:r><w:t>{VOLUME_EVIDENCE}</w:t></w:r></w:p>")
+    knowledge, _ = scanner_provider([(DOC, "Разные действия.docx", data)])
+    knowledge.selector = lambda payload: goal_selection("MATCH", [goal_coverage("volume", VOLUME_EVIDENCE)])
+    with pytest.raises(KnowledgeUnavailable, match="InstructionImageEvidenceMismatch"):
+        knowledge.search_with_llm("Увеличить громкость", {"requested_goals": {"volume": VOLUME_GOAL}})
+
+
+def test_text_coverage_still_requires_the_quote_and_has_no_phantom_image_numbers():
+    knowledge, _, _ = selection_store()
+    knowledge.selector = lambda payload: goal_selection("MATCH", [
+        goal_coverage("volume", EVIDENCE, support_kind="TEXT", image_numbers=[]),
+    ])
+    result = knowledge.search_with_llm("Изменить громкость", {"requested_goals": {"volume": VOLUME_GOAL}})
+    assert result.result == "MATCH" and result.covered_goals == (VOLUME_GOAL,)
+    knowledge.selector = lambda payload: goal_selection("MATCH", [
+        goal_coverage("volume", EVIDENCE, support_kind="TEXT", image_numbers=[1]),
+    ])
+    with pytest.raises(KnowledgeUnavailable, match="InvalidInstructionCoverage"):
+        knowledge.search_with_llm("Изменить громкость", {"requested_goals": {"volume": VOLUME_GOAL}})
+
+
+def test_goal_coverage_does_not_accept_an_invented_quote_or_stale_original():
+    knowledge, state, _ = selection_store()
+    knowledge.selector = lambda payload: goal_selection("MATCH", [
+        goal_coverage("volume", "Выдуманная цитата, которой в данном исходнике нет.", support_kind="TEXT", image_numbers=[]),
+    ])
+    with pytest.raises(KnowledgeUnavailable, match="InstructionEvidenceMismatch"):
+        knowledge.search_with_llm("Изменить громкость", {"requested_goals": {"volume": VOLUME_GOAL}})
+
+    def change_original(payload):
+        state["data"] = instruction(["Новая инструкция и изменённые условия настройки."])
+        return goal_selection("MATCH", [goal_coverage("volume", EVIDENCE, support_kind="TEXT", image_numbers=[])])
+
+    knowledge.selector = change_original
+    with pytest.raises(KnowledgeUnavailable, match="SourceChangedDuringSelection"):
+        knowledge.search_with_llm("Изменить громкость", {"requested_goals": {"volume": VOLUME_GOAL}})
+
+
+def test_absence_accounts_for_every_requested_goal_without_inventing_a_source():
+    knowledge, _, _ = selection_store()
+    knowledge.selector = lambda payload: {"result": "NO_KNOWLEDGE", "missing_goal_ids": ["volume", "reset"]}
+    result = knowledge.search_with_llm("Сброс и громкость", {"requested_goals": REQUESTED_GOALS})
+    assert result.result == "NO_KNOWLEDGE" and result.approved is None
+    assert result.missing_goals == (RESET_GOAL, VOLUME_GOAL)
+    knowledge.selector = lambda payload: {"result": "NO_KNOWLEDGE", "missing_goal_ids": ["reset"]}
+    with pytest.raises(KnowledgeUnavailable, match="InvalidInstructionCoverage"):
+        knowledge.search_with_llm("Сброс и громкость", {"requested_goals": REQUESTED_GOALS})
+
+
+@pytest.mark.parametrize("goals", [[], {"": "Цель"}, {"goal": ""}, {"goal": "x" * 301}, {"goal": "a\nb"},
+                                  {"goal": None}, {"цель": "Цель"}, {str(index): "Цель" for index in range(9)}])
+def test_invalid_requested_goals_fail_before_any_model_selection(goals):
+    knowledge, _, calls = selection_store()
+    with pytest.raises(KnowledgeUnavailable, match="InvalidRequestedGoals"):
+        knowledge.search_with_llm("Настройка устройства", {"requested_goals": goals})
+    assert calls == []
+
+
+def test_goal_metadata_cannot_be_forged_without_requested_goals():
+    knowledge, _, _ = selection_store()
+    knowledge.selector = lambda payload: goal_selection("PARTIAL", [
+        goal_coverage("volume", EVIDENCE, support_kind="TEXT", image_numbers=[]),
+    ], ["reset"])
+    with pytest.raises(KnowledgeUnavailable, match="InvalidInstructionCoverage"):
+        knowledge.search_with_llm("Настройка устройства")
+
+
+def test_read_round_keeps_goals_and_refreshes_available_original_image_numbers():
+    knowledge, state = large_catalogue()
+    state["originals"][OTHER] = instruction([EVIDENCE])
+    next(row for row in state["files"] if row["id"] == OTHER)["filename"] = "Другой документ.docx"
+    calls = []
+
+    def select(payload):
+        calls.append(copy.deepcopy(payload))
+        if len(calls) == 1:
+            return {"result": "READ", "file_id": OTHER}
+        return {"result": "MATCH", "file_id": OTHER, "covered_goals": [
+            goal_coverage("volume", EVIDENCE, image_numbers=[1]),
+        ]}
+
+    knowledge.selector = select
+    result = knowledge.search_with_llm("Изменить громкость", {"requested_goals": {"volume": VOLUME_GOAL}})
+    assert result.result == "MATCH" and result.approved.document["source"]["file_id"] == OTHER
+    assert all(payload["requested_goals"] == {"volume": VOLUME_GOAL} for payload in calls)
+    assert calls[-1]["candidate_image_numbers"][OTHER] == [1]
+
+
+def test_clarification_retry_preserves_answered_questions_and_forbids_another_question():
+    knowledge, _, payloads = selection_store()
+    context = {"clarification_retry": True, "answered_questions": ["Какая программа?"]}
+    assert knowledge.search_with_llm("Сам сканер, программа уже настроена", context).result == "MATCH"
+    assert payloads[0]["allow_clarification"] is False
+    assert payloads[0]["context"]["answered_questions"] == ["Какая программа?"]
+    knowledge.selector = lambda payload: {"result": "CLARIFY", "question": "Какая программа?"}
+    with pytest.raises(KnowledgeUnavailable, match="RepeatedInstructionClarification"):
+        knowledge.search_with_llm("Сам сканер, программа уже настроена", context)
+
+
+def test_answered_questions_context_is_bounded_and_omits_extra_properties():
+    knowledge, _, payloads = selection_store()
+    questions = [None, {"private": "sensitive"}] + [f"Вопрос {index} " + "x" * 400 for index in range(9)]
+    knowledge.search_with_llm("Настройка", {"answered_questions": questions})
+    selected = payloads[0]["context"]
+    assert 1 <= len(selected["answered_questions"]) <= 8
+    assert all(len(question) <= 300 for question in selected["answered_questions"])
+    assert len(json.dumps(selected, ensure_ascii=False)) <= MAX_SELECTION_CONTEXT_CHARS

@@ -60,6 +60,28 @@ class UnderstandingReply(StrictModel):
     evidence: str = Field(default="", max_length=300)
 
 
+class SupportTaskFact(StrictModel):
+    key: Literal["equipment_type", "equipment_model", "application", "connection", "completed", "scope"]
+    value: str = Field(min_length=1, max_length=200)
+    evidence: str = Field(min_length=1, max_length=300)
+
+
+class SupportTaskGoal(StrictModel):
+    text: str = Field(min_length=1, max_length=250)
+    evidence: str = Field(min_length=1, max_length=300)
+    goal_id: str | None = Field(default=None, pattern=r"^g[1-9][0-9]*$")
+
+
+class SupportTaskUnderstanding(StrictModel):
+    new_task: StrictBool = False
+    facts: list[SupportTaskFact] = Field(default_factory=list, max_length=12)
+    goals: list[SupportTaskGoal] = Field(default_factory=list, max_length=8)
+    replace_goals: StrictBool = False
+    replacement_evidence: str = Field(default="", max_length=300)
+    question: str = Field(default="", max_length=300)
+    question_field: Literal["equipment_type", "goal", "connection", "application", "symptoms", "other"] | None = None
+
+
 class FollowupResult(StrictModel):
     result: Literal["EXCERPT", "NO_KNOWLEDGE"]
     source_chunk_ids: list[str] = Field(default_factory=list, max_length=1)
