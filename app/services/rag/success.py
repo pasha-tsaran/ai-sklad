@@ -9,7 +9,8 @@ from uuid import UUID
 
 from sqlalchemy import select
 
-from app.models import Conversation, Feedback, Incident, SolutionAttempt, SuccessfulRetrieval, now
+from app.models import Conversation, Feedback, Incident, Message, SolutionAttempt, SuccessfulRetrieval, now
+from app.services.chat.memory import _redact
 from app.services.rag.query import normalized_query, source_compatible
 from app.services.rag.talk import KnowledgeUnavailable
 from integrations.openwebui.approved_instruction_images import allowed_source_filename
@@ -77,7 +78,34 @@ def _proof(session, principal, incident_id, source):
     return incident if any(attempt.evidence.get("talk_source") == source for attempt in attempts) else None
 
 
-def remember_success(session, settings, principal, incident_id, key, source):
+def _hint_key(settings, query, incident_id):
+    scope = _scope(settings)
+    if not isinstance(query, str) or not query.strip() or len(query) > 6000 or scope is None:
+        return None
+    normalized = normalized_query(query)
+    if not normalized:
+        return None
+    return {"scope_hash": scope, "query_hash": _digest(normalized),
+            "context_hash": _digest({"purpose": "clarification_hint_v1", "incident_id": incident_id})}
+
+
+def _opening_was_reported(session, incident_id, opening_query, source):
+    attempts = session.execute(select(SolutionAttempt, Message.sequence).join(
+        Message, SolutionAttempt.message_id == Message.id,
+    ).join(Feedback, Feedback.attempt_id == SolutionAttempt.id).where(
+        SolutionAttempt.incident_id == incident_id, SolutionAttempt.status == "SUCCEEDED",
+        Feedback.helped.is_(True), Message.incident_id == incident_id,
+    )).all()
+    sequences = [sequence for attempt, sequence in attempts if attempt.evidence.get("talk_source") == source]
+    if not sequences:
+        return False
+    return session.scalar(select(Message.id).where(
+        Message.incident_id == incident_id, Message.role == "user", Message.content == opening_query,
+        Message.sequence < max(sequences),
+    ).limit(1)) is not None
+
+
+def remember_success(session, settings, principal, incident_id, key, source, *, opening_query=None):
     """Persist a reference only after an owned, explicit successful feedback row."""
     if not _valid_key(settings, key) or not _valid_source(settings, source):
         return None
@@ -95,6 +123,13 @@ def remember_success(session, settings, principal, incident_id, key, source):
         row = SuccessfulRetrieval(user_id=principal, **key)
         session.add(row)
     row.incident_id, row.source, row.expires_at = incident.id, copy.deepcopy(source), expires
+    hint_key = _hint_key(settings, opening_query, incident.id)
+    if hint_key and _opening_was_reported(session, incident.id, opening_query, source):
+        hint = session.scalar(select(SuccessfulRetrieval).filter_by(user_id=principal, **hint_key))
+        if hint is None:
+            hint = SuccessfulRetrieval(user_id=principal, **hint_key)
+            session.add(hint)
+        hint.incident_id, hint.source, hint.expires_at = incident.id, copy.deepcopy(source), expires
     return row
 
 
@@ -149,6 +184,51 @@ class SuccessfulTalkKnowledge:
                     pass
                 self._forget(self.last_cache_key)
         return self.delegate.search(query, excluded=excluded, fallback_query=fallback_query)
+
+    def confirmation_hint(self, query, excluded=()):
+        """Suggest an owned past interpretation for confirmation, with no guide or cache hit."""
+        key = _hint_key(self.settings, query, "lookup")
+        if key is None:
+            return None
+        candidates = []
+        with self.factory() as session, session.begin():
+            rows = session.execute(select(SuccessfulRetrieval, Incident).join(
+                Incident, SuccessfulRetrieval.incident_id == Incident.id,
+            ).where(
+                SuccessfulRetrieval.user_id == self.principal,
+                SuccessfulRetrieval.scope_hash == key["scope_hash"],
+                SuccessfulRetrieval.query_hash == key["query_hash"],
+            ).order_by(Incident.closed_at.desc(), SuccessfulRetrieval.created_at.desc()).limit(21)).all()
+            if len(rows) > 20:
+                return None
+            for row, incident in rows:
+                hint_key = _hint_key(self.settings, query, incident.id)
+                if row.context_hash != hint_key["context_hash"]:
+                    continue
+                source = copy.deepcopy(row.source)
+                expires = row.expires_at
+                if expires.tzinfo is None:
+                    expires = expires.replace(tzinfo=timezone.utc)
+                if (expires <= now() or not _valid_source(self.settings, source)
+                        or _proof(session, self.principal, incident.id, source) is None):
+                    session.delete(row)
+                    continue
+                problem = _redact(incident.description.strip() or incident.subject.strip())
+                if source["file_id"] not in excluded and problem and len(problem) <= 6000:
+                    candidates.append((hint_key, source, problem))
+        verified = {}
+        for hint_key, source, problem in candidates:
+            try:
+                approved = self.delegate.read(source["file_id"])
+            except KnowledgeUnavailable:
+                self._forget(hint_key)
+                continue
+            if approved.document["source"] != source:
+                self._forget(hint_key)
+                continue
+            interpretation = {"source": source, "problem": normalized_query(problem)}
+            verified.setdefault(_digest(interpretation), {"problem": problem, "source": source})
+        return next(iter(verified.values())) if len(verified) == 1 else None
 
     def search_with_llm(self, query, context=None, excluded=(), fallback_query=None):
         """A previous success can nominate a source for the model to check again."""

@@ -7,10 +7,11 @@ from langsmith import tracing_context
 from app.core.logging import event
 from app.schemas.contracts import (
     AnalysisResult, AnswerResult, DialogueResult, EscalationExtraction, FollowupResult, InstructionOfferReply, SummaryResult,
+    UnderstandingReply,
 )
 from app.services.llm.prompts import (
     ANALYZE_TASK, COMPOSE_TASK, DIALOGUE_TASK, ESCALATION_EXTRACTION_TASK, FOLLOWUP_TASK,
-    INSTRUCTION_OFFER_TASK, SUMMARY_TASK, stage_messages,
+    INSTRUCTION_OFFER_TASK, SUMMARY_TASK, UNDERSTANDING_REPLY_TASK, stage_messages,
 )
 
 
@@ -144,6 +145,16 @@ class OpenWebUILLM:
     def interpret_instruction_offer(self, message, offered):
         return self._call(InstructionOfferReply, INSTRUCTION_OFFER_TASK,
                           {"message": message, "offered": offered}, fast_selection=True)
+
+    def interpret_understanding_reply(self, message, understanding):
+        reply = self._call(UnderstandingReply, UNDERSTANDING_REPLY_TASK,
+                           {"message": message, "understanding": understanding}, fast_selection=True)
+        if reply.result == "UNCLEAR":
+            if reply.evidence:
+                raise ValueError("UnexpectedUnderstandingEvidence")
+        elif not reply.evidence or reply.evidence not in message:
+            raise ValueError("InvalidUnderstandingEvidence")
+        return reply
 
     def analyze(self, message):
         return self.analyze_context(message, {})

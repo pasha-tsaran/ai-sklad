@@ -61,6 +61,113 @@ def test_single_source_still_requires_model_selection_and_keeps_original_photo()
     assert sum(request.url.path.endswith("/content") for request in state["calls"]) == 2
 
 
+def test_match_can_describe_the_employees_goal_for_backend_confirmation():
+    knowledge, state, _ = selection_store()
+    understanding = "Уменьшить громкость сканера штрихкодов"
+    knowledge.selector = lambda payload: {**match(), "understanding": understanding}
+    result = knowledge.search_with_llm("Сканер штрихкодов громко пищит, хочу сделать потише")
+    assert result.result == "MATCH" and result.understanding == understanding
+    assert result.approved.document["source"]["file_id"] == DOC
+    assert result.approved.illustrations[1].data == read_docx_images(state["data"])[0].data
+
+
+@pytest.mark.parametrize("understanding", [
+    "Нажмите кнопку настройки", "Откройте меню печати", "Выполните sudo reboot",
+    "1. Уменьшить громкость", "- Уменьшить громкость", "`rm -rf /`",
+    "Инструкция https://example.invalid", "<script>example</script>",
+    "Уменьшить громкость\nЗатем запустить команду", "x" * 301, None, {"goal": "печать"},
+])
+def test_invalid_optional_understanding_is_omitted_without_discarding_verified_match(understanding):
+    knowledge, _, _ = selection_store()
+    knowledge.selector = lambda payload: {**match(), "understanding": understanding}
+    result = knowledge.search_with_llm("Уменьшить громкость сканера штрихкодов")
+    assert result.result == "MATCH" and result.approved.document["source"]["file_id"] == DOC
+    assert result.understanding == ""
+
+
+def test_legacy_match_without_goal_wording_remains_compatible():
+    knowledge, _, _ = selection_store()
+    result = knowledge.search_with_llm("Уменьшить громкость сканера штрихкодов")
+    assert result.result == "MATCH" and result.understanding == ""
+
+
+def test_only_available_scanner_document_does_not_skip_model_clarification():
+    caption = "Инструкция описывает подключение сканера штрихкодов в программе Альфа."
+    knowledge, _ = scanner_provider([(DOC, "Настройка сканера в программе Альфа.docx", instruction([caption]))])
+    calls = []
+
+    def select(payload):
+        calls.append(payload)
+        assert payload["actual_problem"] == "Настройка сканера"
+        assert len(payload["candidates"]) == 1 and caption in payload["candidates"][DOC]
+        return {"result": "CLARIFY", "question": "Это сканер штрихкодов или сканер документов?"}
+
+    knowledge.selector = select
+    result = knowledge.search_with_llm("Настройка сканера")
+    assert result.result == "CLARIFY" and result.approved is None and len(calls) == 1
+    assert result.understanding == ""
+
+
+def test_short_tsd_followup_keeps_prior_question_and_conditions_for_next_clarification():
+    knowledge, _, _ = selection_store()
+    problem = "Подключение ТСД к принтеру\nTSC, одно устройство"
+    question = "Какое устройство и сколько принтеров нужно подключить?"
+
+    def select(payload):
+        assert payload["actual_problem"] == problem
+        assert payload["context"]["previous_question"] == question
+        assert payload["context"]["current_message"] == "TSC, одно устройство"
+        return {"result": "CLARIFY", "question": "Нужно подключение по Wi-Fi или по Bluetooth?"}
+
+    knowledge.selector = select
+    result = knowledge.search_with_llm(problem, {"previous_question": question, "current_message": "TSC, одно устройство"})
+    assert result.result == "CLARIFY" and result.approved is None
+    assert result.question == "Нужно подключение по Wi-Fi или по Bluetooth?"
+
+
+@pytest.mark.parametrize("result_kind", ["MATCH", "CLARIFY", "RELATED", "NO_KNOWLEDGE"])
+def test_new_request_marker_reaches_every_returned_decision(result_kind):
+    knowledge, _, _ = selection_store()
+    responses = {
+        "MATCH": match(),
+        "CLARIFY": {"result": "CLARIFY", "question": "Подключение нужно по Wi-Fi или по Bluetooth?"},
+        "RELATED": related((DOC, EVIDENCE)),
+        "NO_KNOWLEDGE": {"result": "NO_KNOWLEDGE"},
+    }
+    knowledge.selector = lambda payload: {**responses[result_kind], "new_request": True}
+    result = knowledge.search_with_llm("Настройка сканера\nПодключение ТСД к принтеру", {
+        "current_message": "Подключение ТСД к принтеру", "previous_question": "Что нужно изменить у сканера?",
+    })
+    assert result.result == result_kind and result.new_request is True
+
+
+def test_legacy_selection_defaults_to_continuing_the_current_request():
+    knowledge, _, _ = selection_store()
+    assert knowledge.search_with_llm("Уменьшить громкость сканера").new_request is False
+
+
+@pytest.mark.parametrize("marker", ["true", "false", "yes", 0, 1, None])
+def test_new_request_marker_requires_a_real_boolean(marker):
+    knowledge, _, _ = selection_store()
+    knowledge.selector = lambda payload: {**match(), "new_request": marker}
+    with pytest.raises(KnowledgeUnavailable, match="InvalidInstructionSelection"):
+        knowledge.search_with_llm("Подключение ТСД к принтеру")
+
+
+def test_new_request_marker_survives_an_authorized_original_read_round():
+    knowledge, _ = large_catalogue()
+    calls = []
+
+    def select(payload):
+        calls.append(payload)
+        return {"result": "READ", "file_id": OTHER, "new_request": True} if len(calls) == 1 else match(OTHER)
+
+    knowledge.selector = select
+    result = knowledge.search_with_llm("Настройка сканера\nПодключение другого устройства")
+    assert result.result == "MATCH" and result.new_request is True
+    assert result.approved.document["source"]["file_id"] == OTHER and len(calls) == 2
+
+
 def test_default_selector_uses_real_model_transport_with_scoped_catalogue_and_no_tools():
     knowledge, state, _ = selection_store()
     knowledge.selector = None

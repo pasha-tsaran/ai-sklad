@@ -55,6 +55,11 @@ class InstructionOfferReply(StrictModel):
     evidence: str = Field(default="", max_length=300)
 
 
+class UnderstandingReply(StrictModel):
+    result: Literal["ACCEPT", "CORRECT", "NEW_REQUEST", "UNCLEAR"]
+    evidence: str = Field(default="", max_length=300)
+
+
 class FollowupResult(StrictModel):
     result: Literal["EXCERPT", "NO_KNOWLEDGE"]
     source_chunk_ids: list[str] = Field(default_factory=list, max_length=1)

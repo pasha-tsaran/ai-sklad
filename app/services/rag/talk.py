@@ -10,7 +10,7 @@ from urllib.parse import quote
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, field_validator
 
 from app.core.logging import event
 from app.services.rag.documents import Illustration, read_xlsx
@@ -35,6 +35,19 @@ class InstructionAlternative(BaseModel):
     evidence: str = Field(max_length=200)
 
 
+def _safe_understanding(value):
+    """Optional intent wording never becomes a model-generated technical step."""
+    if not isinstance(value, str) or len(value) > 300 or any(ord(char) < 32 for char in value):
+        return ""
+    text = value.strip()
+    if (re.search(r"https?://|www\.|[`<>]|!\[|^\s*(?:[-*•]\s|\d+[.)]\s)", text, re.IGNORECASE)
+            or re.search(r"\b(?:нажмите|откройте|перейдите|выберите|введите|выполните|запустите|"
+                         r"установите|удалите|отсканируйте|подключите|отключите|включите|"
+                         r"перезапустите|скачайте|скопируйте|sudo|powershell|cmd\.exe)\b", text, re.IGNORECASE)):
+        return ""
+    return text
+
+
 class InstructionSelection(BaseModel):
     """Untrusted semantic choice; the backend validates original-source evidence."""
 
@@ -44,6 +57,13 @@ class InstructionSelection(BaseModel):
     evidence: str = Field(default="", max_length=2000)
     question: str = Field(default="", max_length=300)
     alternatives: list[InstructionAlternative] = Field(default_factory=list, max_length=3)
+    understanding: str = Field(default="", max_length=300)
+    new_request: StrictBool = False
+
+    @field_validator("understanding", mode="before")
+    @classmethod
+    def understanding_is_an_optional_plain_goal(cls, value):
+        return _safe_understanding(value)
 
 
 INSTRUCTION_SELECTION_TASK = """Пойми actual_problem с учётом context и выбери
@@ -58,12 +78,27 @@ candidates — словарь file_id: полный текст оригинал�
 тип оборудования или цель, верни CLARIFY с одним коротким вопросом на русском.
 Для сканера различай штрихкоды и документы; для принтера — документы А4,
 стационарный термопринтер и мобильный термопринтер. Уже известное не спрашивай.
+Краткое «настройка сканера» само по себе не определяет ни тип сканера, ни цель.
+Сначала уточни тип, затем желаемый результат, если он ещё неизвестен. Не считай
+единственный найденный документ доказательством, что сотрудник работает в 1С
+или настраивает именно этот тип оборудования. Не перечисляй несколько вопросов
+в одном ответе. После каждого уточнения учитывай уже полученный ответ и спрашивай
+следующее недостающее существенное условие. История помогает связать короткое
+«TSC, одно устройство» с прежним вопросом о ТСД и принтере. Если способ соединения
+ещё неизвестен, уточни Wi-Fi или Bluetooth по вариантам разрешённых источников.
 
 current_message содержит последнюю реплику сотрудника. context.active_task —
 задача, по которой уже показана инструкция, context.shown_source — показанный
 источник. Эти поля помогают понять уточнение и ссылку на предыдущий ответ.
 При самостоятельном новом вопросе ориентируйся на новую задачу. Сведения из
 technical_facts и истории могут относиться к прежней проблеме.
+Если current_message является самостоятельным новым рабочим вопросом по другой
+задаче, укажи new_request=true. Учитывай смысл, даже если вопрос начинается с
+названия действия, например «подключение ТСД к принтеру» после уточнения о сканере.
+Короткий ответ на previous_question и уточнение прежней задачи означают
+new_request=false. Без предшествующей задачи оставь false. Это булево поле
+нужно во всех результатах, включая READ. Ориентируй выбор на текущий новый вопрос,
+даже если actual_problem пока содержит также предыдущую тему.
 Последние явно сообщённые условия сотрудника имеют приоритет. Различай описание
 показанной схемы и фактическое оборудование пользователя. В реплике
 «на фото Bluetooth, а у меня оба принтера по Wi-Fi» Bluetooth описывает предыдущий
@@ -81,6 +116,14 @@ technical_facts и истории могут относиться к прежн�
 документ только по похожему слову, не дополняй его техническими сведениями из памяти.
 Одного кандидата тоже нужно проверить по смыслу. Backend проверит цитату, источник
 и оригинальные фотографии; технический ответ пользователю не генерируй.
+В understanding кратко опиши на русском только понятую цель сотрудника и явно
+сообщённые им условия. Например, «Уменьшить громкость сканера штрихкодов».
+Это описание для последующего вопроса backend «Правильно ли я понял?». Не добавляй
+к нему шаги, команды, ссылки, названия кнопок, неизвестную программу или способ
+подключения из выбранного документа. При нехватке существенных сведений верни
+CLARIFY вместо MATCH. Для остальных результатов оставь understanding пустым.
+Сведения из прошлых успешных обращений помогают предложить понимание на подтверждение.
+Они не доказывают, что текущая задача совпадает с прошлой.
 
 Вначале ищи точную инструкцию для фактической задачи сотрудника. Если точной
 инструкции не найдено, но есть близкие по цели утверждённые варианты с другими
@@ -193,6 +236,8 @@ class InstructionDecision:
     approved: ApprovedTalkDocument | None = None
     question: str = ""
     alternatives: tuple[ApprovedTalkDocument, ...] = ()
+    understanding: str = ""
+    new_request: bool = False
 
 
 def _uuid(value):
@@ -354,6 +399,7 @@ class TalkKnowledge:
                     raise KnowledgeUnavailable("SelectionCatalogueTooLarge", "instruction_selection")
                 candidates, budget_limited, discovery_error = self._instruction_candidates(client, problem, context, files)
                 bounded_context = self._instruction_context(context)
+                new_request = False
                 for decision_number in range(2):
                     payload = {"actual_problem": problem, "context": bounded_context,
                                "knowledge_ids": list(self.settings.openwebui_knowledge_ids), "catalogue": catalogue,
@@ -372,6 +418,7 @@ class TalkKnowledge:
                                   context_chars=len(json.dumps(bounded_context, ensure_ascii=False)),
                                   payload_chars=payload_chars)
                     choice = self._instruction_selection(payload)
+                    new_request = new_request or choice.new_request
                     if choice.result == "READ":
                         _search_event("instruction_read_request", call_number=decision_number + 1,
                                       in_catalogue=choice.file_id in files,
@@ -391,7 +438,8 @@ class TalkKnowledge:
                             candidates = {choice.file_id: approved}
                             budget_limited = budget_limited or total > MAX_SELECTION_SOURCE_CHARS
                         continue
-                    return self._instruction_decision(client, choice, files, candidates, budget_limited, discovery_error)
+                    return self._instruction_decision(client, choice.model_copy(update={"new_request": new_request}),
+                                                      files, candidates, budget_limited, discovery_error)
                 raise KnowledgeUnavailable("InstructionReadLimitExceeded", "instruction_selection")
         except KnowledgeUnavailable as error:
             report_failure(error)
@@ -420,12 +468,12 @@ class TalkKnowledge:
                  if _uuid(shown.get("file_id")) and isinstance(shown.get("filename"), str)
                  and allowed_source_filename(shown["filename"]) else {})
         fields = [
+            ("current_message", context.get("current_message")),
             ("active_task", context.get("active_task")),
             ("shown_source", shown),
             ("previous_question", context.get("previous_question")),
             ("technical_facts", facts),
             ("verified_previous_source", {"file_id": previous_id} if _uuid(previous_id) else {}),
-            ("current_message", context.get("current_message")),
         ]
         bounded = {}
         for name, value in fields:
@@ -543,11 +591,11 @@ class TalkKnowledge:
                              for item in choice.alternatives)
             _search_event("instruction_selection", outcome="RELATED", candidate_count=len(candidates),
                           alternative_count=len(approved))
-            return InstructionDecision("RELATED", alternatives=approved)
+            return InstructionDecision("RELATED", alternatives=approved, new_request=choice.new_request)
         if choice.result == "CLARIFY":
             if choice.file_id is not None or choice.evidence or not choice.question:
                 raise KnowledgeUnavailable("InvalidInstructionClarification", "instruction_selection")
-            return InstructionDecision("CLARIFY", question=choice.question)
+            return InstructionDecision("CLARIFY", question=choice.question, new_request=choice.new_request)
         if choice.result == "NO_KNOWLEDGE":
             if choice.file_id is not None or choice.evidence or choice.question:
                 raise KnowledgeUnavailable("InvalidInstructionAbsence", "instruction_selection")
@@ -555,12 +603,13 @@ class TalkKnowledge:
                 raise KnowledgeUnavailable("SelectionBudgetIncomplete", "instruction_selection")
             if discovery_error is not None:
                 raise discovery_error
-            return InstructionDecision("NO_KNOWLEDGE")
+            return InstructionDecision("NO_KNOWLEDGE", new_request=choice.new_request)
         if choice.result != "MATCH" or choice.question:
             raise KnowledgeUnavailable("InvalidInstructionMatch", "instruction_selection")
         approved = self._verified_instruction(client, choice.file_id, choice.evidence, files, candidates)
         _search_event("instruction_selection", outcome="MATCH", candidate_count=len(candidates), selected=True)
-        return InstructionDecision("MATCH", approved=approved)
+        return InstructionDecision("MATCH", approved=approved, understanding=choice.understanding,
+                                   new_request=choice.new_request)
 
     def _verified_instruction(self, client, file_id, evidence, files, candidates):
         """Apply the same original-source proof to answers and offered alternatives."""

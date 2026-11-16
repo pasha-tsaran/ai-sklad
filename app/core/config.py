@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     nextcloud_app_password: SecretStr = SecretStr("")
     nextcloud_poll_interval_seconds: float = Field(default=3, ge=1, le=60)
     nextcloud_batch_size: int = Field(default=100, ge=1, le=100)
+    talk_confirm_understanding: bool = False
     device_collection_base_url: str = ""
     nextcloud_bot_secret: SecretStr = SecretStr("")
     nextcloud_allowed_rooms: list[str] = Field(default_factory=list)

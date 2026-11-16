@@ -9,7 +9,7 @@ from app.core.logging import configure_logging, event
 from app.db import get_engine
 
 configure_logging()
-app = FastAPI(title="ai-support", version="0.3.19", description="Grounded support, personal Talk chats and mail drafts")
+app = FastAPI(title="ai-support", version="0.3.20", description="Grounded support, personal Talk chats and mail drafts")
 app.include_router(router)
 app.include_router(talk_router)
 app.include_router(device_router)
@@ -57,4 +57,5 @@ def ready():
         and bool(settings.nextcloud_app_password.get_secret_value()),
         "talk_private_only": settings.nextcloud_backend == "account",
         "device_collection_configured": bool(settings.device_collection_base_url),
+        "talk_confirm_understanding": settings.talk_confirm_understanding,
     }
