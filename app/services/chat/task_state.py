@@ -19,10 +19,26 @@ _UNKNOWN_ANSWERS = {
     "не помню", "я не помню", "не понимаю вопрос", "я не понимаю вопрос",
     "не понимаю что вы спрашиваете", "я не понимаю что вы спрашиваете",
 }
+_NEW_TASK_BOUNDARY = re.compile(
+    r"^(?:пожалуйста\s+)?(?:а\s+)?(?:(?:теперь|сейчас|у\s+меня)\s+){0,2}(?:"
+    r"(?:другая|новая|следующая)\s+(?:задача|проблема|тема)|"
+    r"(?:другой|новый|следующий)\s+вопрос|"
+    r"(?:давай(?:те)?\s+)?(?:перейдем|переключимся)\s+(?:к|на)\s+"
+    r"(?:другой|новой|следующей|другую|новую|следующую|другому|новому|следующему)\s+"
+    r"(?:задаче|задачу|проблеме|проблему|теме|тему|вопросу)|"
+    r"(?:забудь|забудьте|отмени|отмените)\s+(?:предыдущую|прошлую|текущую)\s+"
+    r"(?:задачу|проблему|тему)"
+    r")(?:\s|$)"
+)
 
 
 def _normalized(value):
     return " ".join(re.sub(r"[^\w\s]", " ", value.casefold().replace("ё", "е")).split())
+
+
+def starts_new_task(message):
+    """Recognize explicit conversation lifecycle requests before model inference."""
+    return isinstance(message, str) and bool(_NEW_TASK_BOUNDARY.match(_normalized(message)))
 
 
 def is_unknown_answer(message):
@@ -73,6 +89,18 @@ def _evidenced(evidence, authority):
     return bool(evidence) and any(evidence in message for message in authority)
 
 
+def task_evidence_authority(message, previous, new_task):
+    """Return user evidence available to both the model adapter and state merge."""
+    authority = [message]
+    if new_task or starts_new_task(message) or not isinstance(previous, dict):
+        return authority
+    authority += [text for text in previous.get("messages", []) if isinstance(text, str)]
+    records = [*previous.get("facts", []), *previous.get("goals", {}).values()]
+    authority += [item["evidence"] for item in records
+                  if isinstance(item, dict) and isinstance(item.get("evidence"), str)]
+    return authority
+
+
 def _unknown_answer(prior, question, answer):
     field = prior["question_field"] if prior["question"] == question else None
     if field is None:
@@ -97,7 +125,10 @@ def update_task_state(message, previous, previous_question, llm):
     """Merge validated deltas; documents and assistant questions cannot supply facts."""
     if not isinstance(message, str) or not message.strip() or len(message) > 6000:
         raise ValueError("InvalidTaskMessage")
-    prior = _previous_state(previous)
+    explicit_new_task = starts_new_task(message)
+    prior = _previous_state(None if explicit_new_task else previous)
+    if explicit_new_task:
+        previous_question = ""
     if is_unknown_answer(message) and isinstance(previous_question, str) and previous_question.strip():
         return {**copy.deepcopy(prior), "messages": _history(prior["messages"], message),
                 "question": "", "question_field": None,
@@ -108,17 +139,15 @@ def update_task_state(message, previous, previous_question, llm):
                 "question": "", "question_field": None, "new_task": False}
     raw = llm.understand_task(message, copy.deepcopy(prior), previous_question)
     update = SupportTaskUnderstanding.model_validate(raw)
+    if explicit_new_task:
+        update.new_task = True
     if update.unknown_answer_evidence and (
         not _evidenced(update.unknown_answer_evidence, [message])
         or not isinstance(previous_question, str) or not previous_question.strip() or update.new_task
     ):
         raise ValueError("InvalidTaskUnknownAnswer")
     state = _previous_state(None) if update.new_task else copy.deepcopy(prior)
-    authority = [message]
-    if not update.new_task:
-        authority += prior["messages"]
-        authority += [fact["evidence"] for fact in prior["facts"]]
-        authority += [goal["evidence"] for goal in prior["goals"].values()]
+    authority = task_evidence_authority(message, prior, update.new_task)
     if any(not _evidenced(item.evidence, authority) for item in [*update.facts, *update.goals]):
         raise ValueError("InvalidTaskEvidence")
     if update.replace_goals and not _evidenced(update.replacement_evidence, [message]):

@@ -31,7 +31,9 @@ from app.services.chat.policies import (
     FORM_ACTION, MAX_ATTEMPTS, TERMINAL_STATES, direct_intent, requests_support_form, resolution_feedback,
 )
 from app.services.chat.service import messenger
-from app.services.chat.task_state import is_unknown_answer, remember_task_message, task_query, update_task_state
+from app.services.chat.task_state import (
+    is_unknown_answer, remember_task_message, starts_new_task, task_query, update_task_state,
+)
 from app.services.rag.openwebui import save_snapshot
 from app.services.rag.query import normalized_query, printer_kinds, scanner_kinds
 from app.services.rag.talk import (
@@ -937,6 +939,9 @@ def _goal_order_turn(message, flow, context, llm, knowledge, settings):
 
 def _support_turn(message, flow, context, llm, knowledge):
     """Understand employee facts before retrieval, without document-driven guesses."""
+    explicit_new_task = starts_new_task(message)
+    if explicit_new_task:
+        flow = {}
     typed_dialogue = _confirmation_enabled(knowledge) or bool(getattr(llm, "supports_instruction_planning", False))
     if not typed_dialogue or not callable(getattr(llm, "understand_task", None)):
         return _retrieve_support_turn(message, flow, context, llm, knowledge)
@@ -969,7 +974,7 @@ def _support_turn(message, flow, context, llm, knowledge):
                 pass
         goals = ", ".join(goal["text"] for goal in flow["task_state"]["goals"].values())
         return Turn("REPLY", [(f"Продолжаем задачу «{goals}».\n\n{question}", None)], flow=next_flow)
-    if not flow and _confirmation_enabled(knowledge):
+    if not flow and not explicit_new_task and _confirmation_enabled(knowledge):
         remembered = _remembered_support_turn(message, context, knowledge)
         if remembered:
             return remembered
@@ -991,6 +996,7 @@ def _support_turn(message, flow, context, llm, knowledge):
         if type(error) is ValueError and str(error) in {
             "InvalidTaskState", "InvalidTaskMessage", "InvalidTaskUnknownAnswer", "InvalidTaskEvidence",
             "InvalidTaskReplacement", "UnexpectedTaskReplacement", "UnknownTaskGoal", "TaskStateTooLarge",
+            "IncompleteTaskUnderstanding",
         }:
             code = str(error)
         failure = KnowledgeUnavailable(code, "task_understanding")
@@ -999,7 +1005,11 @@ def _support_turn(message, flow, context, llm, knowledge):
             saved = remember_task_message(message[:6000], previous_state)
         except ValueError:
             saved = remember_task_message(message[:6000])
-        return Turn("REPLY", [(UNAVAILABLE, None)], flow={**flow, "task_state": saved})
+        failed_flow = {**flow, "task_state": saved}
+        if explicit_new_task:
+            saved["new_task"] = True
+            failed_flow.update(clarification_query=message[:6000], opening_query=message[:6000])
+        return Turn("REPLY", [(UNAVAILABLE, None)], flow=failed_flow)
     next_flow = copy.deepcopy(flow)
     if state["new_task"]:
         next_flow = {}
@@ -1227,6 +1237,9 @@ def _retrieve_support_turn(message, flow, context, llm, knowledge):
                                  "previous_question": flow.get("clarification_question", "")}
             if state := flow.get("task_state"):
                 selection_context.update(
+                    incident={},
+                    short_term={"messages": [{"role": "user", "content": text}
+                                             for text in state.get("messages", [])]},
                     requested_goals={key: goal["text"] for key, goal in state["goals"].items()},
                     task_state={"facts": [{key: value for key, value in fact.items() if key != "evidence"}
                                           for fact in state["facts"]],
@@ -1529,6 +1542,11 @@ def _text_turn(message, flow, context, previous_pending, llm, knowledge, setting
                  or refusal_reply(message))
     if protected:
         return Turn("REPLY", [(protected, None)])
+    explicit_new_task = starts_new_task(message)
+    if explicit_new_task and previous_pending == FORM_ACTION and not requests_support_form(message):
+        return _continue_from_letter(message, {}, context, llm, knowledge, settings)
+    if explicit_new_task:
+        flow, previous_pending = {}, None
     form_request = requests_support_form(message)
     filling_form = previous_pending == FORM_ACTION and flow.get("escalation", {}).get("stage") != "CHOICE"
     if form_request and not filling_form:
@@ -1620,7 +1638,7 @@ def _text_turn(message, flow, context, previous_pending, llm, knowledge, setting
                                       or _PHOTO_REQUEST.search(message) or _NEXT_PHOTO.search(message))) or (
         flow.get("clarification_query") and len(message.split()) <= 8
     )
-    if not _technical_message(message) and not pinned:
+    if not explicit_new_task and not _technical_message(message) and not pinned:
         try:
             routed = DialogueResult.model_validate(llm.dialogue(message, context))
             if routed.route == "REFUSE":

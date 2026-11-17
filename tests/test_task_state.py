@@ -9,7 +9,9 @@ from pydantic import ValidationError
 
 from app.core.config import Settings
 from app.schemas.contracts import SupportTaskUnderstanding
-from app.services.chat.task_state import is_unknown_answer, remember_task_message, task_query, update_task_state
+from app.services.chat.task_state import (
+    is_unknown_answer, remember_task_message, starts_new_task, task_query, update_task_state,
+)
 from app.services.llm.openwebui import OpenWebUILLM
 from app.services.llm.prompts import SUPPORT_TASK_TASK
 
@@ -39,6 +41,70 @@ def compound_task():
         "goals": [goal("сбросить настройки"), goal("увеличить громкость")],
     })
     return update_task_state(message, None, "", model)
+
+
+@pytest.mark.parametrize("message", [
+    "Другая задача. Нужно открыть программу.", "Новая проблема: нужно открыть программу.",
+    "Следующая тема — открыть программу", "Теперь другой вопрос", "А теперь новая задача",
+    "У меня новый вопрос", "Пожалуйста, сейчас другая проблема",
+    "У меня теперь другой вопрос", "Теперь у меня новая задача",
+    "Перейдём к другой задаче", "Давайте переключимся на новую тему",
+    "Забудь предыдущую задачу. Нужно открыть программу.",
+    "Отмените текущую проблему, теперь нужно открыть программу.",
+])
+def test_explicit_topic_boundaries_are_general_conversation_requests(message):
+    assert starts_new_task(message)
+
+
+@pytest.mark.parametrize("message", [
+    "Другая, мне надо сам сканер настроить", "Это не новая задача",
+    "Не другая задача, продолжаем прежнюю", "На четвёртом шаге ошибка",
+    "А теперь увеличить громкость", "Нужно и то и другое", "не знаю", "да, правильно", None,
+])
+def test_topic_boundaries_do_not_swallow_ordinary_followups_or_negation(message):
+    assert not starts_new_task(message)
+
+
+@pytest.mark.parametrize("reported_new_task", [None, False])
+def test_explicit_new_task_uses_fresh_model_input_even_when_model_omits_the_transition(reported_new_task):
+    previous = compound_task()
+    previous.update(question="Какой режим подключения используется?", question_field="connection")
+    message = "Другая задача. Хочу открыть рабочую почту."
+    response = {"goals": [goal("Открыть рабочую почту", "открыть рабочую почту", "g1")]}
+    if reported_new_task is not None:
+        response["new_task"] = reported_new_task
+    model = UnderstandingModel(response)
+    state = update_task_state(message, previous, previous["question"], model)
+    _, model_previous, model_question = model.calls[0]
+    assert model_previous["facts"] == [] and model_previous["goals"] == {}
+    assert model_previous["messages"] == [] and model_question == ""
+    assert state["new_task"] is True and state["facts"] == []
+    assert state["messages"] == [message]
+    assert list(state["goals"].values()) == [{"text": "Открыть рабочую почту", "evidence": "открыть рабочую почту"}]
+
+
+def test_explicit_boundaries_keep_outlook_scanner_and_printer_as_separate_tasks():
+    model = UnderstandingModel(
+        {"facts": [fact("application", "Outlook")], "goals": [goal("Открыть почту", "открыть почту")]},
+        {"facts": [fact("equipment_type", "сканер", "сканера")],
+         "question": "Какой тип сканера требуется настроить?", "question_field": "equipment_type"},
+        {"facts": [fact("equipment_type", "принтер", "принтеру")],
+         "goals": [goal("Подключить ТСД к принтеру TSC по Wi-Fi", "Подключить ТСД к принтеру TSC по Wi-Fi")]},
+    )
+    state = update_task_state("Хочу открыть почту в Outlook", None, "", model)
+    state = update_task_state("Другая задача. Настройка сканера", state, "", model)
+    assert not state["goals"] and "Outlook" not in task_query(state)
+    state = update_task_state("Другая задача. Подключить ТСД к принтеру TSC по Wi-Fi", state, state["question"], model)
+    assert [item["text"] for item in state["goals"].values()] == ["Подключить ТСД к принтеру TSC по Wi-Fi"]
+    assert "Outlook" not in task_query(state) and "сканер" not in task_query(state)
+    assert all(call[1]["goals"] == {} and call[2] == "" for call in model.calls[1:])
+
+
+def test_explicit_topic_boundary_does_not_authorize_a_repeated_old_user_fact():
+    previous = compound_task()
+    model = UnderstandingModel({"facts": [fact("equipment_model", "Zebra DS2208")]})
+    with pytest.raises(ValueError, match="InvalidTaskEvidence"):
+        update_task_state("Новая задача. Нужно открыть рабочую почту.", previous, "", model)
 
 
 def test_vague_request_retains_a_single_type_question_without_inventing_a_goal():
@@ -467,7 +533,8 @@ def test_real_task_adapter_can_switch_tasks_when_the_model_reuses_a_prior_goal_i
         allowed = body["response_format"]["json_schema"]["schema"]["$defs"]["SupportTaskGoal"]["properties"]["goal_id"]
         assert "g2" in allowed["anyOf"][0]["enum"]
         observed.append(json.loads(body["messages"][-1]["content"]))
-        reply = {"new_task": True, "goals": [{"goal_id": "g2", "text": "Открыть корпоративную почту",
+        reply = {"new_task": True, "facts": [], "question": "", "question_field": None,
+                 "goals": [{"goal_id": "g2", "text": "Открыть корпоративную почту",
                                                "evidence": "открыть корпоративную почту"}]}
         return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(reply)},
                                                       "finish_reason": "stop"}]})
@@ -723,12 +790,39 @@ def test_real_adapter_task_stage_has_its_own_user_only_payload_and_bounded_budge
                            "previous_question": "Что сделать сначала?"}
         assert "catalogue" not in payload and "candidates" not in payload
         assert "JSON Schema: " not in body["messages"][0]["content"]
-        return httpx.Response(200, json={"choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}]})
+        response = {"new_task": False, "facts": [], "goals": [], "question": "", "question_field": None}
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(response)},
+                                                     "finish_reason": "stop"}]})
 
     result = OpenWebUILLM(model_settings(), httpx.MockTransport(handler)).understand_task(
         "Сначала сброс", previous, "Что сделать сначала?",
     )
     assert result == SupportTaskUnderstanding()
+
+
+def test_explicit_task_boundary_removes_old_goal_identifiers_from_the_real_model_grammar():
+    previous = compound_task()
+    message = "Другой вопрос. Хочу открыть рабочую почту."
+    calls = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        schema = body["response_format"]["json_schema"]["schema"]
+        assert schema["$defs"]["SupportTaskGoal"]["properties"]["goal_id"]["type"] == "null"
+        payload = json.loads(body["messages"][-1]["content"])
+        calls.append(payload)
+        assert payload["previous_state"]["facts"] == [] and payload["previous_state"]["goals"] == {}
+        assert payload["previous_state"]["messages"] == [] and payload["previous_question"] == ""
+        response = {"new_task": False, "facts": [], "question": "", "question_field": None,
+                    "goals": [{"text": "Открыть рабочую почту", "evidence": "открыть рабочую почту",
+                               "goal_id": None}]}
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(response)},
+                                                     "finish_reason": "stop"}]})
+
+    model = OpenWebUILLM(model_settings(), httpx.MockTransport(handler))
+    state = update_task_state(message, previous, "Какое действие выполнить сначала?", model)
+    assert len(calls) == 1 and state["new_task"] is True
+    assert list(state["goals"].values()) == [{"text": "Открыть рабочую почту", "evidence": "открыть рабочую почту"}]
 
 
 @pytest.mark.parametrize("budget", [False, 0, 127, 1537, 2.5, "512"])

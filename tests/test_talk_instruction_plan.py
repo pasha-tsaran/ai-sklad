@@ -14,11 +14,13 @@ from app.services.chat.instruction_plan import restore_plan, serialize_plan
 from app.services.chat.talk_dialogue import CHANGED
 from app.services.rag.success import cache_key
 from app.services.llm.openwebui import OpenWebUILLM
+from app.services.nextcloud.delivery import deliver_one
 from integrations.openwebui.approved_instruction_images import read_docx_images
 from tests.test_instruction_planning import selected_part
 from tests.test_openwebui_instruction_images import instruction, office, png
 from tests.test_talk_dialogue import assistants
 from tests.test_talk_dialogue import talk as talk
+from tests.test_talk_delivery import Sender
 from tests.test_talk_knowledge import DOC, OTHER
 from tests.test_talk_model_dialogue import model_chat as model_chat
 
@@ -278,13 +280,13 @@ def test_real_reference_adapter_selects_multisource_plan_with_negative_condition
         payload = json.loads(json.loads(request.content)["messages"][-1]["content"])
         calls.append(copy.deepcopy(payload))
         if "message" in payload:
-            response = {"facts": [
+            response = {"new_task": False, "facts": [
                 {"key": "application", "value": "АльфаРегистр", "evidence": "АльфаРегистр"},
                 {"key": "connection", "value": "кабель", "entity": "терминал", "negated": True,
                  "evidence": "Кабель не используется"},
             ], "goals": [
-                {"text": "изменить яркость терминала", "evidence": "изменить яркость терминала"},
-                {"text": "размер шрифта в АльфаРегистр", "evidence": "размер шрифта в АльфаРегистр"},
+                {"text": "изменить яркость терминала", "evidence": "изменить яркость терминала", "goal_id": None},
+                {"text": "размер шрифта в АльфаРегистр", "evidence": "размер шрифта в АльфаРегистр", "goal_id": None},
             ], "question": "Какой протокол использует приложение?", "question_field": "connection"}
         else:
             assert payload["instruction_planning"] is True and payload["evidence_references"] is True
@@ -396,6 +398,40 @@ def test_multiline_original_caption_stays_before_one_original_image(model_chat):
     text = "\n".join(content for content, _ in replies)
     assert text.count(FIRST) == 1 and text.count("Следующая строка исходной подписи") == 1
     assert len([photo for _, photo in replies if photo]) == 2
+
+
+def test_whitespace_equivalent_caption_does_not_repeat_the_preceding_action_paragraphs(model_chat, monkeypatch):
+    chat, _ = planning_chat(model_chat)
+    final_action = "Подтвердите выбранный уровень яркости на терминале."
+    caption = FIRST + " " + final_action
+    with ZipFile(io.BytesIO(instruction([caption], image_data=png("purple")))) as archive:
+        parts = {name: archive.read(name) for name in archive.namelist()}
+    cover = '<w:p><w:r><w:t>Утверждённая инструкция Acrobat</w:t></w:r></w:p>'
+    body = f'<w:p><w:r><w:t>{FIRST}</w:t></w:r></w:p><w:p><w:r><w:t>{final_action}</w:t></w:r></w:p>'
+    document = parts["word/document.xml"].decode()
+    assert cover in document
+    parts["word/document.xml"] = document.replace(cover, body, 1)
+    original = office(parts)
+    chat.state["originals"][DOC] = original
+    pending = chat.send(REQUEST)
+    result = chat.send("Да", 2)
+    replies = assistants(result)[len(assistants(pending)):]
+    text = "\n".join(content for content, _ in replies)
+    assert text.count(FIRST) == 1 and text.count(final_action) == 1
+    assert [photo.data for _, photo in replies if photo] == [
+        read_docx_images(original)[0].data, read_docx_images(chat.state["originals"][OTHER])[0].data,
+    ]
+
+    chat.talk.settings.nextcloud_backend = "account"
+    monkeypatch.setattr("app.services.rag.talk.TalkKnowledge", chat.source_factory)
+    sender = Sender(uid="bot-uid")
+    while deliver_one(chat.talk.env.factory, chat.talk.settings, sender):
+        pass
+    delivered_text = "\n".join(write[2] for write in sender.writes)
+    assert delivered_text.count(FIRST) == 1 and delivered_text.count(final_action) == 1
+    assert [write[5] for write in sender.writes if write[0] == "photo"] == [
+        read_docx_images(original)[0].data, read_docx_images(chat.state["originals"][OTHER])[0].data,
+    ]
 
 
 def goal_order_chat(model_chat, *, confirmation_enabled=True):

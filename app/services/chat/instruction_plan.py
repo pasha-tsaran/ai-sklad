@@ -95,7 +95,7 @@ def _units(parts):
             text = section["text"]
             caption_body = re.sub(r"^Иллюстрация\s+\d+[.)]\s*", "", text, flags=re.I)
             normalized = " ".join(caption_body.split())
-            repeated_caption = normalized in captions and any(normalized in earlier for earlier in original_text)
+            repeated_caption = normalized in captions and normalized in " ".join(original_text)
             if not repeated_caption and text.strip() != "Фотографии и пояснения":
                 pending.append(text)
                 original_text.append(" ".join(text.split()))
@@ -134,12 +134,13 @@ def render_plan(parts, saved, *, repeat=False):
     for index in selected:
         approved, text, numbers = units[index]
         source = approved.document["source"]
+        normalized_text = " ".join(text.split())
         if text:
             blocks.append((text, None))
             sources.append(source)
         for number in numbers:
             picture = approved.illustrations[number]
-            caption = picture.caption if picture.caption not in text else ""
+            caption = picture.caption if " ".join(picture.caption.split()) not in normalized_text else ""
             blocks.append((caption, picture))
             sources.append(source)
     updated = copy.deepcopy(saved)

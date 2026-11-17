@@ -9,12 +9,14 @@ import pytest
 from sqlalchemy import select
 
 from app.core.config import Settings
-from app.models import Delivery, Message, MessageAttachment, TalkRoom
+from app.models import Delivery, KnowledgeIndex, Message, MessageAttachment, TalkRoom
 from app.services.llm.mock import MockLLM
 from scripts.check_support_dialogues import (
     ControllerRunner, EvaluationFailure, TalkRunner, room_message_ids, run_cases, snapshot, source_names,
     validate_interruption, validate_turn,
 )
+from tests.test_openwebui_instruction_images import instruction
+from tests.test_scanner_original_retrieval import scanner_provider
 
 
 def result(**values):
@@ -63,6 +65,22 @@ def test_benchmark_stops_the_failed_case_and_keeps_report_free_of_private_text()
     assert "private" not in json.dumps(report)
 
 
+def test_failed_dialogue_reports_safe_task_and_source_metadata():
+    state = result(sources=["01_Previous.docx"], texts=["private reply"], flow={
+        "understanding_confirmation": {"summary": "private summary"},
+        "task_state": {"goals": {"g1": {"text": "private task"}},
+                       "facts": [{"key": "application", "value": "private value"}]},
+    }, deliveries=[{"provenance": None}, {"provenance": {"filename": "01_Previous.docx"}}])
+    runner = SimpleNamespace(mode="real_qwen_controller", turn=lambda *args, **kwargs: state)
+    report = run_cases(runner, [{"id": "missing-question", "turns": [{"message": "question", "question": True}]}])
+    assert report["turns"][0]["observed"] == {
+        "sources": ["01_Previous.docx"], "photos": 0, "goal_count": 1,
+        "fact_keys": ["application"], "has_clarification": False, "has_confirmation": True,
+        "delivered_sources": ["01_Previous.docx"],
+    }
+    assert "private" not in json.dumps(report)
+
+
 def test_benchmark_completes_every_selected_batch_before_the_next_scenario():
     class Runner:
         mode = "real_qwen_controller"
@@ -105,6 +123,27 @@ def test_controller_benchmark_uses_an_isolated_database_and_the_production_entry
         assert state["texts"] and runner.sequence == 1
         assert str(runner.engine.url).startswith("sqlite:///")
         assert directory in str(runner.engine.url)
+    finally:
+        runner.close()
+
+
+def test_controller_prepares_the_whole_isolated_index_before_dialogues(monkeypatch):
+    rows = [(f"00000000-0000-4000-8000-{number:012}", f"Материал {number}.docx",
+             instruction([f"Выполните действие для нового приложения номер {number}."]))
+            for number in range(1, 5)]
+    knowledge, _ = scanner_provider(rows)
+
+    def configured(settings, *, catalog):
+        knowledge.set_catalog(catalog)
+        return knowledge
+
+    monkeypatch.setattr("scripts.check_support_dialogues.OpenWebUILLM", lambda settings: MockLLM())
+    monkeypatch.setattr("scripts.check_support_dialogues.TalkKnowledge", configured)
+    runner = ControllerRunner(knowledge.settings)
+    try:
+        assert runner.prepare() == {"source_count": 4, "indexed_count": 4, "complete": True}
+        with runner.factory() as session:
+            assert len(session.scalars(select(KnowledgeIndex)).all()) == 4
     finally:
         runner.close()
 

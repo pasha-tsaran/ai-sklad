@@ -8,8 +8,9 @@ import httpx
 import pytest
 from sqlalchemy import select
 
-from app.models import Message
+from app.models import Incident, Message
 from app.models.talk import TalkRoom
+from app.services.chat.policies import FORM_ACTION
 from app.services.chat.talk_dialogue import UNAVAILABLE
 from app.services.llm.openwebui import OpenWebUILLM
 from integrations.openwebui.approved_instruction_images import read_docx_images
@@ -33,6 +34,7 @@ def replies_since(before, after):
 @pytest.mark.parametrize("error,expected_code", [
     (ValueError("UnknownTaskGoal"), "UnknownTaskGoal"),
     (ValueError("InvalidTaskEvidence"), "InvalidTaskEvidence"),
+    (ValueError("IncompleteTaskUnderstanding"), "IncompleteTaskUnderstanding"),
     (ValueError("Untrusted message with employee@example.test"), "ValueError"),
     (RuntimeError("Untrusted message with employee@example.test"), "RuntimeError"),
 ])
@@ -140,6 +142,91 @@ def legacy_question(chat, opening, goal, evidence, question, *, field="connectio
         ).order_by(Message.sequence.desc()))
         message.content = question
     return first, state
+
+
+@pytest.mark.parametrize("pending_form", [False, True])
+def test_explicit_new_task_drops_an_old_confirmation_before_a_failed_understanding(model_chat, pending_form):
+    case = CASES[0]
+    chat = model_chat([match(DOC, case["caption"])], rows=[
+        (DOC, case["filename"], instruction([case["caption"]])),
+    ])
+    chat.talk.settings.talk_confirm_understanding = True
+    chat.model.understand_task = lambda *args: {
+        "facts": [{"key": "application", "value": "Outlook", "evidence": "Outlook"}],
+        "goals": [{"text": case["goal"], "evidence": case["evidence"]}],
+    }
+    old = chat.send(case["opening"])
+    assert old["flow"]["understanding_confirmation"]
+    if pending_form:
+        with chat.talk.env.factory() as session, session.begin():
+            room = session.get(TalkRoom, chat.talk.room_id)
+            session.get(Incident, room.incident_id).pending_action = FORM_ACTION
+            room.flow = {"escalation": {"stage": "FORM", "resume": {"flow": copy.deepcopy(room.flow)}}}
+    opening = "Другая задача. Нужно настроить рабочее устройство."
+
+    def failed_understanding(message, previous, question):
+        assert message == opening
+        assert previous["goals"] == {} and previous["facts"] == [] and previous["messages"] == []
+        assert question == ""
+        raise ValueError("IncompleteTaskUnderstanding")
+
+    chat.model.understand_task = failed_understanding
+    result = chat.send(opening, 2)
+    assert replies_since(old, result) == [(UNAVAILABLE, None)]
+    state = result["flow"]["task_state"]
+    assert state["facts"] == [] and state["goals"] == {} and state["messages"] == [opening]
+    assert state["new_task"] is True
+    assert result["flow"]["clarification_query"] == opening
+    assert not set(result["flow"]) & {"source", "instruction_plan", "understanding_confirmation", "task_query"}
+    assert result["incident"].pending_action is None
+    assert len(chat.model.calls) == 1
+
+
+def test_new_task_selection_uses_only_current_user_history_and_current_step_facts(model_chat):
+    caption = "При подключении сканера штрихкодов откройте указанное окно настройки рабочего устройства."
+    opening = "Другая задача. Настройка сканера"
+    answer = "Сканер штрихкодов. При подключении на четвёртом шаге ошибка «нет связи»."
+    question = "Это сканер штрихкодов или сканер документов?"
+
+    def choose(payload):
+        context = payload["context"]
+        assert payload["requested_goals"] == {"g1": "Подключить сканер штрихкодов"}
+        assert context["recent_messages"] == [{"role": "user", "content": opening},
+                                               {"role": "user", "content": answer}]
+        assert not context.get("technical_facts")
+        assert "Outlook" not in json.dumps(context, ensure_ascii=False)
+        facts = context["task_state"]["facts"]
+        assert any(fact["key"] == "error_text" and fact["value"] == "нет связи" for fact in facts)
+        assert any(fact["key"] == "current_step" for fact in facts)
+        return match(DOC, caption)
+
+    chat = model_chat([choose], rows=[(DOC, "Подключение рабочего считывателя.docx", instruction([caption]))])
+    old, _ = legacy_question(chat, "Хочу открыть почту в Outlook", "Открыть почту в Outlook",
+                             "открыть почту в Outlook", "Какой тип почты используется?")
+    updates = [{"facts": [{"key": "equipment_type", "value": "сканер", "evidence": "сканера"}],
+                "question": question, "question_field": "equipment_type"},
+               {"facts": [{"key": "equipment_type", "value": "сканер штрихкодов", "evidence": "Сканер штрихкодов"},
+                          {"key": "error_text", "value": "нет связи", "evidence": "нет связи"},
+                          {"key": "current_step", "value": "четвёртый шаг", "evidence": "четвёртом шаге"}],
+                "goals": [{"text": "Подключить сканер штрихкодов", "evidence": "При подключении"}]}]
+    calls = []
+
+    def understand(message, previous, previous_question):
+        calls.append((message, copy.deepcopy(previous), previous_question))
+        return updates.pop(0)
+
+    chat.model.understand_task = understand
+    asked = chat.send(opening, 2)
+    assert replies_since(old, asked) == [(question, None)] and not chat.model.calls
+    assert not asked["flow"]["task_state"]["goals"]
+    assert calls[0][1]["goals"] == {} and calls[0][2] == ""
+    result = chat.send(answer, 3)
+    assert result["flow"]["understanding_confirmation"]["source"]["file_id"] == DOC
+    with chat.talk.env.factory() as session:
+        messages = session.scalars(select(Message.content).where(
+            Message.incident_id == result["incident"].id, Message.role == "user",
+        )).all()
+    assert "Хочу открыть почту в Outlook" in messages
 
 
 @pytest.mark.parametrize("answer", ["не знаю", "Не разбираюсь в этом", "затрудняюсь ответить"])

@@ -23,6 +23,7 @@ from pydantic import SecretStr
 from sqlalchemy import create_engine, select, update
 
 from app.core.config import get_settings
+from app.core.logging import configure_logging
 from app.db import session_factory
 from app.models import Base, Delivery, Incident, Message, MessageAttachment, TalkAccount, TalkInbox, TalkRoom, now
 from app.services.chat.talk_dialogue import UNAVAILABLE, process_one
@@ -30,6 +31,7 @@ from app.services.llm.openwebui import OpenWebUILLM
 from app.services.nextcloud.account import AccountClient
 from app.services.nextcloud.inbound_media import parse_inbound_media
 from app.services.nextcloud.interruption import is_resume_request, latest_paused
+from app.services.rag.catalog import KnowledgeCatalog
 from app.services.rag.talk import TalkKnowledge
 
 
@@ -168,6 +170,13 @@ class ControllerRunner:
             session.add(room)
             session.flush()
             self.account_id, self.room_id = account.id, room.id
+
+    def prepare(self):
+        catalog = KnowledgeCatalog(self.settings, self.factory)
+        knowledge = TalkKnowledge(self.settings, catalog=catalog)
+        report = catalog.sync(knowledge, refresh=True)
+        check(report["complete"], "EvaluationIndexIncomplete")
+        return {key: report[key] for key in ("source_count", "indexed_count", "complete")}
 
     def turn(self, message, *, wait_delivery=True):
         previous = room_message_ids(self.factory, self.room_id)
@@ -362,6 +371,7 @@ def run_cases(runner, cases, *, progress=None):
         for index, turn in enumerate(case["turns"], 1):
             started = time.monotonic()
             row = {"case": case["id"], "turn": index}
+            result = None
             try:
                 result = runner.turn(turn["message"], wait_delivery=turn.get("wait_delivery", True))
                 validate_turn(result, turn)
@@ -386,6 +396,17 @@ def run_cases(runner, cases, *, progress=None):
                 code = str(error) if isinstance(error, EvaluationFailure) else type(error).__name__
                 row.update(status="error", error_code=code if re.fullmatch(r"[A-Za-z0-9_]{1,100}", code)
                            else "EvaluationError")
+                if result is not None:
+                    state = result["flow"].get("task_state", {})
+                    row["observed"] = {
+                        "sources": result["sources"], "photos": len(result["photos"]),
+                        "goal_count": len(state.get("goals", {})),
+                        "fact_keys": sorted({fact["key"] for fact in state.get("facts", [])}),
+                        "has_clarification": bool(result["flow"].get("clarification_question")),
+                        "has_confirmation": bool(result["flow"].get("understanding_confirmation")),
+                        "delivered_sources": sorted({row["provenance"]["filename"]
+                            for row in result["deliveries"] if (row.get("provenance") or {}).get("filename")}),
+                    }
             row["seconds"] = round(time.monotonic() - started, 3)
             rows.append(row)
             if progress:
@@ -437,6 +458,7 @@ def main(argv=None):
     parser.add_argument("--all-instructions", action="store_true", help="Check original parsing and model selection for every current source")
     parser.add_argument("--report", type=Path)
     args = parser.parse_args(argv)
+    configure_logging()
     runner = None
     try:
         settings = get_settings()
@@ -448,6 +470,9 @@ def main(argv=None):
             runner = TalkRunner(settings, username, password, args.room)
         else:
             runner = ControllerRunner(settings)
+            print(json.dumps({"stage": "prepare_index", "status": "started"}), flush=True)
+            index = runner.prepare()
+            print(json.dumps({"stage": "prepare_index", "status": "ok", **index}), flush=True)
         cases = [case for case in CASES if not args.case or case["id"] in args.case]
         report = run_cases(runner, cases, progress=lambda row: print(json.dumps(row, ensure_ascii=False), flush=True))
         from app.main import app

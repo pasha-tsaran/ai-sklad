@@ -11,6 +11,7 @@ from app.schemas.contracts import (
     AnalysisResult, AnswerResult, DialogueResult, EscalationExtraction, FollowupResult, InstructionOfferReply, SummaryResult,
     SupportTaskUnderstanding, UnderstandingReply,
 )
+from app.services.chat.task_state import task_evidence_authority
 from app.services.llm.prompts import (
     ANALYZE_TASK, COMPOSE_TASK, DIALOGUE_TASK, ESCALATION_EXTRACTION_TASK, FOLLOWUP_TASK,
     INSTRUCTION_OFFER_TASK, SUMMARY_TASK, SUPPORT_TASK_TASK, UNDERSTANDING_REPLY_TASK, stage_messages,
@@ -18,6 +19,9 @@ from app.services.llm.prompts import (
 from app.services.llm.instruction_selection import (
     InstructionReferenceSelection, reference_selection_schema, resolve_instruction_references,
 )
+
+
+_TASK_REQUIRED_FIELDS = ("new_task", "facts", "goals", "question", "question_field")
 
 
 def _instruction_schema_variants(base, payload):
@@ -116,6 +120,10 @@ class OpenWebUILLM:
         selection_schema = None
         if fast_selection:
             selection_schema = schema.model_json_schema()
+            if schema is SupportTaskUnderstanding:
+                selection_schema["required"] = list(dict.fromkeys([
+                    *selection_schema.get("required", []), *_TASK_REQUIRED_FIELDS,
+                ]))
             if payload.get("instruction_planning") is not True and "parts" in selection_schema["properties"]:
                 selection_schema["properties"].pop("parts")
                 selection_schema["properties"].pop("section_ids")
@@ -156,6 +164,7 @@ class OpenWebUILLM:
                                                 "covered_goals", "missing_goal_ids"]
             task_goal = selection_schema.get("$defs", {}).get("SupportTaskGoal")
             if task_goal:
+                task_goal["required"] = list(dict.fromkeys([*task_goal.get("required", []), "goal_id"]))
                 goal_ids = list(payload.get("previous_state", {}).get("goals", {}))
                 task_goal["properties"]["goal_id"] = (
                     {"anyOf": [{"type": "string", "enum": goal_ids}, {"type": "null"}], "default": None}
@@ -372,9 +381,42 @@ class OpenWebUILLM:
         return reply
 
     def understand_task(self, message, previous_state, previous_question):
-        return self._call(SupportTaskUnderstanding, SUPPORT_TASK_TASK, {
+        payload = {
             "message": message, "previous_state": previous_state, "previous_question": previous_question,
-        }, fast_selection=True, max_output_tokens=1536)
+        }
+        for attempt in range(2):
+            reply = self._call(SupportTaskUnderstanding, SUPPORT_TASK_TASK, payload,
+                               fast_selection=True, max_output_tokens=1536)
+            missing = [field for field in _TASK_REQUIRED_FIELDS if field not in reply.model_fields_set]
+            missing.extend(f"goals.{index}.goal_id" for index, goal in enumerate(reply.goals)
+                           if "goal_id" not in goal.model_fields_set)
+            authority = task_evidence_authority(message, previous_state, reply.new_task)
+            invalid_evidence = []
+            for field, items in (("facts", reply.facts), ("goals", reply.goals)):
+                for index, item in enumerate(items):
+                    if not any(item.evidence in original for original in authority):
+                        invalid_evidence.append(f"{field}.{index}.evidence")
+            for field in ("replacement_evidence", "unknown_answer_evidence"):
+                evidence = getattr(reply, field)
+                if evidence and evidence not in message:
+                    invalid_evidence.append(field)
+            try:
+                event("llm.task_understanding", new_task=reply.new_task, replace_goals=reply.replace_goals,
+                      goal_count=len(reply.goals), goal_ids=[goal.goal_id for goal in reply.goals],
+                      fact_keys=[fact.key for fact in reply.facts], question_field=reply.question_field,
+                      has_question=bool(reply.question.strip()), missing_fields=missing,
+                      invalid_evidence_fields=invalid_evidence,
+                      contract_retry=bool(attempt))
+            except Exception:
+                pass  # Diagnostics never change a validated task interpretation.
+            if not missing and not invalid_evidence:
+                return reply
+            payload = {**payload, "contract_retry": True}
+            if missing:
+                payload["missing_fields"] = missing
+            if invalid_evidence:
+                payload["invalid_evidence_fields"] = invalid_evidence
+        raise ValueError("IncompleteTaskUnderstanding" if missing else "InvalidTaskEvidence")
 
     def analyze(self, message):
         return self.analyze_context(message, {})
