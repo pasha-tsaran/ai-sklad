@@ -168,8 +168,8 @@ def test_reminder_with_an_explicit_new_task_still_reaches_task_understanding(mod
     chat, guide, calls = upload_chat(model_chat, [{
         "new_task": True,
         "facts": [{"key": "equipment_type", "value": "принтер", "evidence": "принтер"}],
-        "goals": [{"text": "Настроить принтер", "evidence": "настроить принтер"}],
-        "question": question, "question_field": "other",
+        "goals": [],
+        "question": question, "question_field": "goal",
     }])
     result = chat.send(message, 3)
     assert calls[-1]["message"] == message

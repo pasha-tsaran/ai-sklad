@@ -88,6 +88,8 @@ def test_instruction_selection_has_a_short_structured_response_with_thinking_dis
         expected_schema["properties"]["alternatives"]["maxItems"] = 0
         expected_schema["properties"].pop("covered_goals")
         expected_schema["properties"].pop("missing_goal_ids")
+        expected_schema["properties"].pop("clarification_kind")
+        expected_schema["properties"].pop("clarification_sources")
         expected_schema["$defs"].pop("InstructionGoalCoverage")
         expected_schema["properties"]["result"]["enum"].remove("PARTIAL")
         assert body["response_format"] == {"type": "json_schema", "json_schema": {
@@ -312,7 +314,8 @@ def test_instruction_schema_disallows_another_read_only_after_explicit_budget_ex
     from app.services.rag.talk import InstructionSelection
 
     file_id = "00000000-0000-4000-8000-000000000001"
-    payload = {"catalogue": {file_id: "Материал.md"}, "candidates": {file_id: "Исходный текст."}}
+    payload = {"catalogue": {file_id: "Материал.md"},
+               "candidates": {file_id: "Исходная процедура настройки рабочей программы."}}
     if availability is not None:
         payload["read_available"] = availability
     if with_goals:
@@ -321,14 +324,22 @@ def test_instruction_schema_disallows_another_read_only_after_explicit_budget_ex
     def handler(request):
         body = json.loads(request.content)
         schema = body["response_format"]["json_schema"]["schema"]
-        outcomes = schema["properties"]["result"]["enum"]
+        if with_goals:
+            variants = {variant["properties"]["result"]["const"]: variant for variant in schema["anyOf"]}
+            outcomes = set(variants)
+            assert "covered_goals" in variants["MATCH"]["required"]
+            assert "missing_goal_ids" not in variants["MATCH"]["properties"]
+            assert "missing_goal_ids" in variants["NO_KNOWLEDGE"]["required"]
+        else:
+            outcomes = schema["properties"]["result"]["enum"]
+            assert "covered_goals" not in schema["properties"]
         assert ("READ" in outcomes) is (availability is not False)
-        assert ("PARTIAL" in outcomes) is with_goals
-        assert ("covered_goals" in schema["properties"]) is with_goals
-        assert ("covered_goals" in schema.get("required", [])) is with_goals
-        assert ("missing_goal_ids" in schema.get("required", [])) is with_goals
+        assert "PARTIAL" not in outcomes
         assert body["max_tokens"] == (768 if with_goals else 512)
-        return httpx.Response(200, json={"choices": [{"message": {"content": '{"result":"NO_KNOWLEDGE"}'}}]})
+        choice = {"result": "NO_KNOWLEDGE"}
+        if with_goals:
+            choice["missing_goal_ids"] = ["g1"]
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(choice)}}]})
 
     result = OpenWebUILLM(settings(), httpx.MockTransport(handler)).select_instruction(payload)
     assert result.result == "NO_KNOWLEDGE"
@@ -368,3 +379,353 @@ def test_explicit_context_window_is_forwarded_to_both_service_routes(selection):
         assert model.select_instruction({"catalogue": {}, "candidates": {}}).result == "NO_KNOWLEDGE"
     else:
         assert model.dialogue("Привет", {}).route == "SOCIAL"
+
+
+@pytest.mark.parametrize("required", [False, True])
+def test_source_clarification_contract_is_explicit_and_preserves_legacy_compactness(required):
+    file_id = "00000000-0000-4000-8000-000000000001"
+    evidence = "При первом запуске программы используется корпоративное подключение."
+    unknown = [{"question": "Какой служебный протокол?", "answer": "Не знаю"}]
+    payload = {"catalogue": {file_id: "Вход в программу.md"}, "candidates": {file_id: evidence},
+               "source_clarification_required": required, "unknown_answers": unknown}
+
+    def handler(request):
+        body = json.loads(request.content)
+        schema = body["response_format"]["json_schema"]["schema"]
+        assert ("clarification_kind" in schema["properties"]) is required
+        assert ("clarification_sources" in schema["properties"]) is required
+        assert ("clarification_sources" in schema.get("required", [])) is required
+        assert ("clarification_kind" in schema.get("required", [])) is required
+        wire = json.loads(body["messages"][-1]["content"])
+        assert wire["unknown_answers"] == unknown
+        if required:
+            assert schema["$defs"]["InstructionAlternative"]["properties"]["file_id"]["enum"] == ["s1"]
+            kind_schema = schema["properties"]["clarification_kind"]
+            assert kind_schema["anyOf"][0]["enum"] == ["USER_GOAL", "VISIBLE_STATE", "PHYSICAL_SETUP", "WORK_HISTORY"]
+            choice = {"result": "CLARIFY", "question": "Что сейчас видно в окне программы?",
+                      "clarification_kind": "VISIBLE_STATE",
+                      "clarification_sources": [{"file_id": "s1", "evidence": evidence}]}
+        else:
+            assert len(json.dumps(schema)) < 2000
+            choice = {"result": "CLARIFY", "question": "Что сейчас видно в окне программы?"}
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(choice)}}]})
+
+    model = OpenWebUILLM(settings(), httpx.MockTransport(handler))
+    assert model.supports_source_clarification is True
+    result = model.select_instruction(payload)
+    assert result.result == "CLARIFY"
+    assert result.clarification_kind == ("VISIBLE_STATE" if required else None)
+    assert [item.file_id for item in result.clarification_sources] == ([file_id] if required else [])
+
+
+@pytest.mark.parametrize("source_id", ["s2", "S1", "00000000-0000-4000-8000-000000000001"])
+def test_source_clarification_cannot_smuggle_unknown_or_canonical_wire_identifiers(source_id):
+    file_id = "00000000-0000-4000-8000-000000000001"
+    choice = {"result": "CLARIFY", "question": "Что сейчас видно в окне программы?",
+              "clarification_kind": "VISIBLE_STATE",
+              "clarification_sources": [{"file_id": source_id, "evidence": "Условие применимости из оригинала."}]}
+    model = OpenWebUILLM(settings(), httpx.MockTransport(lambda request: httpx.Response(200, json={
+        "choices": [{"message": {"content": json.dumps(choice)}}],
+    })))
+    with pytest.raises(ValueError, match="UnknownInstructionSourceAlias"):
+        model.select_instruction({"source_clarification_required": True,
+                                  "catalogue": {file_id: "Материал.md"}, "candidates": {file_id: "Текст"}})
+
+
+@pytest.mark.parametrize("goal_count", [1, 3])
+def test_goal_schema_uses_complete_closed_outcomes_and_exact_match_coverage(goal_count):
+    from copy import deepcopy
+
+    from app.services.llm.openwebui import _instruction_schema_variants
+    from app.services.rag.talk import InstructionSelection
+
+    base = InstructionSelection.model_json_schema()
+    payload = {"requested_goals": {f"g{number}": f"Цель {number}" for number in range(1, goal_count + 1)},
+               "catalogue": {"s1": "Рабочая программа.md", "s2": "Иной вариант.md"},
+               "candidates": {"s1": "Оригинал инструкции по рабочей программе."},
+               "source_clarification_required": True}
+    original_base, original_payload = deepcopy(base), deepcopy(payload)
+    schema = _instruction_schema_variants(base, payload)
+    assert base == original_base and payload == original_payload
+    assert "properties" not in schema and "allOf" not in schema
+    variants = {variant["properties"]["result"]["const"]: variant for variant in schema["anyOf"]}
+    for variant in variants.values():
+        assert variant["type"] == "object" and variant["additionalProperties"] is False
+        assert "result" in variant["required"]
+
+    matched = variants["MATCH"]
+    assert set(matched["required"]) == {"result", "file_id", "covered_goals"}
+    assert matched["properties"]["file_id"] == {"type": "string", "enum": ["s1"]}
+    covered = matched["properties"]["covered_goals"]
+    assert covered["minItems"] == goal_count and covered["maxItems"] == goal_count
+    assert set(matched["properties"]) == {"result", "file_id", "covered_goals", "understanding", "new_request"}
+    # The two live malformed replies cannot satisfy this branch. Empty coverage,
+    # a null or omitted file, and a simultaneous missing-goal list are excluded.
+    assert covered["minItems"] > 0
+    assert "anyOf" not in matched["properties"]["file_id"]
+    assert "missing_goal_ids" not in matched["properties"]
+
+    absent = variants["NO_KNOWLEDGE"]
+    assert absent["required"] == ["result", "missing_goal_ids"]
+    assert absent["properties"]["missing_goal_ids"]["const"] == list(payload["requested_goals"])
+    assert set(absent["properties"]) == {"result", "missing_goal_ids", "new_request"}
+    assert variants["READ"]["properties"]["file_id"] == {"type": "string", "enum": ["s1", "s2"]}
+
+    clarify = variants["CLARIFY"]
+    assert set(clarify["required"]) == {"result", "question", "clarification_kind", "clarification_sources"}
+    assert clarify["properties"]["clarification_sources"]["minItems"] == 1
+    assert "file_id" not in clarify["properties"] and "covered_goals" not in clarify["properties"]
+    alternative = schema["$defs"]["InstructionAlternative"]["properties"]
+    assert alternative["file_id"] == {"type": "string", "enum": ["s1"]}
+    assert alternative["evidence"]["minLength"] == 20
+    assert ("PARTIAL" in variants) is (goal_count > 1)
+    if goal_count > 1:
+        partial = variants["PARTIAL"]["properties"]
+        for field in ("covered_goals", "missing_goal_ids"):
+            assert partial[field]["minItems"] == 1 and partial[field]["maxItems"] == goal_count - 1
+
+
+def test_goal_schema_distinguishes_text_and_original_image_support():
+    from app.services.llm.openwebui import _instruction_schema_variants
+    from app.services.rag.talk import InstructionSelection
+
+    schema = _instruction_schema_variants(InstructionSelection.model_json_schema(), {
+        "requested_goals": {"first": "Первое действие", "second": "Второе действие"},
+        "catalogue": {"s1": "Рабочая программа.md"}, "candidates": {"s1": "Оригинал"},
+    })
+    variants = schema["$defs"]["InstructionGoalCoverage"]["anyOf"]
+    text, image = variants
+    assert text["properties"]["support_kind"]["const"] == "TEXT"
+    assert text["properties"]["image_numbers"]["maxItems"] == 0
+    assert image["properties"]["support_kind"]["const"] == "IMAGE"
+    assert image["properties"]["image_numbers"]["minItems"] == 1
+    assert "image_numbers" in image["required"]
+    for variant in variants:
+        assert variant["properties"]["goal_id"]["enum"] == ["first", "second"]
+        assert variant["properties"]["evidence"]["minLength"] == 20
+        assert variant["additionalProperties"] is False
+
+
+@pytest.mark.parametrize("loaded", [False, True])
+def test_goal_schema_needs_loaded_sources_and_respects_bounded_read_and_question_flags(loaded):
+    from app.services.llm.openwebui import _instruction_schema_variants
+    from app.services.rag.talk import InstructionSelection
+
+    payload = {"requested_goals": {"g1": "Открыть рабочую программу"},
+               "catalogue": {"s1": "Вход.md"}, "candidates": {"s1": "Оригинал"} if loaded else {},
+               "source_clarification_required": True}
+    base = InstructionSelection.model_json_schema()
+    initial = _instruction_schema_variants(base, payload)
+    outcomes = {variant["properties"]["result"]["const"] for variant in initial["anyOf"]}
+    assert ("MATCH" in outcomes) is loaded
+    assert ("RELATED" in outcomes) is loaded
+    assert ("CLARIFY" in outcomes) is loaded
+    assert "READ" in outcomes
+    final = _instruction_schema_variants(base, {**payload, "read_available": False, "allow_clarification": False})
+    final_outcomes = {variant["properties"]["result"]["const"] for variant in final["anyOf"]}
+    assert "READ" not in final_outcomes and "CLARIFY" not in final_outcomes
+    assert "NO_KNOWLEDGE" in final_outcomes
+
+
+def test_goal_schema_leaves_no_goals_legacy_contract_unchanged():
+    from app.services.llm.openwebui import _instruction_schema_variants
+    from app.services.rag.talk import InstructionSelection
+
+    base = InstructionSelection.model_json_schema()
+    assert _instruction_schema_variants(base, {"catalogue": {}, "candidates": {}}) is base
+
+
+@pytest.mark.parametrize("result_kind", ["MATCH", "NO_KNOWLEDGE", "READ", "CLARIFY"])
+def test_goal_outcome_response_can_omit_irrelevant_fields_and_restores_canonical_defaults(result_kind):
+    file_id = "00000000-0000-4000-8000-000000000001"
+    evidence = "При первом входе откройте окно корпоративной программы."
+
+    def handler(request):
+        body = json.loads(request.content)
+        schema = body["response_format"]["json_schema"]["schema"]
+        variants = {variant["properties"]["result"]["const"]: variant for variant in schema["anyOf"]}
+        assert result_kind in variants
+        wire = json.loads(body["messages"][-1]["content"])
+        assert wire["evidence_references"] is True
+        assert wire["candidates"]["s1"]["t1"]["text"] == evidence
+        choice = {"result": result_kind}
+        if result_kind == "MATCH":
+            choice.update(file_id="s1", covered_goals=[{
+                "goal_id": "g1", "evidence_id": "t1",
+            }])
+        elif result_kind == "NO_KNOWLEDGE":
+            choice["missing_goal_ids"] = ["g1"]
+        elif result_kind == "READ":
+            choice["file_id"] = "s1"
+        else:
+            choice.update(question="Какое окно программы вы сейчас видите?", clarification_kind="VISIBLE_STATE",
+                          clarification_sources=[{"file_id": "s1", "evidence_id": "t1"}])
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(choice)}}]})
+
+    result = OpenWebUILLM(settings(), httpx.MockTransport(handler)).select_instruction({
+        "requested_goals": {"g1": "Открыть программу в первый раз"},
+        "catalogue": {file_id: "Первый вход.docx"}, "candidates": {file_id: evidence},
+        "source_clarification_required": True,
+    })
+    assert result.result == result_kind
+    assert result.evidence == "" and result.alternatives == []
+    assert result.file_id == (file_id if result_kind in {"MATCH", "READ"} else None)
+    assert [item.goal_id for item in result.covered_goals] == (["g1"] if result_kind == "MATCH" else [])
+    assert result.missing_goal_ids == (["g1"] if result_kind == "NO_KNOWLEDGE" else [])
+    assert [item.file_id for item in result.clarification_sources] == ([file_id] if result_kind == "CLARIFY" else [])
+
+
+@pytest.mark.parametrize("support_kind", ["TEXT", "IMAGE"])
+def test_goal_selection_uses_precomputed_source_fragments_and_restores_exact_proof(support_kind):
+    from copy import deepcopy
+
+    file_id = "00000000-0000-4000-8000-000000000001"
+    text = "Откройте окно рабочей программы и выберите корпоративное подключение."
+    caption = "Снимок окна. Кнопка входа находится справа от названия подключения."
+    payload = {"requested_goals": {"g1": "Открыть рабочую программу"},
+               "catalogue": {file_id: "Первый вход.docx"}, "candidates": {file_id: text + "\n\n" + caption},
+               "candidate_image_numbers": {file_id: [4]}, "candidate_image_captions": {file_id: {4: caption}},
+               "source_clarification_required": True}
+    unchanged = deepcopy(payload)
+    selected = {}
+
+    def handler(request):
+        body = json.loads(request.content)
+        wire = json.loads(body["messages"][-1]["content"])
+        assert wire["catalogue"] == {"s1": "Первый вход.docx"}
+        assert "candidate_image_captions" not in wire and "candidate_image_numbers" not in wire
+        registry = wire["candidates"]["s1"]
+        reference_id, proof = next((key, item) for key, item in registry.items()
+                                   if item["support_kind"] == support_kind)
+        selected.update(proof)
+        assert proof["text"] == (text if support_kind == "TEXT" else caption)
+        schema = body["response_format"]["json_schema"]["schema"]
+        assert schema["title"] == "InstructionReferenceSelection"
+        match = next(branch for branch in schema["anyOf"] if branch["properties"]["result"]["const"] == "MATCH")
+        definition = match["properties"]["covered_goals"]["items"]["$ref"].split("/")[-1]
+        proof_schema = schema["$defs"][definition]["properties"]
+        assert "evidence" not in proof_schema and "support_kind" not in proof_schema
+        assert reference_id in proof_schema["evidence_id"]["enum"]
+        choice = {"result": "MATCH", "file_id": "s1", "covered_goals": [{
+            "goal_id": "g1", "evidence_id": reference_id,
+        }]}
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(choice)}}]})
+
+    result = OpenWebUILLM(settings(), httpx.MockTransport(handler)).select_instruction(payload)
+    assert payload == unchanged and result.file_id == file_id
+    proof = result.covered_goals[0]
+    assert proof.evidence == selected["text"] and proof.support_kind == support_kind
+    assert proof.image_numbers == ([4] if support_kind == "IMAGE" else [])
+
+
+@pytest.mark.parametrize("reference_id", ["unknown", "i7_1", "s2:t1", "Точная цитата из другого файла"])
+def test_goal_selection_rejects_unknown_and_other_file_reference_ids(reference_id):
+    first = "00000000-0000-4000-8000-000000000001"
+    second = "00000000-0000-4000-8000-000000000002"
+    first_text = "Оригинальная последовательность действий первого документа."
+    second_caption = "Иллюстрация 7. Последовательность действий другого документа."
+    choice = {"result": "MATCH", "file_id": "s1", "covered_goals": [{"goal_id": "g1", "evidence_id": reference_id}]}
+    model = OpenWebUILLM(settings(), httpx.MockTransport(lambda request: httpx.Response(200, json={
+        "choices": [{"message": {"content": json.dumps(choice)}}],
+    })))
+    with pytest.raises(ValueError, match="UnknownInstructionEvidenceReference"):
+        model.select_instruction({"requested_goals": {"g1": "Выполнить настройку"},
+                                  "catalogue": {first: "Первый.md", second: "Другой.docx"},
+                                  "candidates": {first: first_text, second: second_caption},
+                                  "candidate_image_captions": {second: {7: second_caption}}})
+
+
+@pytest.mark.parametrize("generated", [
+    {"evidence": "Модель не должна придумывать или копировать эту цитату."},
+    {"support_kind": "IMAGE"},
+    {"image_numbers": [7]},
+])
+def test_goal_wire_forbids_model_generated_proof_metadata(generated):
+    file_id = "00000000-0000-4000-8000-000000000001"
+    choice = {"result": "MATCH", "file_id": "s1", "covered_goals": [{
+        "goal_id": "g1", "evidence_id": "t1", **generated,
+    }]}
+    model = OpenWebUILLM(settings(), httpx.MockTransport(lambda request: httpx.Response(200, json={
+        "choices": [{"message": {"content": json.dumps(choice)}}],
+    })))
+    with pytest.raises(ValidationError):
+        model.select_instruction({"requested_goals": {"g1": "Открыть программу"},
+                                  "catalogue": {file_id: "Вход.md"},
+                                  "candidates": {file_id: "Оригинальная последовательность действий программы."}})
+
+
+@pytest.mark.parametrize("field", ["alternatives", "clarification_sources"])
+def test_source_reference_items_resolve_each_files_own_original(field):
+    ids = ["00000000-0000-4000-8000-000000000001", "00000000-0000-4000-8000-000000000002"]
+    texts = ["Если окно выбора уже видно, используйте сохранённое подключение.",
+             "Если программа запускается впервые, создайте корпоративное подключение."]
+    choice = {"result": "RELATED" if field == "alternatives" else "CLARIFY",
+              field: [{"file_id": "s1", "evidence_id": "t1"}, {"file_id": "s2", "evidence_id": "t1"}]}
+    if field == "clarification_sources":
+        choice.update(question="Вы открываете эту программу впервые на компьютере?", clarification_kind="WORK_HISTORY")
+    model = OpenWebUILLM(settings(), httpx.MockTransport(lambda request: httpx.Response(200, json={
+        "choices": [{"message": {"content": json.dumps(choice)}}],
+    })))
+    result = model.select_instruction({"requested_goals": {"g1": "Открыть программу"},
+                                       "catalogue": dict(zip(ids, ["Первый вход.md", "Повторный вход.md"], strict=True)),
+                                       "candidates": dict(zip(ids, texts, strict=True)),
+                                       "source_clarification_required": True})
+    assert [item.file_id for item in getattr(result, field)] == ids
+    assert [item.evidence for item in getattr(result, field)] == texts
+
+
+def test_reference_schema_binds_each_file_and_filters_short_context_fragments():
+    from app.services.llm.instruction_selection import InstructionReferenceSelection, reference_selection_schema
+
+    first = {"t1": {"text": "Исходный текст первого документа.", "support_kind": "TEXT", "image_numbers": []},
+             "t2": {"text": "Краткое название", "support_kind": "TEXT", "image_numbers": []}}
+    second = {"i5_1": {"text": "Исходная подпись программирующего штрихкода.",
+                       "support_kind": "IMAGE", "image_numbers": [5]}}
+    payload = {"evidence_references": True, "requested_goals": {"g1": "Первое действие", "g2": "Второе действие"},
+               "candidates": {"s1": first, "s2": second, "s3": {"t1": first["t2"]}},
+               "catalogue": {"s1": "Первый.md", "s2": "Другой.docx", "s3": "Краткий.md", "s4": "Не прочитан.docx"},
+               "source_clarification_required": True}
+    schema = reference_selection_schema(InstructionReferenceSelection.model_json_schema(), payload)
+    matches = [item for item in schema["anyOf"] if item["properties"]["result"]["const"] == "MATCH"]
+    assert len(matches) == 2
+    for branch in matches:
+        file_id = branch["properties"]["file_id"]["const"]
+        reference = branch["properties"]["covered_goals"]["items"]["$ref"].split("/")[-1]
+        allowed = schema["$defs"][reference]["properties"]["evidence_id"]["enum"]
+        assert allowed == (["t1"] if file_id == "s1" else ["i5_1"])
+        assert branch["properties"]["covered_goals"]["minItems"] == 2
+        assert branch["properties"]["covered_goals"]["maxItems"] == 2
+        assert branch["additionalProperties"] is False
+    for file_id, allowed in (("s1", ["t1"]), ("s2", ["i5_1"])):
+        fields = schema["$defs"]["AlternativeReference_" + file_id]["properties"]
+        assert fields["file_id"]["const"] == file_id and fields["evidence_id"]["enum"] == allowed
+    assert "AlternativeReference_s3" not in schema["$defs"]
+    partials = [item for item in schema["anyOf"] if item["properties"]["result"]["const"] == "PARTIAL"]
+    assert len(partials) == 2
+    for branch in partials:
+        assert branch["properties"]["covered_goals"]["maxItems"] == 1
+        assert branch["properties"]["missing_goal_ids"]["maxItems"] == 1
+    read = next(item for item in schema["anyOf"] if item["properties"]["result"]["const"] == "READ")
+    assert read["properties"]["file_id"]["enum"] == ["s1", "s2", "s3", "s4"]
+
+
+@pytest.mark.parametrize("captions", [{"outside": {}}, {"s1": {"1": "Подпись"}}, {"s1": {0: "Подпись"}}])
+def test_caption_inventory_cannot_leave_source_or_image_scope(captions):
+    model = OpenWebUILLM(settings(), httpx.MockTransport(lambda request: pytest.fail("Invalid inventory reached model")))
+    with pytest.raises(ValueError, match="UnknownInstructionImageCaption"):
+        model.select_instruction({"requested_goals": {"g1": "Открыть программу"},
+                                  "catalogue": {"s1": "Вход.md"},
+                                  "candidates": {"s1": "Оригинальная инструкция входа в программу."},
+                                  "candidate_image_captions": captions})
+
+
+def test_actual_reference_payload_still_has_the_original_network_budget():
+    from app.services.rag.talk import MAX_SELECTION_PAYLOAD_CHARS, KnowledgeUnavailable
+
+    model = OpenWebUILLM(settings(), httpx.MockTransport(lambda request: pytest.fail("Oversized payload reached model")))
+    payload = {"requested_goals": {"g1": "Открыть программу"},
+               "catalogue": {"s1": "Вход.md"},
+               "candidates": {"s1": "Оригинальная последовательность действий программы. " * 900}}
+    assert len(json.dumps(payload, ensure_ascii=False)) < MAX_SELECTION_PAYLOAD_CHARS
+    with pytest.raises(KnowledgeUnavailable, match="SelectionPayloadTooLarge"):
+        model.select_instruction(payload)

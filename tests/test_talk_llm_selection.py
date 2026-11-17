@@ -209,6 +209,82 @@ def test_default_selector_uses_real_model_transport_with_scoped_catalogue_and_no
     assert sum(request.url.path.endswith("/content") for request in state["calls"]) == 2
 
 
+@pytest.mark.parametrize("support_kind", ["TEXT", "IMAGE"])
+@pytest.mark.parametrize("source_changes", [False, True])
+def test_fragment_reference_transport_keeps_original_proof_photos_and_freshness(support_kind, source_changes):
+    text = "Откройте рабочую программу и выберите корпоративное подключение в окне входа."
+    caption = "На иллюстрации показан исходный программирующий код для настройки устройства."
+    paragraph = "<w:p><w:r><w:t>" + text + "</w:t></w:r></w:p>"
+    data = instruction([caption], extra_paragraph=paragraph)
+    knowledge, state = provider(filename="Порядок настройки рабочей программы.docx", data=data, chunks=[])
+    original_transport = knowledge.transport
+    calls = []
+
+    def handler(request):
+        if request.url.path != "/api/chat/completions":
+            return original_transport.handle_request(request)
+        wire = json.loads(json.loads(request.content)["messages"][-1]["content"])
+        calls.append(wire)
+        assert wire["evidence_references"] is True
+        registry = wire["candidates"]["s1"]
+        reference_id = next(key for key, proof in registry.items()
+                            if proof["support_kind"] == support_kind
+                            and (text if support_kind == "TEXT" else caption) in proof["text"])
+        if source_changes:
+            state["data"] = instruction([caption + " Изменённый оригинал."], extra_paragraph=paragraph)
+        choice = {"result": "MATCH", "file_id": "s1", "covered_goals": [{
+            "goal_id": "g1", "evidence_id": reference_id,
+        }]}
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(choice)}}]})
+
+    knowledge.transport = httpx.MockTransport(handler)
+    context = {"requested_goals": {"g1": "Настроить рабочую программу"}}
+    if source_changes:
+        with pytest.raises(KnowledgeUnavailable):
+            knowledge.search_with_llm("Настроить рабочую программу", context)
+    else:
+        result = knowledge.search_with_llm("Настроить рабочую программу", context)
+        assert result.result == "MATCH" and result.approved.document["source"]["file_id"] == DOC
+        assert result.approved.illustrations[1].data == read_docx_images(data)[0].data
+        assert result.covered_goals == ("Настроить рабочую программу",)
+    assert len(calls) == 1
+
+
+def test_derived_caption_duplication_does_not_reject_a_valid_bounded_reference_request():
+    from app.services.rag.talk import MAX_SELECTION_PAYLOAD_CHARS
+
+    captions = [f"Иллюстрация {number}. " + ("Исходная подпись окна корпоративной программы. " * 120).strip()
+                for number in range(1, 6)]
+    data = instruction(captions)
+    knowledge, state = provider(filename="Порядок первого входа.docx", data=data, chunks=[])
+    original_transport = knowledge.transport
+    original_selection = knowledge._instruction_selection
+    raw_sizes = []
+    wire_sizes = []
+
+    def select(payload):
+        raw_sizes.append(len(json.dumps(payload, ensure_ascii=False)))
+        return original_selection(payload)
+
+    def handler(request):
+        if request.url.path != "/api/chat/completions":
+            return original_transport.handle_request(request)
+        wire = json.loads(json.loads(request.content)["messages"][-1]["content"])
+        wire_sizes.append(len(json.dumps(wire, ensure_ascii=False)))
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps({
+            "result": "NO_KNOWLEDGE", "missing_goal_ids": ["g1"],
+        })}}]})
+
+    knowledge._instruction_selection = select
+    knowledge.transport = httpx.MockTransport(handler)
+    result = knowledge.search_with_llm("Открыть рабочую программу", {
+        "requested_goals": {"g1": "Открыть рабочую программу"},
+    })
+    assert result.result == "NO_KNOWLEDGE"
+    assert raw_sizes[0] > MAX_SELECTION_PAYLOAD_CHARS >= wire_sizes[0]
+    assert all(request.method == "GET" for request in state["calls"])
+
+
 def test_instruction37_without_native_index_hit_is_selected_by_model():
     filename = "37_Zebra DS2208 — лист настроечных штрихкодов.docx"
     knowledge, state = scanner_provider([(DOC, filename, instruction([EVIDENCE]))], chunks=[])
@@ -1143,3 +1219,159 @@ def test_answered_questions_context_is_bounded_and_omits_extra_properties():
     assert 1 <= len(selected["answered_questions"]) <= 8
     assert all(len(question) <= 300 for question in selected["answered_questions"])
     assert len(json.dumps(selected, ensure_ascii=False)) <= MAX_SELECTION_CONTEXT_CHARS
+
+
+def sourced_question(question, *, kind="VISIBLE_STATE", sources=None):
+    return {"result": "CLARIFY", "question": question, "clarification_kind": kind,
+            "clarification_sources": sources if sources is not None else [{"file_id": DOC, "evidence": EVIDENCE}]}
+
+
+def test_new_application_clarification_proves_real_workflow_conditions_in_current_sources():
+    initial = "При первом открытии программы Парус на этом компьютере настройте рабочую учётную запись."
+    existing = "Если программа Парус уже работала на этом компьютере, используйте восстановление подключения."
+    knowledge, _ = scanner_provider([
+        (DOC, "Первое открытие новой программы.md", initial.encode()),
+        (OTHER, "Восстановление рабочего подключения.md", existing.encode()),
+    ])
+    question = "Эта программа уже работала на этом компьютере или вы открываете её впервые?"
+    knowledge.selector = lambda payload: sourced_question(question, kind="WORK_HISTORY", sources=[
+        {"file_id": DOC, "evidence": initial}, {"file_id": OTHER, "evidence": existing},
+    ])
+    result = knowledge.search_with_llm("Хочу открыть рабочие данные в программе Парус", {
+        "source_clarification_required": True,
+    })
+    assert result.result == "CLARIFY" and result.question == question
+    assert result.clarification_kind == "WORK_HISTORY"
+    assert [item.document["source"]["file_id"] for item in result.clarification_sources] == [DOC, OTHER]
+    assert result.approved is None
+
+
+def test_a_setting_defined_by_the_original_does_not_need_an_unsourced_expert_question():
+    text = "При первом входе в программу Меридиан выберите корпоративное подключение и дождитесь загрузки данных."
+    knowledge, _ = scanner_provider([(DOC, "Первый вход в новую программу.docx", instruction([text]))])
+    responses = [
+        {"result": "CLARIFY", "question": "Какая служебная схема передачи данных используется?"},
+        match(evidence=text),
+    ]
+    calls = []
+
+    def select(payload):
+        calls.append(copy.deepcopy(payload))
+        return responses.pop(0)
+
+    knowledge.selector = select
+    result = knowledge.search_with_llm("Впервые открыть рабочие данные в Меридиане", {
+        "source_clarification_required": True,
+    })
+    assert result.result == "MATCH" and result.approved.document["source"]["file_id"] == DOC
+    assert len(calls) == 2 and calls[1]["source_question_retry"] is True
+    assert calls[1]["clarification_retry_reason"] == "InvalidSourceClarification"
+    assert calls[0]["catalogue"] == calls[1]["catalogue"]
+    assert calls[0]["candidates"] == calls[1]["candidates"]
+
+
+@pytest.mark.parametrize("update", [
+    {"clarification_kind": None}, {"clarification_sources": []},
+    {"clarification_sources": [{"file_id": DOC, "evidence": EVIDENCE}] * 2},
+])
+def test_missing_or_duplicate_question_grounds_stop_after_one_repair(update):
+    knowledge, _, _ = selection_store()
+    calls = []
+    choice = {**sourced_question("Что сейчас отображается в окне программы?"), **update}
+    knowledge.selector = lambda payload: calls.append(copy.deepcopy(payload)) or choice
+    with pytest.raises(KnowledgeUnavailable, match="InvalidSourceClarification"):
+        knowledge.search_with_llm("Открыть рабочие данные", {"source_clarification_required": True})
+    assert len(calls) == 2 and calls[-1]["source_question_retry"] is True
+
+
+@pytest.mark.parametrize("failure", ["quote", "source", "stale"])
+def test_source_question_never_bypasses_original_evidence_scope_or_freshness(failure):
+    knowledge, state, _ = selection_store()
+    calls = []
+
+    def select(payload):
+        calls.append(payload)
+        if failure == "stale":
+            state["data"] = instruction(["Содержимое оригинала изменилось после выбора вопроса."])
+        sources = [{"file_id": OTHER if failure == "source" else DOC,
+                    "evidence": "Этой цитаты нет в проверенном оригинале." if failure == "quote" else EVIDENCE}]
+        return sourced_question("Что сейчас отображается в окне программы?", sources=sources)
+
+    knowledge.selector = select
+    with pytest.raises(KnowledgeUnavailable, match={
+        "quote": "InstructionEvidenceMismatch", "source": "InvalidInstructionMatch",
+        "stale": "SourceChangedDuringSelection",
+    }[failure]):
+        knowledge.search_with_llm("Открыть рабочие данные", {"source_clarification_required": True})
+    assert len(calls) == 1
+
+
+def test_unknown_answer_changes_question_to_an_observable_condition_without_inventing_a_fact():
+    knowledge, _, _ = selection_store()
+    old_question = "Какую служебную схему подключения использует программа?"
+    visible_question = "Какое окно программы сейчас открыто?"
+    calls = []
+    responses = [sourced_question(old_question), sourced_question(visible_question)]
+    knowledge.selector = lambda payload: calls.append(copy.deepcopy(payload)) or responses.pop(0)
+    context = {"source_clarification_required": True,
+               "unknown_answers": [{"question": old_question, "answer": "Не знаю"}],
+               "task_state": {"goals": {"g1": "Открыть рабочие данные"}}}
+    result = knowledge.search_with_llm("Открыть рабочие данные", context)
+    assert result.result == "CLARIFY" and result.question == visible_question
+    assert len(calls) == 2 and calls[1]["source_question_retry"] is True
+    assert all(item["actual_problem"] == "Открыть рабочие данные" for item in calls)
+    assert all(item["unknown_answers"] == context["unknown_answers"] for item in calls)
+    assert all(item["context"]["unknown_answers"] == context["unknown_answers"] for item in calls)
+    assert context["task_state"] == {"goals": {"g1": "Открыть рабочие данные"}}
+
+
+@pytest.mark.parametrize("read_first", [False, True])
+def test_source_question_repair_and_one_read_share_the_three_call_budget(read_first):
+    knowledge, _ = large_catalogue()
+    calls = []
+    malformed = {"result": "CLARIFY", "question": "Какую служебную схему подключения вы используете?"}
+    read = {"result": "READ", "file_id": OTHER}
+    responses = [read, malformed] if read_first else [malformed, read]
+    responses.append(sourced_question("Что сейчас видно в окне программы?", sources=[
+        {"file_id": OTHER, "evidence": EVIDENCE},
+    ]))
+    knowledge.selector = lambda payload: calls.append(copy.deepcopy(payload)) or responses.pop(0)
+    result = knowledge.search_with_llm("Открыть рабочие данные", {"source_clarification_required": True})
+    assert result.result == "CLARIFY" and len(calls) == 3
+    assert calls[-1]["read_available"] is False and calls[-1]["source_question_retry"] is True
+    assert result.clarification_sources[0].document["source"]["file_id"] == OTHER
+
+
+def test_source_question_and_coverage_repairs_have_one_shared_budget():
+    knowledge, _, _ = selection_store()
+    calls = []
+    responses = [{"result": "MATCH", "file_id": DOC},
+                 {"result": "CLARIFY", "question": "Какая служебная схема подключения используется?"}]
+    knowledge.selector = lambda payload: calls.append(copy.deepcopy(payload)) or responses.pop(0)
+    with pytest.raises(KnowledgeUnavailable, match="InvalidSourceClarification"):
+        knowledge.search_with_llm("Открыть рабочие данные", {
+            "source_clarification_required": True, "requested_goals": {"g1": "Открыть рабочие данные"},
+        })
+    assert len(calls) == 2 and calls[-1]["coverage_retry"] is True
+
+
+def test_clarification_metadata_cannot_be_attached_to_a_technical_answer():
+    knowledge, _, _ = selection_store()
+    responses = [{**match(), "clarification_kind": "VISIBLE_STATE", "clarification_sources": [
+        {"file_id": DOC, "evidence": EVIDENCE},
+    ]}, match()]
+    knowledge.selector = lambda payload: responses.pop(0)
+    result = knowledge.search_with_llm("Открыть рабочие данные", {"source_clarification_required": True})
+    assert result.result == "MATCH" and not result.clarification_sources
+
+
+def test_unknown_answers_are_bounded_and_prioritized_over_optional_task_history():
+    knowledge, _, calls = selection_store()
+    unknown = [{"question": "Какой параметр? " + "q" * 350, "answer": "Не знаю " + "a" * 250}]
+    knowledge.search_with_llm("Открыть рабочие данные", {
+        "unknown_answers": unknown, "task_state": {"old": "x" * 6000},
+    })
+    assert len(calls[0]["unknown_answers"][0]["question"]) == 300
+    assert len(calls[0]["unknown_answers"][0]["answer"]) == 160
+    assert calls[0]["context"]["unknown_answers"] == calls[0]["unknown_answers"]
+    assert "task_state" not in calls[0]["context"]

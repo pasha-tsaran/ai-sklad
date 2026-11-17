@@ -9,7 +9,7 @@ from pydantic import ValidationError
 
 from app.core.config import Settings
 from app.schemas.contracts import SupportTaskUnderstanding
-from app.services.chat.task_state import remember_task_message, task_query, update_task_state
+from app.services.chat.task_state import is_unknown_answer, remember_task_message, task_query, update_task_state
 from app.services.llm.openwebui import OpenWebUILLM
 from app.services.llm.prompts import SUPPORT_TASK_TASK
 
@@ -95,6 +95,239 @@ def test_both_goals_are_retained_without_another_model_call(message):
     assert state["goals"] == previous["goals"] and model.calls == []
     assert state["messages"][-1] == message and state["question"] == ""
     assert previous == unchanged
+
+
+@pytest.mark.parametrize("message", [
+    "не знаю", "Не знаю!", "я не знаю", "не разбираюсь", "Я в этом не разбираюсь",
+    "не могу определить", "не могу сказать", "без понятия", "понятия не имею",
+    "не уверен", "не уверена", "затрудняюсь ответить", "не помню",
+    "не понимаю вопрос", "Не знаю, помогите", "не знаю, что это значит",
+])
+def test_unknown_answer_keeps_every_goal_and_fact_without_a_model_call(message):
+    previous = compound_task()
+    question = "Какой способ подключения используется?"
+    previous.update(question=question, question_field="connection")
+    unchanged = copy.deepcopy(previous)
+    model = UnderstandingModel()
+    state = update_task_state(message, previous, question, model)
+    assert is_unknown_answer(message)
+    assert model.calls == [] and state["goals"] == previous["goals"]
+    assert state["facts"] == previous["facts"] and state["messages"][-1] == message
+    assert state["question"] == "" and state["question_field"] is None
+    assert state["unknown_answers"] == [{"question": question, "answer": message, "field": "connection"}]
+    assert previous == unchanged and state["new_task"] is False
+
+
+def test_unknown_answer_to_a_legacy_question_does_not_copy_an_unrelated_old_field():
+    previous = compound_task()
+    previous.update(question="Какой результат нужен?", question_field="goal")
+    question = "Какой параметр программы используется?"
+    state = update_task_state("не знаю", previous, question, UnderstandingModel())
+    assert state["unknown_answers"] == [{"question": question, "answer": "не знаю", "field": None}]
+    assert state["goals"] == previous["goals"]
+
+
+def test_unknown_without_an_asked_question_still_uses_normal_task_understanding():
+    model = UnderstandingModel({})
+    state = update_task_state("не знаю", None, "", model)
+    assert len(model.calls) == 1 and state["unknown_answers"] == []
+    assert state["facts"] == [] and state["goals"] == {}
+
+
+@pytest.mark.parametrize("message", [
+    "не знаю, но подключено по USB", "не знаю, теперь другая задача",
+    "не понимаю, почему не работает", "не знаю название, устройство пищит",
+    "Exchange", "да", "нет", "сначала сброс, потом громкость", None,
+])
+def test_unknown_shortcut_does_not_swallow_additional_conditions_or_another_task(message):
+    assert is_unknown_answer(message) is False
+
+
+def test_unknown_message_with_a_concrete_condition_is_interpreted_and_keeps_the_condition():
+    previous = compound_task()
+    question = "Как подключено устройство?"
+    previous.update(question=question, question_field="connection")
+    model = UnderstandingModel({"facts": [fact("connection", "USB")]})
+    state = update_task_state("не знаю, но подключено по USB", previous, question, model)
+    assert len(model.calls) == 1 and state["unknown_answers"] == []
+    assert any(item["key"] == "connection" and item["value"] == "USB" for item in state["facts"])
+    assert state["goals"] == previous["goals"]
+
+
+def test_unknown_records_are_bounded_deduplicated_and_preserve_the_latest_answer():
+    state = compound_task()
+    for index in range(12):
+        question = f"Какой параметр {index} используется?"
+        state.update(question=question, question_field="other")
+        state = update_task_state("не знаю", state, question, UnderstandingModel())
+        assert len(state["unknown_answers"]) <= 8
+    assert len(state["unknown_answers"]) == 8
+    assert state["unknown_answers"][0]["question"] == "Какой параметр 4 используется?"
+    state = update_task_state("Я не знаю", state, "Какой параметр 11 используется?", UnderstandingModel())
+    assert len(state["unknown_answers"]) == 8
+    assert state["unknown_answers"][-1]["answer"] == "Я не знаю"
+    assert state["unknown_answers"][-1]["field"] == "other"
+
+
+def test_a_later_reported_condition_replaces_unknown_status_for_that_field():
+    previous = compound_task()
+    previous.update(question="Как подключено устройство?", question_field="connection")
+    state = update_task_state("не знаю", previous, previous["question"], UnderstandingModel())
+    state = update_task_state("Посмотрел, USB", state, previous["question"], UnderstandingModel({
+        "facts": [fact("connection", "USB")],
+    }))
+    assert state["unknown_answers"] == []
+    assert state["goals"] == previous["goals"]
+    assert any(item["key"] == "connection" and item["value"] == "USB" for item in state["facts"])
+
+
+def test_a_different_question_in_the_same_coarse_field_keeps_the_prior_unknown_answer():
+    previous = compound_task()
+    question = "Какой режим обмена выбран в программе?"
+    previous.update(question=question, question_field="connection")
+    unknown = update_task_state("не знаю", previous, question, UnderstandingModel())
+    state = update_task_state("Вижу провод USB", unknown, "Что видно на кабеле?", UnderstandingModel({
+        "facts": [fact("connection", "USB")],
+    }))
+    assert state["unknown_answers"] == unknown["unknown_answers"]
+    assert any(item["key"] == "connection" and item["value"] == "USB" for item in state["facts"])
+    assert "USB" in task_query(state)
+
+
+def test_reemitting_an_old_fact_does_not_cancel_a_reported_unknown_answer():
+    previous = update_task_state("USB подключение", None, "", UnderstandingModel({
+        "facts": [fact("connection", "USB")],
+    }))
+    previous.update(question="Какое соединение используется сейчас?", question_field="connection")
+    unknown = update_task_state("не помню", previous, previous["question"], UnderstandingModel())
+    state = update_task_state("так и есть", unknown, "", UnderstandingModel({
+        "facts": [fact("connection", "USB")],
+    }))
+    assert state["unknown_answers"] == unknown["unknown_answers"]
+
+
+def test_a_new_task_clears_unknown_conditions_from_the_previous_task():
+    previous = compound_task()
+    previous.update(question="Какой параметр используется?", question_field="other")
+    previous = update_task_state("не знаю", previous, previous["question"], UnderstandingModel())
+    state = update_task_state("Нужно открыть файл в новой программе Бета", previous, "", UnderstandingModel({
+        "new_task": True,
+        "facts": [fact("application", "Бета")],
+        "goals": [goal("Открыть файл в программе Бета", "открыть файл")],
+    }))
+    assert state["unknown_answers"] == [] and state["new_task"] is True
+    assert "параметр" not in task_query(state)
+
+
+def test_new_application_names_are_preserved_without_a_catalogue_of_programs():
+    message = "В новой программе Гамма хочу получить список всех поставок"
+    state = update_task_state(message, None, "", UnderstandingModel({
+        "facts": [fact("application", "Гамма"), fact("scope", "application", "В новой программе Гамма")],
+        "goals": [goal("Получить список всех поставок", "получить список всех поставок")],
+    }))
+    assert state["question"] == "" and state["unknown_answers"] == []
+    assert "Гамма" in task_query(state) and "Получить список" in task_query(state)
+
+
+@pytest.mark.parametrize("unknown", [
+    {}, None, [None], [{"question": ""}], [{"question": "x" * 301}],
+    [{"question": "Вопрос?", "field": "administrator"}],
+    [{"question": "Вопрос?", "answer": "x" * 301}],
+    [{"question": f"Вопрос {index}?"} for index in range(9)],
+])
+def test_corrupt_unknown_metadata_is_rejected(unknown):
+    with pytest.raises(ValueError):
+        update_task_state("ответ", {"unknown_answers": unknown}, "", UnderstandingModel())
+
+
+def test_old_state_without_unknown_metadata_remains_compatible():
+    previous = {"facts": [], "goals": {"g1": {"text": "Открыть файл", "evidence": "Открыть файл"}},
+                "messages": ["Открыть файл"]}
+    state = remember_task_message("в программе", previous)
+    assert state["unknown_answers"] == [] and state["goals"] == previous["goals"]
+
+
+def test_free_form_inability_to_answer_is_retained_by_a_user_evidenced_model_delta():
+    previous = compound_task()
+    question = "Какой параметр используется?"
+    previous.update(question=question, question_field="connection")
+    message = "Эти сокращения мне ни о чём не говорят, я обычный сотрудник"
+    model = UnderstandingModel({"unknown_answer_evidence": "Эти сокращения мне ни о чём не говорят",
+                                "question": question, "question_field": "connection"})
+    state = update_task_state(message, previous, question, model)
+    assert len(model.calls) == 1 and not is_unknown_answer(message)
+    assert state["goals"] == previous["goals"] and state["facts"] == previous["facts"]
+    assert state["unknown_answers"] == [{"question": question, "field": "connection",
+                                        "answer": "Эти сокращения мне ни о чём не говорят"}]
+    assert state["question"] == "" and state["question_field"] is None
+    assert state["messages"][-1] == message and state["new_task"] is False
+
+
+def test_free_form_unknown_answer_keeps_a_useful_supplement_without_inventing_the_missing_setting():
+    previous = compound_task()
+    question = "Какой режим соединения настроен в программе?"
+    previous.update(question=question, question_field="connection")
+    message = "В этих настройках я совершенно не понимаю, вижу только кабель USB"
+    state = update_task_state(message, previous, question, UnderstandingModel({
+        "unknown_answer_evidence": "В этих настройках я совершенно не понимаю",
+        "facts": [fact("connection", "USB")],
+    }))
+    assert state["unknown_answers"] == [{"question": question, "field": "connection",
+                                        "answer": "В этих настройках я совершенно не понимаю"}]
+    assert any(item["key"] == "connection" and item["value"] == "USB" for item in state["facts"])
+    assert state["goals"] == previous["goals"] and "режим" not in task_query(state)
+
+
+def test_semantic_unknown_answer_can_keep_a_reported_goal_refinement():
+    previous = compound_task()
+    question = "Какой режим используется?"
+    previous.update(question=question, question_field="connection")
+    state = update_task_state("С режимом не разберусь, громкость нужна максимальная", previous, question,
+                              UnderstandingModel({
+                                  "unknown_answer_evidence": "С режимом не разберусь",
+                                  "goals": [goal("максимальная громкость", "максимальная", "g2")],
+                              }))
+    assert list(state["goals"]) == ["g1", "g2"]
+    assert state["goals"]["g1"] == previous["goals"]["g1"]
+    assert state["goals"]["g2"]["text"] == "максимальная громкость"
+    assert len(state["unknown_answers"]) == 1
+
+
+@pytest.mark.parametrize("question,update", [
+    ("Какой режим?", {"unknown_answer_evidence": "не знаю"}),
+    ("", {"unknown_answer_evidence": "не умею определить"}),
+    (None, {"unknown_answer_evidence": "не умею определить"}),
+    ("Какой режим?", {"unknown_answer_evidence": "Какой режим?"}),
+    ("Какой режим?", {"new_task": True, "unknown_answer_evidence": "не умею определить"}),
+])
+def test_invalid_semantic_unknown_delta_does_not_change_the_previous_task(question, update):
+    previous = compound_task()
+    unchanged = copy.deepcopy(previous)
+    with pytest.raises(ValueError, match="InvalidTaskUnknownAnswer"):
+        update_task_state("Сам не умею определить", previous, question, UnderstandingModel(update))
+    assert previous == unchanged
+
+
+def test_semantic_unknown_evidence_cannot_be_reused_from_an_old_message():
+    previous = compound_task()
+    previous["messages"].append("Эти настройки мне непонятны")
+    with pytest.raises(ValueError, match="InvalidTaskUnknownAnswer"):
+        update_task_state("да", previous, "Какой режим?", UnderstandingModel({
+            "unknown_answer_evidence": "Эти настройки мне непонятны",
+        }))
+
+
+def test_explicit_new_task_after_an_unknown_answer_clears_old_question_and_values():
+    previous = compound_task()
+    previous.update(question="Какой режим?", question_field="connection")
+    previous = update_task_state("В этих параметрах не разберусь", previous, previous["question"], UnderstandingModel({
+        "unknown_answer_evidence": "В этих параметрах не разберусь",
+    }))
+    state = update_task_state("Теперь нужно открыть файл в программе Дельта", previous, "Какой режим?",
+                              UnderstandingModel({"new_task": True, "facts": [fact("application", "Дельта")],
+                                                  "goals": [goal("Открыть файл", "открыть файл")]}))
+    assert state["unknown_answers"] == [] and state["new_task"] is True
+    assert state["messages"] == ["Теперь нужно открыть файл в программе Дельта"]
 
 
 def test_updating_one_goal_preserves_the_other_goal_and_its_order():
@@ -349,6 +582,15 @@ def test_task_prompt_keeps_user_intent_independent_of_retrieved_sources():
     assert "Не теряй вторую цель" in SUPPORT_TASK_TASK
 
 
+def test_task_prompt_defers_configuration_questions_to_the_actual_sources():
+    assert "Если желаемый результат уже понятен, question=\"\"" in SUPPORT_TASK_TASK
+    assert "до чтения базы знаний не запрашивай" in SUPPORT_TASK_TASK
+    assert "Настройка, которую предписывает инструкция" in SUPPORT_TASK_TASK
+    assert "previous_state.unknown_answers" in SUPPORT_TASK_TASK
+    assert "Не повторяй вопрос\nиз unknown_answers" in SUPPORT_TASK_TASK
+    assert "IMAP" not in SUPPORT_TASK_TASK and "Outlook" not in SUPPORT_TASK_TASK
+
+
 def model_settings():
     return Settings(_env_file=None, llm_backend="openwebui", openwebui_api_key="test-key",
                     openwebui_model="local-qwen")
@@ -389,22 +631,34 @@ def test_fast_output_budget_rejects_invalid_or_unbounded_values(budget):
 @pytest.mark.parametrize("goal_count,budget", [(1, 768), (2, 768), (3, 1024), (4, 1024), (5, 1536), (8, 1536)])
 def test_compound_selection_scales_its_json_budget_and_aliases_image_inventory(goal_count, budget):
     file_id = "00000000-0000-4000-8000-000000000037"
-    payload = {"catalogue": {file_id: "Настройки.docx"}, "candidates": {file_id: "Исходный текст"},
+    caption = "Исходный текст подтверждённой инструкции настройки оборудования."
+    payload = {"catalogue": {file_id: "Настройки.docx"}, "candidates": {file_id: caption},
                "requested_goals": {f"g{i}": f"Цель {i}" for i in range(1, goal_count + 1)},
-               "candidate_image_numbers": {file_id: [1, 2]}, "allow_clarification": False}
+               "candidate_image_numbers": {file_id: [1, 2]},
+               "candidate_image_captions": {file_id: {1: caption}}, "allow_clarification": False}
     unchanged = copy.deepcopy(payload)
 
     def handler(request):
         body = json.loads(request.content)
         assert body["max_tokens"] == budget and body["params"]["max_tokens"] == budget
         schema = body["response_format"]["json_schema"]["schema"]
-        assert "CLARIFY" not in schema["properties"]["result"]["enum"]
-        assert "PARTIAL" in schema["properties"]["result"]["enum"]
-        assert "covered_goals" in schema["properties"] and "missing_goal_ids" in schema["properties"]
-        assert schema["$defs"]["InstructionGoalCoverage"]["properties"]["goal_id"]["enum"] == list(payload["requested_goals"])
-        assert schema["properties"]["missing_goal_ids"]["items"]["enum"] == list(payload["requested_goals"])
+        variants = {variant["properties"]["result"]["const"]: variant for variant in schema["anyOf"]}
+        assert "CLARIFY" not in variants and ("PARTIAL" in variants) is (goal_count > 1)
+        matched = variants["MATCH"]
+        assert matched["additionalProperties"] is False
+        assert matched["properties"]["file_id"] == {"type": "string", "const": "s1"}
+        assert matched["properties"]["covered_goals"]["minItems"] == goal_count
+        assert matched["properties"]["covered_goals"]["maxItems"] == goal_count
+        assert "missing_goal_ids" not in matched["properties"]
+        proof = schema["$defs"]["GoalReference_s1"]["properties"]
+        assert proof["goal_id"]["enum"] == list(payload["requested_goals"])
+        assert proof["evidence_id"]["enum"] == ["i1_1"]
+        assert variants["NO_KNOWLEDGE"]["properties"]["missing_goal_ids"]["const"] == list(payload["requested_goals"])
         wire = json.loads(body["messages"][-1]["content"])
-        assert wire["candidate_image_numbers"] == {"s1": [1, 2]}
+        assert "candidate_image_numbers" not in wire and "candidate_image_captions" not in wire
+        assert wire["candidates"] == {"s1": {"i1_1": {
+            "text": caption, "support_kind": "IMAGE", "image_numbers": [1],
+        }}}
         assert wire["requested_goals"] == payload["requested_goals"]
         return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps({
             "result": "NO_KNOWLEDGE", "missing_goal_ids": list(payload["requested_goals"]),

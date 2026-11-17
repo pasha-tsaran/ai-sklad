@@ -30,7 +30,7 @@ from app.services.chat.policies import (
     FORM_ACTION, MAX_ATTEMPTS, TERMINAL_STATES, direct_intent, requests_support_form, resolution_feedback,
 )
 from app.services.chat.service import messenger
-from app.services.chat.task_state import remember_task_message, task_query, update_task_state
+from app.services.chat.task_state import is_unknown_answer, remember_task_message, task_query, update_task_state
 from app.services.rag.openwebui import save_snapshot
 from app.services.rag.query import normalized_query, printer_kinds, scanner_kinds
 from app.services.rag.talk import (
@@ -48,6 +48,8 @@ from integrations.openwebui.automatic_instruction_images import (
 )
 
 UNAVAILABLE = "Сейчас не удалось проверить базу знаний. Повторите вопрос немного позже или напишите «оператор»."
+SELECTION_UNCLEAR = ("Пока не удалось выбрать подтверждённый следующий шаг. "
+                     "Можно описать, что сейчас видно на экране, или написать «оператор» для помощи специалиста.")
 CHANGED = "Инструкция изменилась или доступ к ней недоступен. Продолжение приостановлено до проверки актуального источника."
 ESCALATION_MENU = ("Как продолжим?\n1 — оформить письмо в техническую поддержку.\n"
                    "2 — продолжить диалог с ботом.\n\nМожно ответить цифрой или словами. Заявка пока не отправлена.")
@@ -929,7 +931,17 @@ def _support_turn(message, flow, context, llm, knowledge):
     answered_field = (field_name in known or field_name == "goal" and (
                           len(state["goals"]) > 1 or next_flow.get("source") and bool(state["goals"]))
                       or field_name == "application" and hardware and bool(state["goals"]))
-    if question and not answered_field:
+    source_questions = bool(getattr(llm, "supports_source_clarification", False))
+    observable_error = (field_name in {"error_text", "current_step", "symptoms"}
+                        and (next_flow.get("source") or known.intersection({"error_text", "current_step", "symptoms"})))
+    coarse_question = (field_name == "goal" and not state["goals"]
+                       or field_name == "equipment_type" and "equipment_type" not in known
+                       and "application" not in known)
+    legacy_followup = next_flow.get("source") and not source_questions and field_name == "other"
+    ask_before_search = bool(coarse_question or observable_error or legacy_followup)
+    if question and not ask_before_search:
+        event("talk.question_deferred", question_field=field_name, reason="source_lookup_required")
+    if question and not answered_field and ask_before_search:
         try:
             question = _model_clarification(question, state["messages"])
         except KnowledgeUnavailable:
@@ -939,7 +951,9 @@ def _support_turn(message, flow, context, llm, knowledge):
             next_flow.update(clarification_query=task_query(state) or message[:6000],
                              clarification_keys=["MODEL"], clarification_question=question,
                              opening_query=next_flow.get("opening_query", message))
+            state["question"] = question
             return Turn("REPLY", [(question, None)], flow=next_flow)
+    state["question"], state["question_field"] = "", None
     problem = task_query(state)
     if not state["goals"]:
         question = "Что именно нужно сделать? Опишите желаемый результат своими словами."
@@ -948,18 +962,26 @@ def _support_turn(message, flow, context, llm, knowledge):
         return Turn("REPLY", [(question, None)], flow=next_flow)
     next_flow["task_query"] = problem
     next_flow.pop("required_source", None)
+    if is_unknown_answer(message) and previous_question:
+        event("talk.unknown_answer", unknown_question_count=len(state.get("unknown_answers", [])))
     # Step difficulties can retain verified source navigation. New facts/goals
     # and corrections must select against the entire updated task again.
     if not (same_task and _current_step_question(message)):
         next_flow["reselect_source"] = True
     try:
         turn = _retrieve_support_turn(message, next_flow, context, llm, knowledge)
-    except KnowledgeUnavailable:
-        return Turn("REPLY", [(UNAVAILABLE, None)], flow=next_flow)
+    except KnowledgeUnavailable as error:
+        reply = SELECTION_UNCLEAR if error.code in {
+            "InvalidInstructionCoverage", "InvalidSourceClarification", "RepeatedInstructionClarification",
+        } else UNAVAILABLE
+        return Turn("REPLY", [(reply, None)], flow=next_flow)
     retained = turn.flow if turn.flow is not None else next_flow
     if turn.action in {"REPLY", "NO_KNOWLEDGE"} and not retained.get("understanding_confirmation"):
         retained = {**next_flow, **retained}
     retained.update(task_state=state, answered_questions=next_flow["answered_questions"], task_query=problem)
+    if retained.get("clarification_question") and not retained.get("understanding_confirmation"):
+        state["question"] = retained["clarification_question"]
+        state["question_field"] = None
     if confirmation := retained.get("understanding_confirmation"):
         confirmation["guide_flow"].update(task_state=copy.deepcopy(state), task_query=problem,
                                           answered_questions=next_flow["answered_questions"])
@@ -1060,6 +1082,8 @@ def _retrieve_support_turn(message, flow, context, llm, knowledge):
                                           for fact in state["facts"]],
                                 "goals": {key: goal["text"] for key, goal in state["goals"].items()}},
                     answered_questions=flow.get("answered_questions", []),
+                    unknown_answers=state.get("unknown_answers", []),
+                    source_clarification_required=bool(getattr(llm, "supports_source_clarification", False)),
                 )
             if chosen := flow.get("required_source"):
                 selection_context["verified_previous_source"] = {
@@ -1094,7 +1118,7 @@ def _retrieve_support_turn(message, flow, context, llm, knowledge):
                 )
                 if decision.result == "CLARIFY":
                     raise KnowledgeUnavailable("RepeatedInstructionClarification", "instruction_selection")
-            if getattr(decision, "new_request", False):
+            if getattr(decision, "new_request", False) and not flow.get("task_state"):
                 problem, opening_query = message[:6000], message
             if decision.result == "CLARIFY":
                 return Turn("REPLY", [(question, None)], flow={
@@ -1159,7 +1183,7 @@ def _retrieve_support_turn(message, flow, context, llm, knowledge):
         if understanding and not flow.get("task_state"):
             next_flow["understanding"] = understanding
         retrieval_key = getattr(knowledge, "last_cache_key", None)
-        if model_selection and getattr(decision, "new_request", False):
+        if model_selection and getattr(decision, "new_request", False) and not flow.get("task_state"):
             retrieval_key = cache_key(knowledge.settings, problem, context)
         if retrieval_key and next_flow.get("coverage_mode") != "partial":
             next_flow["retrieval_key"] = retrieval_key

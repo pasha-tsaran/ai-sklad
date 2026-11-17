@@ -73,12 +73,20 @@ class SupportTaskGoal(StrictModel):
     goal_id: str | None = Field(default=None, pattern=r"^g[1-9][0-9]*$")
 
 
+class SupportUnknownAnswer(StrictModel):
+    question: str = Field(min_length=1, max_length=300)
+    answer: str = Field(default="", max_length=300)
+    field: Literal["equipment_type", "goal", "connection", "application", "symptoms",
+                   "error_text", "current_step", "other"] | None = None
+
+
 class SupportTaskUnderstanding(StrictModel):
     new_task: StrictBool = False
     facts: list[SupportTaskFact] = Field(default_factory=list, max_length=12)
     goals: list[SupportTaskGoal] = Field(default_factory=list, max_length=8)
     replace_goals: StrictBool = False
     replacement_evidence: str = Field(default="", max_length=300)
+    unknown_answer_evidence: str = Field(default="", max_length=300)
     question: str = Field(default="", max_length=300)
     question_field: Literal["equipment_type", "goal", "connection", "application", "symptoms",
                             "error_text", "current_step", "other"] | None = None

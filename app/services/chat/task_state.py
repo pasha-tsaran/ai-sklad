@@ -3,7 +3,7 @@
 import copy
 import re
 
-from app.schemas.contracts import SupportTaskFact, SupportTaskGoal, SupportTaskUnderstanding
+from app.schemas.contracts import SupportTaskFact, SupportTaskGoal, SupportTaskUnderstanding, SupportUnknownAnswer
 
 
 _BOTH = {
@@ -11,16 +11,32 @@ _BOTH = {
     "все перечисленное", "все эти действия",
 }
 _MULTIPLE_FACTS = {"completed"}
+_UNKNOWN_ANSWERS = {
+    "не знаю", "я не знаю", "не знаю что это", "я не знаю что это", "не знаю что это значит",
+    "не разбираюсь", "я не разбираюсь", "не разбираюсь в этом", "я в этом не разбираюсь",
+    "не могу определить", "я не могу определить", "не могу сказать", "затрудняюсь ответить",
+    "без понятия", "понятия не имею", "я понятия не имею", "не уверен", "не уверена",
+    "не помню", "я не помню", "не понимаю вопрос", "я не понимаю вопрос",
+    "не понимаю что вы спрашиваете", "я не понимаю что вы спрашиваете",
+}
 
 
 def _normalized(value):
     return " ".join(re.sub(r"[^\w\s]", " ", value.casefold().replace("ё", "е")).split())
 
 
+def is_unknown_answer(message):
+    if not isinstance(message, str):
+        return False
+    text = _normalized(message)
+    text = re.sub(r"\s+(?:пожалуйста|подскажите|помоги|помогите)$", "", text)
+    return text in _UNKNOWN_ANSWERS
+
+
 def _previous_state(previous):
     if not previous:
         return {"facts": [], "goals": {}, "messages": [], "question": "", "question_field": None,
-                "new_task": False}
+                "unknown_answers": [], "new_task": False}
     if not isinstance(previous, dict):
         raise ValueError("InvalidTaskState")
     raw_facts = previous.get("facts", [])
@@ -35,12 +51,15 @@ def _previous_state(previous):
         goal = SupportTaskGoal.model_validate({**item, "goal_id": goal_id})
         goals[goal_id] = {"text": goal.text, "evidence": goal.evidence}
     messages = previous.get("messages", [])
+    unknown = previous.get("unknown_answers", [])
     if (len(facts) > 12 or len(goals) > 8 or not isinstance(messages, list)
-            or any(not isinstance(message, str) for message in messages)):
+            or any(not isinstance(message, str) for message in messages)
+            or not isinstance(unknown, list) or len(unknown) > 8):
         raise ValueError("InvalidTaskState")
+    unknown = [SupportUnknownAnswer.model_validate(item).model_dump() for item in unknown]
     return {"facts": facts, "goals": goals, "messages": messages,
             "question": previous.get("question", ""), "question_field": previous.get("question_field"),
-            "new_task": False}
+            "unknown_answers": unknown, "new_task": False}
 
 
 def _history(messages, message):
@@ -52,6 +71,17 @@ def _history(messages, message):
 
 def _evidenced(evidence, authority):
     return bool(evidence) and any(evidence in message for message in authority)
+
+
+def _unknown_answer(prior, question, answer):
+    field = prior["question_field"] if prior["question"] == question else None
+    if field is None:
+        field = next((item["field"] for item in reversed(prior["unknown_answers"])
+                      if _normalized(item["question"]) == _normalized(question)), None)
+    unknown = SupportUnknownAnswer(question=question, answer=answer, field=field).model_dump()
+    retained = [item for item in prior["unknown_answers"]
+                if _normalized(item["question"]) != _normalized(unknown["question"])]
+    return [*retained, unknown][-8:]
 
 
 def remember_task_message(message, previous=None):
@@ -68,11 +98,21 @@ def update_task_state(message, previous, previous_question, llm):
     if not isinstance(message, str) or not message.strip() or len(message) > 6000:
         raise ValueError("InvalidTaskMessage")
     prior = _previous_state(previous)
+    if is_unknown_answer(message) and isinstance(previous_question, str) and previous_question.strip():
+        return {**copy.deepcopy(prior), "messages": _history(prior["messages"], message),
+                "question": "", "question_field": None,
+                "unknown_answers": _unknown_answer(prior, previous_question, message),
+                "new_task": False}
     if len(prior["goals"]) >= 2 and _normalized(message) in _BOTH:
         return {**copy.deepcopy(prior), "messages": _history(prior["messages"], message),
                 "question": "", "question_field": None, "new_task": False}
     raw = llm.understand_task(message, copy.deepcopy(prior), previous_question)
     update = SupportTaskUnderstanding.model_validate(raw)
+    if update.unknown_answer_evidence and (
+        not _evidenced(update.unknown_answer_evidence, [message])
+        or not isinstance(previous_question, str) or not previous_question.strip() or update.new_task
+    ):
+        raise ValueError("InvalidTaskUnknownAnswer")
     state = _previous_state(None) if update.new_task else copy.deepcopy(prior)
     authority = [message]
     if not update.new_task:
@@ -116,8 +156,22 @@ def update_task_state(message, previous, previous_question, llm):
         state["facts"].pop(completed)
     if len(goals) > 8:
         raise ValueError("TaskStateTooLarge")
+    answered_fields = {fact.key for fact in update.facts if _evidenced(fact.evidence, [message])}
+    if any(_evidenced(goal.evidence, [message]) for goal in update.goals):
+        answered_fields.add("goal")
+    state["unknown_answers"] = [item for item in state["unknown_answers"]
+                                if not (item["field"] in answered_fields
+                                        and isinstance(previous_question, str)
+                                        and _normalized(item["question"]) == _normalized(previous_question))]
+    question, question_field = update.question, update.question_field
+    if update.unknown_answer_evidence:
+        state["unknown_answers"] = _unknown_answer(
+            {**prior, "unknown_answers": state["unknown_answers"]},
+            previous_question, update.unknown_answer_evidence,
+        )
+        question, question_field = "", None
     state.update({"goals": goals, "messages": _history(state["messages"], message),
-                  "question": update.question, "question_field": update.question_field,
+                  "question": question, "question_field": question_field,
                   "new_task": update.new_task})
     return state
 
