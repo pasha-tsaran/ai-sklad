@@ -21,7 +21,7 @@ from app.services.rag.interface import Candidate
 from app.services.rag.query import _terms, normalized_query
 from integrations.openwebui.approved_instruction_images import MAX_SOURCE_BYTES, W, WP, _member, _validate_archive, _xml
 
-PARSER_VERSION = "source-catalog-v2"
+PARSER_VERSION = "source-catalog-v3"
 _WARNING = re.compile(r"\b(?:внимание|осторожно|предупреждение|нельзя|запрещено|"
                       r"не\s+(?:удаляйте|сканируйте|выключайте|отключайте))\b", re.I)
 _PREREQUISITE = re.compile(r"^(?:перед\s+(?:началом|настройкой|работой)|предварительн\w*|"
@@ -33,6 +33,10 @@ _EQUIPMENT = re.compile(r"\b(?:сканер\w*|принтер\w*|термопр�
 _APPLICATION = re.compile(r"\b(?:программ\w*|приложени\w*|сервис\w*|учетн\w*\s+запис\w*|"
                           r"учётн\w*\s+запис\w*)\b", re.I)
 _SEQUENTIAL_HEADING = re.compile(r"^(?:(?:шаг|step|этап)\s*(?:№\s*)?\d+\b|\d+[.)](?:\s|$))", re.I)
+_ILLUSTRATION_HEADING = re.compile(
+    r"(?:фото|фотографии|иллюстрации|изображения|скриншоты)(?:\s+и\s+пояснения)?|"
+    r"(?:photos|photographs|illustrations|images|screenshots)(?:\s+and\s+(?:explanations|captions))?", re.I,
+)
 
 
 def _digest(value):
@@ -120,6 +124,8 @@ def read_docx_headings(original):
                 if specified:
                     return level
                 for name in (style.get("name", ""), style_id):
+                    if re.fullmatch(r"(?:title|subtitle|заголовок|подзаголовок)", name, re.I):
+                        return 0
                     match = re.fullmatch(r"(?:heading|заголовок)[ _-]*([1-9])", name, re.I)
                     if match:
                         return int(match.group(1))
@@ -150,14 +156,15 @@ def instruction_sections(document):
     sections = []
     heading = ""
     group_id = "procedure-" + identity[:24]
+    illustration_level = None
     explicit_headings = {(item["text"], item["occurrence"]): item["level"] for item in document.get("headings", [])
                          if isinstance(item, dict) and isinstance(item.get("text"), str)
                          and type(item.get("occurrence")) is int and type(item.get("level")) is int
-                         and item["occurrence"] > 0 and 1 <= item["level"] <= 9}
+                         and item["occurrence"] > 0 and 0 <= item["level"] <= 9}
     positioned_headings = {(item["text"], item["paragraph"]): item["level"] for item in document.get("headings", [])
                            if isinstance(item, dict) and isinstance(item.get("text"), str)
                            and type(item.get("paragraph")) is int and type(item.get("level")) is int
-                           and item["paragraph"] > 0 and 1 <= item["level"] <= 9}
+                           and item["paragraph"] > 0 and 0 <= item["level"] <= 9}
     occurrences = Counter()
     mandatory_kind = None
     layout = document.get("layout")
@@ -197,10 +204,16 @@ def instruction_sections(document):
         elif mandatory_kind and kind not in {"WARNING", "PREREQUISITE"}:
             kind = mandatory_kind
         suffix = _digest([identity, ordinal, text])[:24]
-        if level is not None and level <= 2 and not _SEQUENTIAL_HEADING.match(label):
+        if level is not None and illustration_level is not None and level <= illustration_level:
+            illustration_level = None
+        if is_heading and _ILLUSTRATION_HEADING.fullmatch(" ".join(label.rstrip(":").split())):
+            illustration_level = level or 2
+        elif (level is not None and level <= 2 and illustration_level is None
+              and not _SEQUENTIAL_HEADING.match(label)):
             group_id = "procedure-" + suffix
         sections.append({"id": "section-" + suffix, "title": heading or text[:100], "text": text,
                          "kind": kind, "image_numbers": images, "ordinal": ordinal,
+                         "is_heading": is_heading, "heading_level": level,
                          "group_id": group_id,
                          "step_ids": ["step-" + suffix],
                          "image_ids": [f"image-{identity[:24]}-{number}" for number in images]})

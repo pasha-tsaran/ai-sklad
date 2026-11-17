@@ -25,5 +25,5 @@ def test_ready_response_identifies_the_actual_app_and_schema(monkeypatch):
     monkeypatch.setattr(main, "get_engine", lambda: SimpleNamespace(connect=lambda: nullcontext(connection)))
     monkeypatch.setattr(main, "get_settings", lambda: Settings(_env_file=None, knowledge_backend="demo"))
     result = main.ready()
-    assert result["status"] == "ok" and result["app_version"] == "0.4.0"
+    assert result["status"] == "ok" and result["app_version"] == "0.4.1"
     assert result["database_revision"] == "0010"

@@ -1,7 +1,9 @@
 """Verified source plans run through the production controller and durable outbox."""
 
 import copy
+import io
 import json
+from zipfile import ZipFile
 
 import httpx
 import pytest
@@ -14,7 +16,7 @@ from app.services.rag.success import cache_key
 from app.services.llm.openwebui import OpenWebUILLM
 from integrations.openwebui.approved_instruction_images import read_docx_images
 from tests.test_instruction_planning import selected_part
-from tests.test_openwebui_instruction_images import instruction, png
+from tests.test_openwebui_instruction_images import instruction, office, png
 from tests.test_talk_dialogue import assistants
 from tests.test_talk_dialogue import talk as talk
 from tests.test_talk_knowledge import DOC, OTHER
@@ -65,6 +67,61 @@ def test_compound_plan_confirms_all_goals_and_preserves_each_original_photo_prov
             MessageAttachment, MessageAttachment.message_id == Message.id,
         ).order_by(Message.sequence)).all()
         assert [delivery.provenance["file_id"] for delivery in deliveries] == [DOC, OTHER]
+
+
+def test_text_selected_procedure_delivers_its_separate_illustration_appendix_in_original_order(model_chat):
+    action = "Для первого входа в СкладОкно откройте приложение и выберите рабочую учётную запись."
+    captions = [f"В окне СкладОкно выполните действие номер {number}." for number in range(1, 7)]
+    with ZipFile(io.BytesIO(instruction(captions))) as archive:
+        parts = {item.filename: archive.read(item.filename) for item in archive.infolist()}
+    cover = '<w:p><w:r><w:t>Утверждённая инструкция Acrobat</w:t></w:r></w:p>'
+    introduction = (
+        '<w:p><w:pPr><w:outlineLvl w:val="0"/></w:pPr>'
+        '<w:r><w:t>Первый вход в рабочее приложение</w:t></w:r></w:p>'
+        '<w:p><w:pPr><w:outlineLvl w:val="1"/></w:pPr>'
+        '<w:r><w:t>Первый вход в СкладОкно</w:t></w:r></w:p>'
+        f'<w:p><w:r><w:t>{action}</w:t></w:r></w:p>'
+        '<w:p><w:pPr><w:outlineLvl w:val="1"/></w:pPr>'
+        '<w:r><w:t>Фотографии и пояснения</w:t></w:r></w:p>'
+    )
+    document = parts["word/document.xml"].decode()
+    assert cover in document
+    parts["word/document.xml"] = document.replace(cover, introduction, 1)
+    for number, color in enumerate(["red", "green", "blue", "yellow", "purple", "orange"], 1):
+        parts[f"word/media/photo{number}.png"] = png(color)
+    original = office(parts)
+
+    def choose(payload):
+        part = selected_part(payload, DOC, "g1", action)
+        assert part["covered_goals"][0]["support_kind"] == "TEXT"
+        assert not part["covered_goals"][0]["image_numbers"]
+        return {"result": "MATCH", **part}
+
+    chat = model_chat([choose], rows=[(DOC, "Первый вход в рабочее приложение.docx", original)])
+    chat.talk.settings.talk_confirm_understanding = True
+    chat.model.supports_instruction_planning = True
+    chat.model.supports_source_clarification = True
+    chat.model.understand_task = lambda *args: {
+        "facts": [{"key": "application", "value": "СкладОкно", "evidence": "СкладОкно"}],
+        "goals": [{"text": "Первый вход в СкладОкно", "evidence": "Первый вход в СкладОкно"}],
+    }
+    pending = chat.send("Первый вход в СкладОкно")
+    assert pending["flow"].get("understanding_confirmation")
+    current = chat.send("Да, правильно", 2)
+    assert any(photo for _, photo in assistants(current))
+    assert current["flow"]["has_more"]
+    previous_cursor = current["flow"]["instruction_plan"]["cursor"]
+    for sequence in range(3, 7):
+        if not current["flow"]["has_more"]:
+            break
+        current = chat.send("Продолжить", sequence)
+        assert current["flow"]["instruction_plan"]["cursor"] > previous_cursor
+        previous_cursor = current["flow"]["instruction_plan"]["cursor"]
+    assert not current["flow"]["has_more"]
+    assert len(chat.model.calls) == 1 and len(current["attempts"]) == 1
+    photographs = [photo.data for _, photo in assistants(current) if photo]
+    assert photographs == [photo.data for photo in read_docx_images(original)]
+    assert len(photographs) == 6
 
 
 @pytest.mark.parametrize("changed", [DOC, OTHER])

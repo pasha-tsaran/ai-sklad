@@ -841,13 +841,15 @@ class TalkKnowledge:
         terms = _terms(problem)
         def relevance(section):
             return -len(terms & _terms(section["title"] + "\n" + section["text"])), section["ordinal"]
-        relevant = sorted(sections, key=relevance)
+        selectable = [section for section in sections
+                      if not section.get("is_heading") or section["image_numbers"]]
+        relevant = sorted(selectable, key=relevance)
         image_anchors = {}
         for section in sorted((section for section in sections if section["image_numbers"]), key=relevance):
             for number in section["image_numbers"]:
                 image_anchors.setdefault(number, section)
         illustrated = list({section["id"]: section for section in image_anchors.values()}.values())[:2]
-        conditions = sorted((section for section in sections if section["kind"] in {"WARNING", "PREREQUISITE"}),
+        conditions = sorted((section for section in selectable if section["kind"] in {"WARNING", "PREREQUISITE"}),
                             key=relevance)[:2]
         ranked = list({section["id"]: section for section in illustrated + conditions + relevant}.values())[:8]
         registry, descriptors, extra = {}, {}, []

@@ -72,6 +72,36 @@ def test_short_new_instruction_is_selectable_by_exact_backend_reference_only():
     assert result.approved.document["content"] == text
 
 
+def test_document_headings_remain_searchable_without_proving_a_procedure():
+    heading = "Первый запуск рабочего приложения"
+    action = "Откройте приложение и введите выданный рабочий адрес."
+    source = "# " + heading + "\n## Подключение\n" + action
+    knowledge, _ = scanner_provider([(DOC, "Первый запуск.md", source.encode())])
+
+    def select(payload):
+        references = payload["candidate_evidence"][DOC]
+        assert all(heading not in proof["text"] for proof in references.values())
+        assert all(proof["text"] != "## Подключение" for proof in references.values())
+        return {"result": "MATCH", **selected_part(payload, DOC, "g1", action)}
+
+    knowledge.selector = select
+    result = knowledge.search_with_llm(heading, context(heading))
+    texts = [section["text"] for section in result.plan[0].sections]
+    assert "## Подключение" in texts and action in texts
+
+
+def test_heading_alone_cannot_produce_an_action_plan():
+    knowledge, _ = scanner_provider([(DOC, "Только заголовок.md", "# Первый запуск приложения".encode())])
+
+    def select(payload):
+        assert not payload["candidate_evidence"][DOC]
+        return {"result": "NO_KNOWLEDGE", "missing_goal_ids": ["g1"]}
+
+    knowledge.selector = select
+    result = knowledge.search_with_llm("Первый запуск приложения", context("Запустить приложение"))
+    assert result.result == "NO_KNOWLEDGE" and not result.plan
+
+
 def test_legacy_free_quote_still_requires_twenty_characters():
     text = "Нажмите F8."
     knowledge, _ = scanner_provider([(DOC, "Открытие окна.md", text.encode())])

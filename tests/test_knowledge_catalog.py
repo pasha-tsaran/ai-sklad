@@ -239,6 +239,64 @@ def test_plain_source_is_one_complete_procedure_and_explicit_headings_define_gro
     assert structured[2]["group_id"] == structured[3]["group_id"] != structured[0]["group_id"]
 
 
+@pytest.mark.parametrize("word_headings", [False, True])
+def test_illustration_appendix_belongs_to_the_preceding_procedure(word_headings):
+    labels = ["Работа с рабочей программой", "Первый вход в рабочую программу", "Фотографии и пояснения"]
+    captions = [f"Исходный снимок {number} показывает следующий шаг первого входа." for number in range(1, 7)]
+    headings = labels if word_headings else ["# " + labels[0], "# " + labels[1], "## " + labels[2]]
+    content = "\n".join([headings[0], headings[1], "Откройте программу и введите свою рабочую учётную запись.",
+                         headings[2], *captions])
+    source = document(content, images=[{"number": number, "caption": caption}
+                                       for number, caption in enumerate(captions, 1)])
+    if word_headings:
+        source["headings"] = [{"text": text, "occurrence": 1, "level": level}
+                              for text, level in zip(labels, [1, 1, 2], strict=True)]
+    sections = instruction_sections(source)
+    action = next(section for section in sections if section["text"].startswith("Откройте программу"))
+    selected = [section for section in sections if section["group_id"] == action["group_id"]]
+    assert len({section["group_id"] for section in sections}) == 2
+    assert [number for section in selected for number in section["image_numbers"]] == list(range(1, 7))
+    assert sections[0]["is_heading"] and sections[0]["heading_level"] == 1
+    assert action["is_heading"] is False and action["heading_level"] is None
+
+
+@pytest.mark.parametrize("label", ["Иллюстрации", "Скриншоты", "Photos and captions", "Screenshots"])
+def test_generic_illustration_headings_keep_nested_captions_in_their_procedure(label):
+    first = "Оригинальная фотография первого рецепта."
+    second = "Оригинальная фотография второго рецепта."
+    content = ("# Первый рецепт\nВыполните первую настройку.\n# " + label
+               + "\n## Первый снимок\n" + first + "\n# Второй рецепт\n" + second)
+    sections = instruction_sections(document(content, images=[{"number": 1, "caption": first},
+                                                             {"number": 2, "caption": second}]))
+    first_group = sections[0]["group_id"]
+    selected = [section for section in sections if section["group_id"] == first_group]
+    assert [number for section in selected for number in section["image_numbers"]] == [1]
+    assert "## Первый снимок" in [section["text"] for section in selected]
+    assert sections[-1]["group_id"] != first_group
+
+
+def test_separate_image_only_recipes_keep_their_own_illustration_appendices():
+    first = "Исходный настроечный лист первого режима."
+    second = "Исходный настроечный лист второго режима."
+    content = ("# Первый режим\n## Иллюстрации\n" + first
+               + "\n# Второй режим\n## Иллюстрации\n" + second)
+    sections = instruction_sections(document(content, images=[{"number": 1, "caption": first},
+                                                             {"number": 2, "caption": second}]))
+    first_group, second_group = sections[0]["group_id"], sections[3]["group_id"]
+    assert first_group != second_group
+    assert [number for section in sections if section["group_id"] == first_group
+            for number in section["image_numbers"]] == [1]
+    assert [number for section in sections if section["group_id"] == second_group
+            for number in section["image_numbers"]] == [2]
+
+
+def test_colon_heading_keeps_its_distinction_from_explicit_outline():
+    sections = instruction_sections(document("Параметры:\nВведите значение.\n## Проверка\nНажмите кнопку."))
+    assert sections[0]["is_heading"] is True and sections[0]["heading_level"] is None
+    assert sections[1]["is_heading"] is False and sections[1]["heading_level"] is None
+    assert sections[2]["is_heading"] is True and sections[2]["heading_level"] == 2
+
+
 @pytest.mark.parametrize("labels", [("Шаг 1", "Шаг 2"), ("Step 1", "Step 2"),
                                    ("Этап №1", "Этап №2"), ("1. Подключение", "2. Проверка")])
 @pytest.mark.parametrize("word_headings", [False, True])
@@ -298,6 +356,31 @@ def test_actual_docx_outline_styles_and_repeated_heading_text_define_safe_proced
     wireless = next(section for section in sections if section["text"] == "Выберите беспроводную сеть.")
     assert wired["group_id"] == check["group_id"] != wireless["group_id"]
     assert sections[-1]["group_id"] == wireless["group_id"]
+
+
+@pytest.mark.parametrize("style_name", ["Title", "Subtitle", "Заголовок", "Подзаголовок"])
+def test_docx_title_styles_and_bounded_inheritance_are_metadata_headings(style_name):
+    styles = ('<w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+              '<w:style w:styleId="DocumentTitle"><w:name w:val="' + style_name + '"/></w:style>'
+              '<w:style w:styleId="DerivedTitle"><w:basedOn w:val="DocumentTitle"/></w:style>'
+              '</w:styles>')
+    paragraphs = [
+        '<w:p><w:pPr><w:pStyle w:val="DocumentTitle"/></w:pPr><w:r><w:t>Рабочая программа</w:t></w:r></w:p>',
+        '<w:p><w:pPr><w:pStyle w:val="DerivedTitle"/></w:pPr><w:r><w:t>Порядок первого входа</w:t></w:r></w:p>',
+        '<w:p><w:r><w:t>Нажмите F8.</w:t></w:r></w:p>',
+    ]
+    original = styled_docx(paragraphs, styles)
+    headings = read_docx_headings(original)
+    assert headings == [{"text": "Рабочая программа", "occurrence": 1, "level": 0, "paragraph": 2},
+                        {"text": "Порядок первого входа", "occurrence": 1, "level": 0, "paragraph": 3}]
+    layout = read_docx_layout(original)
+    source = document(layout["content"])
+    source["layout"], source["headings"] = layout["paragraphs"], headings
+    sections = instruction_sections(source)
+    titles = [section for section in sections if section["text"] in {"Рабочая программа", "Порядок первого входа"}]
+    assert all(section["is_heading"] and section["heading_level"] == 0 for section in titles)
+    action = next(section for section in sections if section["text"] == "Нажмите F8.")
+    assert action["is_heading"] is False and action["heading_level"] is None
 
 
 def test_docx_heading_inheritance_cycles_are_bounded_and_direct_outline_is_honored():
