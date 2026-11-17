@@ -206,8 +206,18 @@ def test_xlsx_tables_keep_all_original_cells_without_model_generated_prose():
     assert approved.document["images"] == []
 
 
-@pytest.mark.parametrize("data", [b"not a zip", instruction([""]), instruction(external=True)])
-def test_invalid_original_or_missing_photo_description_is_an_unavailable_source(data):
+@pytest.mark.parametrize("data", [b"not a zip", instruction(external=True)])
+def test_invalid_original_or_external_photo_is_an_unavailable_source(data):
     knowledge, _ = provider(data=data)
     with pytest.raises(KnowledgeUnavailable):
         knowledge.read(DOC)
+
+
+def test_new_docx_without_photo_alt_text_uses_original_paragraph_context():
+    data = instruction([""])
+    knowledge, _ = provider(data=data)
+    approved = knowledge.read(DOC)
+    expected = read_docx_images(data, contextual_captions=True)[0]
+    assert approved.illustrations[1].data == expected.data
+    assert approved.illustrations[1].caption in approved.document["content"]
+    assert approved.document["source"]["sha256"] == hashlib.sha256(data).hexdigest()

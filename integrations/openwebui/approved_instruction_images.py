@@ -164,7 +164,7 @@ def _normalize_image(data):
     return result
 
 
-def read_docx_images(data):
+def read_docx_images(data, *, contextual_captions=False):
     """Read the same body illustrations/alt text as the approved instruction backend.
 
     Never unzip to disk, follow external relationships or interpret document text
@@ -186,11 +186,22 @@ def read_docx_images(data):
                     relations[rid] = node
             if list(document.iter(W + "pict")):
                 raise ToolError("unsupported_document", "Старые VML-иллюстрации нужно преобразовать в обычные рисунки DOCX.")
+            contexts = {}
+            if contextual_captions:
+                previous_text = ""
+                for paragraph in document.iter(W + "p"):
+                    text = "".join(node.text or "" for node in paragraph.iter(W + "t")).strip()
+                    for drawing in paragraph.iter(W + "drawing"):
+                        contexts[id(drawing)] = (text or previous_text)[:6000]
+                    if text:
+                        previous_text = text
             pictures, total_bytes = [], 0
             for drawing in document.iter(W + "drawing"):
                 blips = list(drawing.iter(A + "blip"))
                 props = next(drawing.iter(WP + "docPr"), None)
                 caption = props.get("descr", "").strip() if props is not None else ""
+                if not caption and contextual_captions:
+                    caption = contexts.get(id(drawing)) or f"Иллюстрация {len(pictures) + 1} из исходного документа."
                 if len(blips) != 1 or not caption or len(caption) > 6000:
                     raise ToolError("missing_description", "У каждой фотографии должно быть текстовое описание в альтернативном тексте DOCX.")
                 relation = relations.get(blips[0].get(R + "embed"))

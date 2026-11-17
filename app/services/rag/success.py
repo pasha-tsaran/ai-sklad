@@ -11,8 +11,10 @@ from sqlalchemy import select
 
 from app.models import Conversation, Feedback, Incident, Message, SolutionAttempt, SuccessfulRetrieval, now
 from app.services.chat.memory import _redact
+from app.services.chat.instruction_plan import immutable_plan, restore_plan, serialize_plan
+from app.services.chat.task_state import task_query
 from app.services.rag.query import normalized_query, source_compatible
-from app.services.rag.talk import KnowledgeUnavailable
+from app.services.rag.talk import InstructionDecision, InstructionPlanPart, KnowledgeUnavailable
 from integrations.openwebui.approved_instruction_images import allowed_source_filename
 
 _HASH = re.compile(r"^[0-9a-f]{64}$")
@@ -39,9 +41,23 @@ def cache_key(settings, query, context):
     text, scope = normalized_query(query), _scope(settings)
     if not text or not scope:
         return None
-    incident = context.get("incident", {}) if isinstance(context, dict) else {}
-    facts = {key: normalized_query(incident.get(key)) for key in ("equipment_model", "problem_type")}
-    return {"scope_hash": scope, "query_hash": _digest(text), "context_hash": _digest(facts)}
+    state = context.get("task_state") if isinstance(context, dict) else None
+    if isinstance(state, dict) and state.get("goals"):
+        facts = {"version": 2,
+                 "facts": sorted((fact["key"], normalized_query(fact["value"]),
+                                  normalized_query(fact.get("entity", "")),
+                                  normalized_query(fact.get("attribute", "")), fact.get("negated", False))
+                                 for fact in state.get("facts", [])),
+                 "goals": [normalized_query(goal.get("text", "") if isinstance(goal, dict) else goal)
+                           for goal in state["goals"].values()],
+                 "unknown_answers": sorted((normalized_query(item.get("question", "")),
+                                            normalized_query(item.get("answer", "")))
+                                           for item in state.get("unknown_answers", context.get("unknown_answers", [])))}
+    else:
+        incident = context.get("incident", {}) if isinstance(context, dict) else {}
+        facts = {key: normalized_query(incident.get(key)) for key in ("equipment_model", "problem_type")}
+    query_identity = {"purpose": "typed_task_v2", "goals": facts["goals"]} if "version" in facts else text
+    return {"scope_hash": scope, "query_hash": _digest(query_identity), "context_hash": _digest(facts)}
 
 
 def _valid_key(settings, key):
@@ -105,11 +121,50 @@ def _opening_was_reported(session, incident_id, opening_query, source):
     ).limit(1)) is not None
 
 
-def remember_success(session, settings, principal, incident_id, key, source, *, opening_query=None):
+def _plan_envelope(source):
+    return isinstance(source, dict) and source.get("kind") == "verified_instruction_plan" and source.get("version") == 1
+
+
+def _plan_proof(session, principal, incident_id, plan):
+    incident = session.scalar(select(Incident).join(Conversation).where(
+        Incident.id == incident_id, Conversation.user_id == principal,
+        Incident.state == "RESOLVED", Incident.closed_at.is_not(None),
+    ))
+    if incident is None:
+        return None
+    attempts = session.scalars(select(SolutionAttempt).join(Feedback).where(
+        SolutionAttempt.incident_id == incident.id, SolutionAttempt.status == "SUCCEEDED", Feedback.helped.is_(True),
+    )).all()
+    return incident if any(attempt.evidence.get("instruction_plan") == plan for attempt in attempts) else None
+
+
+def _hint_state(state):
+    if not isinstance(state, dict) or not state.get("goals"):
+        return None
+    retained = {key: copy.deepcopy(state.get(key, default)) for key, default in (
+        ("facts", []), ("goals", {}), ("unknown_answers", []),
+    )}
+    retained.update(messages=[], question="", question_field=None, new_task=False)
+    # A recalled interpretation must retain exact validated meaning. Sensitive
+    # values can be redacted for memory elsewhere, but cannot train this shortcut.
+    encoded = json.dumps(retained, ensure_ascii=False, sort_keys=True)
+    if _redact(encoded) != encoded:
+        return None
+    try:
+        task_query(retained)
+    except (ValueError, TypeError):
+        return None
+    return retained
+
+
+def remember_success(session, settings, principal, incident_id, key, source, *, opening_query=None,
+                     plan=None, task_state=None):
     """Persist a reference only after an owned, explicit successful feedback row."""
     if not _valid_key(settings, key) or not _valid_source(settings, source):
         return None
-    incident = _proof(session, principal, incident_id, source)
+    saved_plan = immutable_plan(plan) if plan is not None else None
+    incident = (_plan_proof(session, principal, incident_id, saved_plan) if saved_plan
+                else _proof(session, principal, incident_id, source))
     if incident is None:
         return None
     resolved = incident.closed_at
@@ -118,18 +173,32 @@ def remember_success(session, settings, principal, incident_id, key, source, *, 
     expires = resolved + timedelta(days=settings.memory_retention_days)
     if expires <= now():
         return None
-    row = session.scalar(select(SuccessfulRetrieval).filter_by(user_id=principal, **key))
+    stored_key = dict(key)
+    stored_source = source
+    if saved_plan:
+        if not isinstance(task_state, dict) or not task_state.get("goals"):
+            return None
+        stored_key["context_hash"] = _digest({"task_hash": key["context_hash"], "plan": saved_plan["digest"]})
+        stored_source = {"kind": "verified_instruction_plan", "version": 1,
+                         "task_hash": key["context_hash"], "plan": saved_plan}
+    row = session.scalar(select(SuccessfulRetrieval).filter_by(user_id=principal, **stored_key))
     if row is None:
-        row = SuccessfulRetrieval(user_id=principal, **key)
+        row = SuccessfulRetrieval(user_id=principal, **stored_key)
         session.add(row)
-    row.incident_id, row.source, row.expires_at = incident.id, copy.deepcopy(source), expires
+    row.incident_id, row.source, row.expires_at = incident.id, copy.deepcopy(stored_source), expires
     hint_key = _hint_key(settings, opening_query, incident.id)
     if hint_key and _opening_was_reported(session, incident.id, opening_query, source):
+        hint_source = copy.deepcopy(source)
+        if saved_plan:
+            retained_state = _hint_state(task_state)
+            if retained_state is None:
+                return row
+            hint_source = {**copy.deepcopy(stored_source), "interpretation": retained_state}
         hint = session.scalar(select(SuccessfulRetrieval).filter_by(user_id=principal, **hint_key))
         if hint is None:
             hint = SuccessfulRetrieval(user_id=principal, **hint_key)
             session.add(hint)
-        hint.incident_id, hint.source, hint.expires_at = incident.id, copy.deepcopy(source), expires
+        hint.incident_id, hint.source, hint.expires_at = incident.id, hint_source, expires
     return row
 
 
@@ -191,6 +260,7 @@ class SuccessfulTalkKnowledge:
         if key is None:
             return None
         candidates = []
+        plan_candidates = []
         with self.factory() as session, session.begin():
             rows = session.execute(select(SuccessfulRetrieval, Incident).join(
                 Incident, SuccessfulRetrieval.incident_id == Incident.id,
@@ -209,6 +279,15 @@ class SuccessfulTalkKnowledge:
                 expires = row.expires_at
                 if expires.tzinfo is None:
                     expires = expires.replace(tzinfo=timezone.utc)
+                if _plan_envelope(source):
+                    plan, state = source.get("plan"), _hint_state(source.get("interpretation"))
+                    if (expires <= now() or not isinstance(plan, dict) or state is None
+                            or _plan_proof(session, self.principal, incident.id, plan) is None):
+                        session.delete(row)
+                    elif not any(part.get("source", {}).get("file_id") in excluded
+                                 for part in plan.get("parts", [])):
+                        plan_candidates.append((hint_key, plan, state))
+                    continue
                 if (expires <= now() or not _valid_source(self.settings, source)
                         or _proof(session, self.principal, incident.id, source) is None):
                     session.delete(row)
@@ -217,6 +296,15 @@ class SuccessfulTalkKnowledge:
                 if source["file_id"] not in excluded and problem and len(problem) <= 6000:
                     candidates.append((hint_key, source, problem))
         verified = {}
+        for hint_key, plan, state in plan_candidates:
+            try:
+                parts = restore_plan(self.delegate, plan)
+            except (KnowledgeUnavailable, KeyError, TypeError, ValueError):
+                self._forget(hint_key)
+                continue
+            signature = _digest({"plan": plan["digest"], "state": state})
+            verified[signature] = {"problem": task_query(state), "source": parts[0].approved.document["source"],
+                                   "plan": serialize_plan(parts), "task_state": state}
         for hint_key, source, problem in candidates:
             try:
                 approved = self.delegate.read(source["file_id"])
@@ -233,9 +321,14 @@ class SuccessfulTalkKnowledge:
     def search_with_llm(self, query, context=None, excluded=(), fallback_query=None):
         """A previous success can nominate a source for the model to check again."""
         problem = fallback_query if isinstance(fallback_query, str) and fallback_query.strip() else query
-        self.last_cache_key = cache_key(self.settings, problem, self.context)
-        self.cache_hit = False
         selection_context = dict(context or self.context)
+        self.last_cache_key = cache_key(self.settings, problem, selection_context)
+        self.cache_hit = False
+        if self.last_cache_key and selection_context.get("instruction_planning"):
+            previous_plan = self._lookup_plan(self.last_cache_key, selection_context, excluded)
+            if previous_plan is not None:
+                self.cache_hit = True
+                return previous_plan
         verified = None
         if self.last_cache_key:
             source = self._lookup(self.last_cache_key, excluded)
@@ -256,6 +349,52 @@ class SuccessfulTalkKnowledge:
         self.cache_hit = bool(verified and decision.approved is not None
                               and decision.approved.document["source"] == verified)
         return decision
+
+    def _lookup_plan(self, key, context, excluded):
+        candidates = []
+        with self.factory() as session, session.begin():
+            rows = session.scalars(select(SuccessfulRetrieval).where(
+                SuccessfulRetrieval.user_id == self.principal,
+                SuccessfulRetrieval.scope_hash == key["scope_hash"],
+                SuccessfulRetrieval.query_hash == key["query_hash"],
+            ).limit(101)).all()
+            if len(rows) > 100:
+                return None
+            for row in rows:
+                envelope = row.source
+                if not _plan_envelope(envelope) or envelope.get("task_hash") != key["context_hash"]:
+                    continue
+                plan = envelope.get("plan")
+                expires = row.expires_at
+                if expires.tzinfo is None:
+                    expires = expires.replace(tzinfo=timezone.utc)
+                if (expires <= now() or not isinstance(plan, dict)
+                        or _plan_proof(session, self.principal, row.incident_id, plan) is None):
+                    session.delete(row)
+                    continue
+                if not any(part.get("source", {}).get("file_id") in excluded for part in plan.get("parts", [])):
+                    candidates.append((copy.deepcopy(plan), {name: getattr(row, name) for name in _KEY_FIELDS}))
+        verified = {}
+        for plan, stored_key in candidates:
+            try:
+                parts = restore_plan(self.delegate, plan)
+            except (KnowledgeUnavailable, KeyError, TypeError, ValueError):
+                self._forget(stored_key)
+                continue
+            requested = context.get("requested_goals", {})
+            labels = {normalized_query(text): goal_id for goal_id, text in requested.items()}
+            if (len(labels) != len(requested) or any(normalized_query(goal) not in labels
+                                                   for part in parts for goal in part.goals)):
+                continue
+            covered = [normalized_query(goal) for part in parts for goal in part.goals]
+            if len(covered) != len(requested) or set(covered) != set(labels):
+                continue
+            remapped = tuple(InstructionPlanPart(part.approved,
+                tuple(labels[normalized_query(goal)] for goal in part.goals), part.goals,
+                part.section_ids, part.sections) for part in parts)
+            verified[plan["digest"]] = InstructionDecision("MATCH", approved=parts[0].approved,
+                covered_goals=tuple(goal for part in parts for goal in part.goals), plan=remapped)
+        return next(iter(verified.values())) if len(verified) == 1 else None
 
     def read(self, file_id):
         return self.delegate.read(file_id)

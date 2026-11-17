@@ -90,8 +90,12 @@ def test_instruction_selection_has_a_short_structured_response_with_thinking_dis
         expected_schema["properties"].pop("missing_goal_ids")
         expected_schema["properties"].pop("clarification_kind")
         expected_schema["properties"].pop("clarification_sources")
+        expected_schema["properties"].pop("parts")
+        expected_schema["properties"].pop("section_ids")
+        expected_schema["$defs"].pop("InstructionPartSelection")
         expected_schema["$defs"].pop("InstructionGoalCoverage")
         expected_schema["properties"]["result"]["enum"].remove("PARTIAL")
+        expected_schema["properties"]["result"]["enum"].remove("PLAN")
         assert body["response_format"] == {"type": "json_schema", "json_schema": {
             "name": "instruction_selection", "schema": expected_schema,
         }}

@@ -43,7 +43,7 @@ def _instruction_schema_variants(base, payload):
 
     coverage = definitions["InstructionGoalCoverage"]["properties"]
     goal_id = {**coverage["goal_id"], "enum": goals}
-    text = {"goal_id": goal_id, "evidence": coverage["evidence"],
+    text = {"goal_id": goal_id, "evidence": {**coverage["evidence"], "minLength": 20},
             "support_kind": {"type": "string", "const": "TEXT"},
             "image_numbers": {**coverage["image_numbers"], "maxItems": 0}}
     image = {**text, "support_kind": {"type": "string", "const": "IMAGE"},
@@ -101,6 +101,7 @@ def _instruction_schema_variants(base, payload):
 
 class OpenWebUILLM:
     supports_source_clarification = True
+    supports_instruction_planning = True
 
     def __init__(self, settings, transport=None):
         self.settings = settings
@@ -115,6 +116,12 @@ class OpenWebUILLM:
         selection_schema = None
         if fast_selection:
             selection_schema = schema.model_json_schema()
+            if payload.get("instruction_planning") is not True and "parts" in selection_schema["properties"]:
+                selection_schema["properties"].pop("parts")
+                selection_schema["properties"].pop("section_ids")
+                selection_schema["properties"]["result"]["enum"].remove("PLAN")
+                selection_schema.get("$defs", {}).pop("InstructionPartSelection", None)
+                selection_schema.get("$defs", {}).pop("PartReference", None)
             allowed_ids = list(payload.get("catalogue", {}))
             if "file_id" in selection_schema["properties"]:
                 selection_schema["properties"]["file_id"] = (
@@ -252,6 +259,11 @@ class OpenWebUILLM:
             "catalogue": {aliases[file_id]: name for file_id, name in catalogue.items()},
             "candidates": {aliases[file_id]: content for file_id, content in candidates.items()},
         }
+        if "catalogue_cards" in payload:
+            cards = payload["catalogue_cards"]
+            if not isinstance(cards, dict) or any(file_id not in aliases for file_id in cards):
+                raise ValueError("UnknownInstructionCatalogueCard")
+            wire_payload["catalogue_cards"] = {aliases[key]: value for key, value in cards.items()}
         if "candidate_image_numbers" in payload:
             image_numbers = payload["candidate_image_numbers"]
             if not isinstance(image_numbers, dict) or any(file_id not in candidates for file_id in image_numbers):
@@ -286,9 +298,35 @@ class OpenWebUILLM:
             call_options["max_output_tokens"] = 768 if len(goals) <= 2 else 1024 if len(goals) <= 4 else 1536
             from app.services.rag.evidence import build_evidence_registry
 
-            registries = {aliases[file_id]: build_evidence_registry(content, image_captions.get(file_id, {}))
-                          for file_id, content in candidates.items()}
+            prepared = payload.get("candidate_evidence")
+            if prepared is None:
+                registries = {aliases[file_id]: build_evidence_registry(content, image_captions.get(file_id, {}))
+                              for file_id, content in candidates.items()}
+            else:
+                if not isinstance(prepared, dict) or set(prepared) != set(candidates):
+                    raise ValueError("UnknownInstructionEvidenceCandidate")
+                registries = {}
+                for file_id, registry in prepared.items():
+                    source = " ".join(candidates[file_id].split())
+                    if not isinstance(registry, dict) or len(registry) > 32:
+                        raise ValueError("InvalidInstructionEvidenceRegistry")
+                    for reference_id, proof in registry.items():
+                        if (not isinstance(reference_id, str) or not isinstance(proof, dict)
+                                or set(proof) != {"text", "support_kind", "image_numbers"}
+                                or not isinstance(proof["text"], str) or not 1 <= len(proof["text"]) <= 200
+                                or proof["text"] not in source or proof["support_kind"] not in {"TEXT", "IMAGE"}
+                                or not isinstance(proof["image_numbers"], list)
+                                or any(type(number) is not int or number < 1 for number in proof["image_numbers"])
+                                or proof["support_kind"] == "TEXT" and proof["image_numbers"]):
+                            raise ValueError("InvalidInstructionEvidenceRegistry")
+                    registries[aliases[file_id]] = registry
+            sections = payload.get("candidate_sections")
+            if sections is not None:
+                if not isinstance(sections, dict) or set(sections) != set(candidates):
+                    raise ValueError("UnknownInstructionSectionCandidate")
+                wire_payload["candidate_sections"] = {aliases[key]: value for key, value in sections.items()}
             wire_payload.update(candidates=registries, evidence_references=True)
+            wire_payload.pop("candidate_evidence", None)
             wire_payload.pop("candidate_image_captions", None)
             wire_payload.pop("candidate_image_numbers", None)
         if len(json.dumps(wire_payload, ensure_ascii=False)) > MAX_SELECTION_PAYLOAD_CHARS:
@@ -296,13 +334,17 @@ class OpenWebUILLM:
         if goals:
             references = self._call(InstructionReferenceSelection, INSTRUCTION_SELECTION_TASK,
                                     wire_payload, **call_options)
-            choice = InstructionSelection.model_validate(resolve_instruction_references(references, registries))
+            choice = InstructionSelection.model_validate(resolve_instruction_references(
+                references, registries, planning=payload.get("instruction_planning") is True,
+                sections=wire_payload.get("candidate_sections"),
+            ))
         else:
             choice = self._call(InstructionSelection, INSTRUCTION_SELECTION_TASK, wire_payload, **call_options)
         decoded = choice.model_dump()
         source_ids = [choice.file_id] if choice.file_id is not None else []
         source_ids.extend(alternative.file_id for alternative in choice.alternatives)
         source_ids.extend(source.file_id for source in choice.clarification_sources)
+        source_ids.extend(part.file_id for part in choice.parts)
         if any(source_id not in originals for source_id in source_ids):
             raise ValueError("UnknownInstructionSourceAlias")
         if choice.file_id is not None:
@@ -311,6 +353,8 @@ class OpenWebUILLM:
             alternative["file_id"] = originals[alternative["file_id"]]
         for source in decoded["clarification_sources"]:
             source["file_id"] = originals[source["file_id"]]
+        for part in decoded["parts"]:
+            part["file_id"] = originals[part["file_id"]]
         return InstructionSelection.model_validate(decoded)
 
     def interpret_instruction_offer(self, message, offered):

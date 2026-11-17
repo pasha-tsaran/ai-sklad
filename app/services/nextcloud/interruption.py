@@ -153,9 +153,14 @@ def latest_paused(session, room):
 def has_unfinished_guide(session, room, attempt):
     """Explicit feedback may resolve early; an unseen guide cannot seed a cache."""
     source = attempt.evidence.get("talk_source")
-    if not source:
+    sources = [source] if source else []
+    plan = attempt.evidence.get("instruction_plan")
+    if isinstance(plan, dict) and isinstance(plan.get("parts"), list):
+        sources.extend(part["source"] for part in plan["parts"]
+                       if isinstance(part, dict) and isinstance(part.get("source"), dict))
+    if not sources:
         return False
-    return any(row.provenance == source for row in session.scalars(select(Delivery).join(Message).where(
+    return any(row.provenance in sources for row in session.scalars(select(Delivery).join(Message).where(
         Delivery.account_id == room.account_id, Delivery.room_token == room.room_token,
         Delivery.status.not_in(["SENT", "CANCELLED"]), Message.incident_id == attempt.incident_id,
         Delivery.provenance.is_not(None),

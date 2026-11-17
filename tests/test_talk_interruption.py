@@ -5,11 +5,13 @@ import copy
 import pytest
 from sqlalchemy import func, select
 
-from app.models import Delivery, Feedback, Incident, Message, SuccessfulRetrieval, now
+from app.models import Delivery, Feedback, Incident, Message, SolutionAttempt, SuccessfulRetrieval, now
 from app.models.talk import TalkInbox, TalkRoom
 from app.services.chat.talk_dialogue import CHANGED, Turn
 from app.services.nextcloud.delivery import deliver_one
-from app.services.nextcloud.interruption import ACTIVE, PAUSED, is_resume_request, latest_paused, resume_response
+from app.services.nextcloud.interruption import (
+    ACTIVE, PAUSED, has_unfinished_guide, is_resume_request, latest_paused, resume_response,
+)
 from app.talk_worker import recover
 from tests.test_talk_delivery import Sender, bind, enqueue
 from tests.test_talk_dialogue import DOC, QUESTION, Knowledge, approved
@@ -289,6 +291,30 @@ def test_explicit_success_can_resolve_early_but_unseen_guide_does_not_seed_cache
         assert session.scalar(select(func.count()).select_from(Feedback)) == 1
         assert session.scalar(select(func.count()).select_from(SuccessfulRetrieval)) == 0
         assert any(row.status == "PAUSED" for row in session.scalars(select(Delivery)))
+
+
+@pytest.mark.parametrize("status,unfinished", [
+    ("PENDING", True), ("PAUSED", True), ("UNKNOWN", True), ("SENT", False), ("CANCELLED", False),
+])
+def test_unfinished_plan_tracks_delivery_from_every_verified_source(talk, status, unfinished):
+    talk.incoming(QUESTION)
+    talk.process(Knowledge([approved(1)]))
+    with talk.env.factory() as session, session.begin():
+        room = session.get(TalkRoom, talk.room_id)
+        attempt = session.scalar(select(SolutionAttempt).where(SolutionAttempt.incident_id == room.incident_id))
+        first_source = attempt.evidence["talk_source"]
+        second_source = {**first_source, "file_id": "00000000-0000-4000-8000-000000000999"}
+        attempt.evidence = {**attempt.evidence, "instruction_plan": {"version": 1, "parts": [
+            {"source": first_source}, {"source": second_source},
+        ]}}
+        rows = session.scalars(select(Delivery).join(Message).where(
+            Message.incident_id == room.incident_id,
+        ).order_by(Message.sequence)).all()
+        for row in rows:
+            row.status = "SENT"
+        rows[-1].provenance, rows[-1].status = second_source, status
+        session.flush()
+        assert has_unfinished_guide(session, room, attempt) is unfinished
 
 
 @pytest.mark.parametrize("message", ["продолжай", "продолжи предыдущий ответ", "Закончи предыдущий ответ",

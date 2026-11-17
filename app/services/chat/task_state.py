@@ -43,7 +43,7 @@ def _previous_state(previous):
     raw_goals = previous.get("goals", {})
     if not isinstance(raw_facts, list) or not isinstance(raw_goals, dict):
         raise ValueError("InvalidTaskState")
-    facts = [SupportTaskFact.model_validate(item).model_dump() for item in raw_facts]
+    facts = [SupportTaskFact.model_validate(item).model_dump(exclude_defaults=True) for item in raw_facts]
     goals = {}
     for goal_id, item in raw_goals.items():
         if not isinstance(item, dict):
@@ -126,17 +126,24 @@ def update_task_state(message, previous, previous_question, llm):
     if not update.replace_goals and update.replacement_evidence:
         raise ValueError("UnexpectedTaskReplacement")
     for fact in update.facts:
+        identity = (fact.key, _normalized(fact.entity), _normalized(fact.attribute))
+        def same_field(item):
+            return (item["key"], _normalized(item.get("entity", "")), _normalized(item.get("attribute", ""))) == identity
+
         if fact.key not in _MULTIPLE_FACTS:
-            state["facts"] = [item for item in state["facts"] if item["key"] != fact.key]
+            state["facts"] = [item for item in state["facts"]
+                              if not (same_field(item) and not item.get("negated", False) and not fact.negated)]
         state["facts"] = [item for item in state["facts"]
-                          if (item["key"], _normalized(item["value"])) != (fact.key, _normalized(fact.value))]
-        state["facts"].append(fact.model_dump())
+                          if not (same_field(item) and _normalized(item["value"]) == _normalized(fact.value))]
+        state["facts"].append(fact.model_dump(exclude_defaults=True))
     existing = state["goals"]
     next_id = max((int(key[1:]) for key in existing), default=0) + 1
     goals = {} if update.replace_goals else copy.deepcopy(existing)
     updated_goal_ids = []
     for goal in update.goals:
-        goal_id = goal.goal_id
+        # Goal identifiers are local to one task. A new task receives fresh
+        # backend identifiers even if the model repeats an earlier valid ID.
+        goal_id = None if update.new_task else goal.goal_id
         if goal_id is not None and goal_id not in existing:
             raise ValueError("UnknownTaskGoal")
         if goal_id is None:
@@ -156,7 +163,8 @@ def update_task_state(message, previous, previous_question, llm):
         state["facts"].pop(completed)
     if len(goals) > 8:
         raise ValueError("TaskStateTooLarge")
-    answered_fields = {fact.key for fact in update.facts if _evidenced(fact.evidence, [message])}
+    answered_fields = {fact.key for fact in update.facts
+                       if not fact.negated and _evidenced(fact.evidence, [message])}
     if any(_evidenced(goal.evidence, [message]) for goal in update.goals):
         answered_fields.add("goal")
     state["unknown_answers"] = [item for item in state["unknown_answers"]
@@ -179,12 +187,21 @@ def update_task_state(message, previous, previous_question, llm):
 def task_query(state):
     """Retrieve current work and reported conditions without completed setup steps."""
     task = _previous_state(state)
-    parts = [fact["value"] for fact in task["facts"] if fact["key"] in {"equipment_type", "equipment_model"}]
-    software = any(fact["key"] == "scope" and fact["value"] in {"application", "software"}
-                   for fact in task["facts"])
+    def text(fact):
+        value = fact["value"]
+        if fact.get("entity"):
+            value = fact["entity"] + ": " + value
+        if fact.get("attribute"):
+            value = fact["attribute"] + " — " + value
+        return "Не " + value if fact.get("negated", False) else value
+
+    parts = [text(fact) for fact in task["facts"] if fact["key"] in {"equipment_type", "equipment_model"}]
+    software = any(fact["key"] == "scope" and not fact.get("negated", False)
+                   and fact["value"] in {"application", "software"} for fact in task["facts"])
     if software:
-        parts += [fact["value"] for fact in task["facts"] if fact["key"] == "application"]
+        parts += [text(fact) for fact in task["facts"] if fact["key"] == "application"]
     parts += [goal["text"] for goal in task["goals"].values()]
-    parts += [fact["value"] for fact in task["facts"]
-              if fact["key"] in {"connection", "current_step", "error_text", "symptoms"}]
+    parts += [text(fact) for fact in task["facts"]
+              if fact["key"] in {"connection", "current_step", "error_text", "symptoms", "condition"}
+              or fact.get("negated", False) and fact["key"] == "completed"]
     return "\n".join(dict.fromkeys(parts))

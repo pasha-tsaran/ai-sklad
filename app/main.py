@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from sqlalchemy import text
 
 from app.api.routes import router
@@ -9,7 +9,7 @@ from app.core.logging import configure_logging, event
 from app.db import get_engine
 
 configure_logging()
-app = FastAPI(title="ai-support", version="0.3.23", description="Grounded support, personal Talk chats and mail drafts")
+app = FastAPI(title="ai-support", version="0.4.0", description="Grounded support, personal Talk chats and mail drafts")
 app.include_router(router)
 app.include_router(talk_router)
 app.include_router(device_router)
@@ -37,10 +37,14 @@ def live():
 @app.get("/health/ready")
 def ready():
     with get_engine().connect() as connection:
-        connection.execute(text("SELECT 1 FROM alembic_version"))
+        revision = connection.execute(text("SELECT version_num FROM alembic_version")).scalar()
+        if revision != "0010":
+            raise HTTPException(503, {"error_code": "DatabaseMigrationRequired", "expected_revision": "0010"})
     settings = get_settings()
     return {
         "status": "ok",
+        "app_version": app.version,
+        "database_revision": revision,
         "llm": settings.llm_backend,
         "nextcloud": settings.nextcloud_backend,
         "mail": settings.mail_backend,

@@ -19,7 +19,7 @@ from app.services.rag.interface import Candidate
 from app.services.rag.knowledge_files import KnowledgeFilesError, list_knowledge_files
 from app.services.rag.query import _terms, choose_source, normalized_query, retrieval_query, scanner_kinds, source_compatible
 from integrations.openwebui.approved_instruction_images import (
-    MAX_SOURCE_BYTES, MAX_TEXT_CHARS, allowed_source_filename, read_docx_images, read_docx_text,
+    MAX_SOURCE_BYTES, MAX_TEXT_CHARS, allowed_source_filename, read_docx_images,
 )
 
 
@@ -38,9 +38,17 @@ class InstructionAlternative(BaseModel):
 class InstructionGoalCoverage(BaseModel):
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
     goal_id: str = Field(min_length=1, max_length=64)
-    evidence: str = Field(min_length=20, max_length=200)
+    evidence: str = Field(min_length=1, max_length=200)
     support_kind: Literal["TEXT", "IMAGE"]
     image_numbers: list[StrictInt] = Field(default_factory=list, max_length=6)
+    section_id: str | None = Field(default=None, max_length=64)
+
+
+class InstructionPartSelection(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    file_id: str
+    covered_goals: list[InstructionGoalCoverage] = Field(min_length=1, max_length=8)
+    section_ids: list[str] = Field(min_length=1, max_length=32)
 
 
 def _safe_understanding(value):
@@ -60,7 +68,7 @@ class InstructionSelection(BaseModel):
     """Untrusted semantic choice; the backend validates original-source evidence."""
 
     model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
-    result: Literal["MATCH", "PARTIAL", "CLARIFY", "NO_KNOWLEDGE", "READ", "RELATED"]
+    result: Literal["MATCH", "PARTIAL", "CLARIFY", "NO_KNOWLEDGE", "READ", "RELATED", "PLAN"]
     file_id: str | None = None
     evidence: str = Field(default="", max_length=2000)
     question: str = Field(default="", max_length=300)
@@ -71,6 +79,8 @@ class InstructionSelection(BaseModel):
     missing_goal_ids: list[str] = Field(default_factory=list, max_length=8)
     clarification_kind: Literal["USER_GOAL", "VISIBLE_STATE", "PHYSICAL_SETUP", "WORK_HISTORY"] | None = None
     clarification_sources: list[InstructionAlternative] = Field(default_factory=list, max_length=3)
+    section_ids: list[str] = Field(default_factory=list, max_length=32)
+    parts: list[InstructionPartSelection] = Field(default_factory=list, max_length=8)
 
     @field_validator("understanding", mode="before")
     @classmethod
@@ -91,17 +101,41 @@ ID. В covered_goals передавай только goal_id и evidence_id, а 
 clarification_sources — file_id и evidence_id. Не копируй и не переписывай цитаты,
 не создавай evidence, support_kind или image_numbers. Backend восстановит точное
 основание по выбранному ID, затем заново проверит оригинал. ID принадлежит только
-своему файлу. Фрагменты короче 20 символов дают контекст, но не подходят как
-основание. Условия применимости и требования к покрытию целей ниже сохраняются.
+своему файлу. В instruction_planning=true допустим и короткий исходный фрагмент,
+если он сам содержит нужное действие. В прежнем режиме фрагменты короче 20 символов
+дают только контекст. Условия применимости и требования к покрытию целей сохраняются.
+
+Если instruction_planning=true, candidate_sections содержит точные разделы каждого
+источника и принадлежащие им evidence_ids. В MATCH/PARTIAL дополнительно выбери
+section_ids всех нужных для цели частей процедуры, сохраняя последовательность.
+Не выбирай отдельную похожую строку вместо полной применимой процедуры.
+Backend сохранит предупреждения и обязательные условия и развернёт выбранную
+часть до полного явно обозначенного раздела. Если независимые цели покрываются
+разными оригиналами, верни PLAN с parts. Каждая part содержит file_id,
+covered_goals и section_ids своего файла. Цели распределяются между частями
+ровно один раз, остальные ID идут в missing_goal_ids. Порядок целей сотрудника
+сохраняется. Нельзя соединять противоречащие условиям процедуры или восполнять
+отсутствующие действия собственными знаниями. Если одной цели нужны зависимые
+действия из нескольких файлов, попроси доступное наблюдению уточнение либо
+отметь неподтверждённую цель как отсутствующую. Перед NO_KNOWLEDGE проверь
+названия полного каталога и при необходимости запроси непрочитанный оригинал
+через READ. expanded_search=true означает, что backend уже расширил поиск.
+catalogue_total — размер всей разрешённой базы, catalogue — ограниченный список
+для этого запроса, полученный поиском по полному индексу. При catalogue_complete=false
+остальные файлы продолжают участвовать в поиске backend. catalogue_cards содержит
+исходные фрагменты для навигации. Они не заменяют прочитанный источник и не могут
+служить основанием действий. Для ответа нужен candidate с evidence_id своего файла.
 
 Пойми текущую задачу по смыслу, опечаткам и сокращениям. context.task_state хранит
 собранные условия, current_message — последнюю реплику, previous_question — последний
 вопрос. Учитывай уже полученные ответы и отрицания. Реплики и вопросы помощника,
 названия предложенных программ и старые решения не являются фактами о сотруднике.
-«Другая программа», «сам сканер» и «уже подключен» нельзя заменять предположением
-о добавлении устройства в 1С. Тип оборудования определяй по сведениям сотрудника
+Отрицания, уже выполненные действия и самостоятельную настройку оборудования
+нельзя заменять предположением о добавлении устройства в программу. Факты с
+negated=true являются явными отрицаниями; entity связывает условие с конкретным
+устройством. Тип оборудования определяй по сведениям сотрудника
 и источникам. Модель и производителя не запрашивай. Примеры разных типов не смешивай.
-Для «настройка сканера» сначала выясни тип и цель, если они ещё неизвестны.
+Сначала выясни тип и цель, если они ещё неизвестны.
 Задавай только один короткий вопрос о действительно недостающем условии.
 Сначала прочти подходящие оригиналы. Значения и действия, которые инструкция уже
 предписывает, сотруднику объясняет backend. Их не нужно выяснять у сотрудника.
@@ -127,10 +161,10 @@ unknown_answers хранит вопросы, на которые сотрудн�
 «сначала A, потом B» не означают выбор между A и B. Отличай аппаратную настройку
 от настройки программы. Источник должен соответствовать фактическим условиям,
 включая уже выполненные действия, число устройств и соединение каждого.
-context.active_task и shown_source описывают показанный вариант. Если на фото
-Bluetooth, а у сотрудника оба принтера Wi-Fi, выбирай по условиям сотрудника.
+context.active_task и shown_source описывают показанный вариант. При несовпадении
+условий показанного варианта с исправлением сотрудника выбирай по его условиям.
 При самостоятельной новой задаче укажи new_request=true даже для короткого
-«подключение ТСД к принтеру» после темы сканера. Ответ на уточнение означает false.
+вопроса о другом оборудовании или программе. Ответ на уточнение означает false.
 Прошлая успешная настройка помогает предложить цель, но не доказывает её сейчас.
 
 При достаточных данных верни MATCH с точным file_id загруженного кандидата.
@@ -158,7 +192,7 @@ IMAGE нужен, когда само изображение необходим�
 этой иллюстрации. Backend сверит текст, подпись, наличие фото и свежий SHA.
 Упоминание действия, условное «может понадобиться», название штрихкода или ссылка
 на внешнюю непроверенную страницу не являются готовой инструкцией для этой цели.
-Нельзя объявлять неизвестный или непроверенный центральный код заводским сбросом.
+Нельзя приписывать неизвестному или непроверенному коду требуемую функцию.
 Если необходимого кода или порядка действий нет, помести ID в missing_goal_ids.
 MATCH допустим только при покрытии всех целей одним источником. При подтверждении
 части целей верни PARTIAL с одним file_id, покрытыми целями и оставшимися ID.
@@ -283,6 +317,15 @@ class ApprovedTalkDocument:
 
 
 @dataclass(frozen=True)
+class InstructionPlanPart:
+    approved: ApprovedTalkDocument
+    goal_ids: tuple[str, ...]
+    goals: tuple[str, ...]
+    section_ids: tuple[str, ...]
+    sections: tuple[dict, ...]
+
+
+@dataclass(frozen=True)
 class InstructionDecision:
     result: Literal["MATCH", "PARTIAL", "CLARIFY", "NO_KNOWLEDGE", "RELATED"]
     approved: ApprovedTalkDocument | None = None
@@ -294,6 +337,8 @@ class InstructionDecision:
     missing_goals: tuple[str, ...] = ()
     clarification_kind: str | None = None
     clarification_sources: tuple[ApprovedTalkDocument, ...] = ()
+    plan: tuple[InstructionPlanPart, ...] = ()
+    proposed_goal_order: tuple[str, ...] = ()
 
 
 def _uuid(value):
@@ -309,10 +354,15 @@ def _employee_file(item):
 
 
 class TalkKnowledge:
-    def __init__(self, settings, transport=None, *, selector=None):
+    def __init__(self, settings, transport=None, *, selector=None, catalog=None):
         self.settings, self.transport = settings, transport
         self.selector = selector
         self.base = settings.openwebui_base_url.rstrip("/")
+        self.catalog = catalog
+
+    def set_catalog(self, catalog):
+        self.catalog = catalog
+        return self
 
     @property
     def uses_llm_selection(self):
@@ -375,21 +425,32 @@ class TalkKnowledge:
             original = content.encode()
         else:
             original = self._original(client, file_id)
+        current = self._files(client).get(file_id)
+        if not current or (current["filename"], current["knowledge_id"]) != (filename, item["knowledge_id"]):
+            raise KnowledgeUnavailable("SourceMembershipChanged")
+        if self.catalog is not None:
+            cached = self.catalog.load_verified(file_id, original, files)
+            if cached is not None:
+                return cached
         pictures = []
+        headings = []
+        layout = []
         if extracted_pdf:
             pass
         elif filename.casefold().endswith(".docx"):
             with knowledge_stage("parse_document"):
-                content, pictures = read_docx_text(original), read_docx_images(original)
+                from app.services.rag.catalog import read_docx_headings, read_docx_layout
+
+                parsed = read_docx_layout(original)
+                content, layout = parsed["content"], parsed["paragraphs"]
+                pictures = read_docx_images(original, contextual_captions=True)
+                headings = read_docx_headings(original)
         elif filename.casefold().endswith(".xlsx"):
             content = read_xlsx(original)
         else:
             content = original.decode("utf-8-sig")
         if not content.strip() or len(content) > min(self.settings.knowledge_max_chars, MAX_TEXT_CHARS):
             raise KnowledgeUnavailable("KnowledgeTextInvalidOrTooLarge")
-        current = self._files(client).get(file_id)
-        if not current or (current["filename"], current["knowledge_id"]) != (filename, item["knowledge_id"]):
-            raise KnowledgeUnavailable("SourceMembershipChanged")
         digest = hashlib.sha256(original).hexdigest()
         illustrations = {
             picture.number: Illustration(picture.filename, picture.caption, "image/png", picture.data)
@@ -407,11 +468,21 @@ class TalkKnowledge:
              "illustrations": [p.metadata() for p in illustrations.values()]},
             list(illustrations.values()),
         )
-        return ApprovedTalkDocument(
-            {"status": "ready", "source": source, "content": content,
-             "images": [{"number": picture.number, "caption": picture.caption} for picture in pictures]},
+        document = {"status": "ready", "source": source, "content": content,
+                    "images": [{"number": picture.number, "caption": picture.caption} for picture in pictures]}
+        if headings:
+            document["headings"] = headings
+        if layout:
+            document["layout"] = layout
+        approved = ApprovedTalkDocument(
+            document,
             illustrations, candidate,
         )
+        if self.catalog is not None:
+            from app.services.rag.catalog import remote_revision
+
+            self.catalog.store(approved, remote_revision=remote_revision(item))
+        return approved
 
     def read(self, file_id):
         if not _uuid(file_id):
@@ -447,9 +518,12 @@ class TalkKnowledge:
         problem = fallback_query if isinstance(fallback_query, str) and fallback_query.strip() else query
         if not isinstance(problem, str) or not problem.strip() or len(problem) > 6000:
             raise KnowledgeUnavailable("InvalidSelectionProblem", "instruction_selection")
+        if isinstance(context, dict) and context.get("instruction_planning") is True:
+            return self._search_instruction_plan(problem, context, excluded)
         try:
             with self._client() as client:
-                files = {key: item for key, item in self._files(client).items() if key not in excluded}
+                all_files = self._files(client)
+                files = {key: item for key, item in all_files.items() if key not in excluded}
                 catalogue = {key: item["filename"] for key, item in files.items()}
                 if len(json.dumps(catalogue, ensure_ascii=False)) > MAX_SELECTION_CATALOGUE_CHARS:
                     raise KnowledgeUnavailable("SelectionCatalogueTooLarge", "instruction_selection")
@@ -561,6 +635,353 @@ class TalkKnowledge:
             failure = KnowledgeUnavailable(type(error).__name__, "instruction_selection")
             report_failure(failure)
             raise failure from None
+
+    def _search_instruction_plan(self, problem, context, excluded):
+        """Retrieve source sections first, then verify every selected part afresh."""
+        from app.services.rag.catalog import bm25_rank, reciprocal_rank_fusion
+
+        goals = self._requested_goals(context)
+        # The ordinary adapter also supports callers predating task-state goals.
+        goals = goals or {"g1": problem[:300]}
+        try:
+            with self._client() as client:
+                all_files = self._files(client)
+                files = {key: item for key, item in all_files.items() if key not in excluded}
+                entries = {}
+                if self.catalog is not None:
+                    self.catalog.reconcile(all_files)
+                    entries = self.catalog.entries(files)
+                lexical_rankings = [bm25_rank(problem, entries)] if entries else []
+                if len(goals) > 1 and entries:
+                    lexical_rankings.extend(bm25_rank(goal, entries) for goal in goals.values())
+                lexical = reciprocal_rank_fusion(*lexical_rankings)
+                terms = _terms(problem)
+                names = sorted(files, key=lambda key: -len(terms & _terms(files[key]["filename"])))
+                discovery_error = None
+                try:
+                    vector = self._instruction_vector_ids(client, problem, files) if len(files) > 4 else []
+                except KnowledgeUnavailable as error:
+                    report_failure(error)
+                    vector = []
+                    discovery_error = error if set(entries) != set(files) else None
+                ranked = reciprocal_rank_fusion(lexical, vector, names)
+                ranked = [key for key in ranked if key in files]
+                preloaded = {}
+                if self.catalog is not None:
+                    # A newly uploaded source becomes searchable on the first
+                    # question while the background catalogue catches up.
+                    for file_id in [key for key in ranked if key not in entries][:3]:
+                        try:
+                            preloaded[file_id] = self._read(client, file_id, files)
+                        except KnowledgeUnavailable as error:
+                            report_failure(error)
+                            discovery_error = error
+                    entries = self.catalog.entries(files)
+                    lexical_rankings = [bm25_rank(problem, entries)]
+                    if len(goals) > 1:
+                        lexical_rankings.extend(bm25_rank(goal, entries) for goal in goals.values())
+                    ranked = reciprocal_rank_fusion(*lexical_rankings, vector, names)
+                    ranked = [key for key in ranked if key in files]
+                    if set(entries) == set(files) and discovery_error is not None and discovery_error.stage == "retrieval":
+                        discovery_error = None
+                loaded, views, seen = {}, {}, set()
+                requested_read = None
+                retried = False
+                bounded_context = self._instruction_context(context)
+                for pass_number in range(3):
+                    window = ([requested_read] if requested_read else
+                              [key for key in ranked if key not in seen][:3])
+                    if pass_number and not window:
+                        break
+                    for file_id in window:
+                        try:
+                            approved = preloaded.pop(file_id) if file_id in preloaded else self._read(client, file_id, files)
+                        except KnowledgeUnavailable as error:
+                            report_failure(error)
+                            discovery_error = error
+                            seen.add(file_id)
+                            continue
+                        loaded[file_id] = approved
+                        views[file_id] = self._instruction_source_view(
+                            approved, problem + "\n" + "\n".join(goals.values()),
+                        )
+                        seen.add(file_id)
+                    catalogue = self._instruction_ranked_catalogue(files, ranked, loaded)
+                    cards = self._instruction_catalogue_cards({key: entry for key, entry in entries.items()
+                                                               if key in catalogue})
+                    payload = {
+                        "actual_problem": problem, "requested_goals": goals,
+                        "context": bounded_context, "knowledge_ids": list(self.settings.openwebui_knowledge_ids),
+                        "catalogue": catalogue, "instruction_planning": True,
+                        "catalogue_total": len(files), "catalogue_complete": len(catalogue) == len(files),
+                        "catalogue_cards": cards,
+                        "candidates": {key: value.candidate.content for key, value in loaded.items()},
+                        "candidate_evidence": {key: value[0] for key, value in views.items()},
+                        "candidate_sections": {key: value[1] for key, value in views.items()},
+                        "candidate_image_captions": {key: {number: image.caption
+                            for number, image in value.illustrations.items()} for key, value in loaded.items()},
+                        "read_available": pass_number < 2 and requested_read is None,
+                        "expanded_search": pass_number > 0, "unread_count": len(files) - len(seen),
+                        "source_clarification_required": True, "unknown_answers": self._unknown_answers(context),
+                    }
+                    if isinstance(context, dict) and context.get("clarification_retry") is True:
+                        payload["allow_clarification"] = False
+                    requested_read = None
+                    while True:
+                        _search_event("instruction_selection_request", call_number=pass_number + 1,
+                                      approved_files=len(files), candidate_count=len(loaded),
+                                      source_chars=sum(len(ref["text"]) for view in views.values()
+                                                       for ref in view[0].values()),
+                                      context_chars=len(json.dumps(bounded_context, ensure_ascii=False)))
+                        choice = self._instruction_selection(payload)
+                        self._planning_reference_proofs(choice, views)
+                        if choice.result == "READ":
+                            if (not payload["read_available"] or choice.file_id not in catalogue
+                                    or choice.file_id in seen or choice.parts or choice.section_ids
+                                    or choice.covered_goals or choice.missing_goal_ids or choice.question
+                                    or choice.evidence or choice.alternatives or choice.clarification_sources):
+                                raise KnowledgeUnavailable("InvalidInstructionRead", "instruction_selection")
+                            requested_read = choice.file_id
+                            break
+                        incomplete = choice.result in {"NO_KNOWLEDGE", "PARTIAL"} or (
+                            choice.result == "PLAN" and bool(choice.missing_goal_ids)
+                        )
+                        if incomplete and pass_number == 0 and len(seen) < len(files):
+                            # A second independently ranked window gets a chance before
+                            # absence is reported. The model still sees the full catalogue.
+                            break
+                        try:
+                            if choice.result in {"MATCH", "PARTIAL", "PLAN"}:
+                                return self._instruction_plan_decision(client, choice, files, loaded, views, goals,
+                                                                       context=context)
+                            if choice.result == "NO_KNOWLEDGE" and self.catalog is not None:
+                                entries = self.catalog.entries(files)
+                                if set(entries) != set(files):
+                                    raise KnowledgeUnavailable("SelectionIndexIncomplete", "instruction_selection")
+                            return self._instruction_decision(
+                                client, choice, files, loaded, False, discovery_error, goals,
+                                source_questions=True, unknown_answers=self._unknown_answers(context),
+                                short_references=True,
+                            )
+                        except KnowledgeUnavailable as error:
+                            if retried or error.code not in {"InvalidInstructionCoverage", "InvalidSourceClarification"}:
+                                raise
+                            retried = True
+                            payload["coverage_retry" if error.code == "InvalidInstructionCoverage"
+                                    else "source_question_retry"] = True
+                if discovery_error is not None:
+                    raise discovery_error
+                raise KnowledgeUnavailable("SelectionExpansionIncomplete", "instruction_selection")
+        except KnowledgeUnavailable as error:
+            report_failure(error)
+            raise
+        except Exception as error:
+            failure = KnowledgeUnavailable(type(error).__name__, "instruction_selection")
+            report_failure(failure)
+            raise failure from None
+
+    @staticmethod
+    def _planning_reference_proofs(choice, views):
+        """Short proof is valid only as an entire backend-created fragment."""
+        coverage = [(choice.file_id, item) for item in choice.covered_goals]
+        coverage.extend((part.file_id, item) for part in choice.parts for item in part.covered_goals)
+        for file_id, item in coverage:
+            registry, descriptors = views.get(file_id, ({}, {}))
+            references = [reference_id for reference_id, proof in registry.items()
+                          if item.evidence == proof["text"] and item.support_kind == proof["support_kind"]
+                          and item.image_numbers == proof["image_numbers"]]
+            matches = [section_id for section_id, section in descriptors.items()
+                       if set(references) & set(section["evidence_ids"])]
+            if not references or item.section_id is not None and item.section_id not in matches:
+                raise KnowledgeUnavailable("InstructionEvidenceReferenceMismatch", "instruction_selection")
+            if item.section_id is None:
+                if len(matches) != 1:
+                    raise KnowledgeUnavailable("AmbiguousInstructionEvidenceSection", "instruction_selection")
+                item.section_id = matches[0]
+        for item in [*choice.alternatives, *choice.clarification_sources]:
+            registry = views.get(item.file_id, ({}, {}))[0]
+            if not any(item.evidence == proof["text"] for proof in registry.values()):
+                raise KnowledgeUnavailable("InstructionEvidenceReferenceMismatch", "instruction_selection")
+
+    @staticmethod
+    def _instruction_ranked_catalogue(files, ranked, required):
+        """Search the full index while sending only a bounded discovery shortlist."""
+        catalogue = {}
+        for file_id in dict.fromkeys([*required, *ranked]):
+            if len(catalogue) >= 32:
+                break
+            proposed = {**catalogue, file_id: files[file_id]["filename"]}
+            if len(json.dumps(proposed, ensure_ascii=False)) > MAX_SELECTION_CATALOGUE_CHARS:
+                continue
+            catalogue = proposed
+        if any(file_id not in catalogue for file_id in required):
+            raise KnowledgeUnavailable("SelectionCatalogueTooLarge", "instruction_selection")
+        return catalogue
+
+    @staticmethod
+    def _instruction_catalogue_cards(entries):
+        """Bounded source excerpts aid discovery, never authorize delivered actions."""
+        if not entries:
+            return {}
+        per_source = max(40, min(240, 6000 // len(entries)))
+        cards = {}
+        for file_id, entry in entries.items():
+            excerpts = [row["text"] for name in ("purpose", "conditions")
+                        for row in entry.card.get(name, []) if isinstance(row, dict)
+                        and isinstance(row.get("text"), str)]
+            cards[file_id] = [text[:per_source // 2] for text in excerpts[:2]]
+        return cards
+
+    @staticmethod
+    def _instruction_source_view(approved, problem):
+        from app.services.rag.catalog import instruction_sections
+        from app.services.rag.evidence import build_evidence_registry
+
+        sections = instruction_sections(approved.document)
+        terms = _terms(problem)
+        def relevance(section):
+            return -len(terms & _terms(section["title"] + "\n" + section["text"])), section["ordinal"]
+        relevant = sorted(sections, key=relevance)
+        image_anchors = {}
+        for section in sorted((section for section in sections if section["image_numbers"]), key=relevance):
+            for number in section["image_numbers"]:
+                image_anchors.setdefault(number, section)
+        illustrated = list({section["id"]: section for section in image_anchors.values()}.values())[:2]
+        conditions = sorted((section for section in sections if section["kind"] in {"WARNING", "PREREQUISITE"}),
+                            key=relevance)[:2]
+        ranked = list({section["id"]: section for section in illustrated + conditions + relevant}.values())[:8]
+        registry, descriptors, extra = {}, {}, []
+        for section in ranked:
+            captions = {}
+            section_text = " ".join(section["text"].split())
+            for number in section["image_numbers"]:
+                if number in approved.illustrations:
+                    actual_caption = " ".join(approved.illustrations[number].caption.split())
+                    # Multiline captions remain backed by the same original image.
+                    # Approval checks this fragment against its actual caption.
+                    captions[number] = section_text if section_text in actual_caption else actual_caption
+            references = build_evidence_registry(section["text"], captions)
+            selected = sorted(references, key=lambda key: (
+                len(references[key]["text"]) < 20,
+                -len(terms & _terms(references[key]["text"])),
+                references[key]["support_kind"] != "IMAGE", list(references).index(key),
+            ))[:3]
+            ids = []
+            for index, reference_id in enumerate(selected):
+                proof = references[reference_id]
+                if " ".join(proof["text"].split()) not in " ".join(approved.candidate.content.split()):
+                    continue
+                local_id = "r" + str(section["ordinal"]) + "_" + reference_id
+                if index == 0:
+                    registry[local_id] = proof
+                    ids.append(local_id)
+                else:
+                    extra.append((local_id, proof, section["id"]))
+            if ids:
+                descriptors[section["id"]] = {"title": section["title"], "kind": section["kind"],
+                                                "evidence_ids": ids, "image_numbers": section["image_numbers"]}
+        for local_id, proof, section_id in extra[:max(0, 8 - len(registry))]:
+            registry[local_id] = proof
+            descriptors[section_id]["evidence_ids"].append(local_id)
+        return registry, descriptors
+
+    def _instruction_plan_decision(self, client, choice, files, candidates, views, goals, *, context=None):
+        from app.services.rag.catalog import instruction_sections
+
+        if (choice.question or choice.evidence or choice.alternatives
+                or choice.clarification_sources or choice.clarification_kind):
+            raise KnowledgeUnavailable("InvalidInstructionCoverage", "instruction_selection")
+        parts = choice.parts
+        if choice.result != "PLAN":
+            if parts:
+                raise KnowledgeUnavailable("InvalidInstructionCoverage", "instruction_selection")
+            parts = [InstructionPartSelection(file_id=choice.file_id, covered_goals=choice.covered_goals,
+                                              section_ids=choice.section_ids)]
+        elif choice.file_id is not None or choice.covered_goals or choice.section_ids or not parts:
+            raise KnowledgeUnavailable("InvalidInstructionCoverage", "instruction_selection")
+        covered = [item.goal_id for part in parts for item in part.covered_goals]
+        missing = choice.missing_goal_ids
+        if (not covered or len(covered) != len(set(covered)) or len(missing) != len(set(missing))
+                or set(covered) & set(missing) or set(covered) | set(missing) != set(goals)
+                or choice.result == "MATCH" and missing or choice.result == "PARTIAL" and not missing):
+            raise KnowledgeUnavailable("InvalidInstructionCoverage", "instruction_selection")
+        plan, procedures = [], {}
+
+        def procedure(section):
+            return section.get("group_id") or section["id"]
+
+        for part in parts:
+            part_goals = {key: text for key, text in goals.items() if key in {item.goal_id for item in part.covered_goals}}
+            verified = self._covered_instruction(
+                client, InstructionSelection(result="MATCH", file_id=part.file_id, covered_goals=part.covered_goals),
+                files, candidates, part_goals, short_references=True,
+            ).approved
+            if len(set(part.section_ids)) != len(part.section_ids) or any(
+                    key not in views[part.file_id][1] for key in part.section_ids):
+                raise KnowledgeUnavailable("InvalidInstructionSections", "instruction_selection")
+            all_sections = instruction_sections(verified.document)
+            groups = {procedure(section) for section in all_sections if section["id"] in part.section_ids}
+            selected = [section for section in all_sections if section["id"] in part.section_ids
+                        or procedure(section) in groups
+                        or section["kind"] in {"WARNING", "PREREQUISITE"}]
+            selected_by_id = {section["id"]: section for section in selected}
+            goal_groups = {}
+            for proof in part.covered_goals:
+                anchor = selected_by_id.get(proof.section_id)
+                if anchor is None or " ".join(proof.evidence.split()) not in " ".join(anchor["text"].split()):
+                    raise KnowledgeUnavailable("InstructionSectionEvidenceMismatch", "instruction_selection")
+                if proof.support_kind == "IMAGE" and not set(proof.image_numbers) <= set(anchor["image_numbers"]):
+                    raise KnowledgeUnavailable("InstructionImageEvidenceMismatch", "instruction_selection")
+                goal_groups[proof.goal_id] = procedure(anchor)
+            shared_groups = groups - set(goal_groups.values())
+            for goal_id, group in goal_groups.items():
+                scope = tuple(section for section in selected if procedure(section) == group
+                              or procedure(section) in shared_groups
+                              or section["kind"] in {"WARNING", "PREREQUISITE"})
+                plan.append(InstructionPlanPart(verified, (goal_id,), (goals[goal_id],),
+                                                tuple(section["id"] for section in scope), scope))
+                procedures[goal_id] = (part.file_id, group)
+        by_goal = {goal_id: part for part in plan for goal_id in part.goal_ids}
+        positions = {}
+        ordered_goals = [goal_id for goal_id in goals if goal_id in by_goal]
+        for position, goal_id in enumerate(ordered_goals):
+            key = procedures[goal_id]
+            previous = positions.get(key)
+            if previous is not None and position > previous + 1:
+                grouped = {}
+                for requested_id in goals:
+                    grouped.setdefault(procedures.get(requested_id, ("missing", requested_id)), []).append(requested_id)
+                proposed = tuple(item for group in grouped.values() for item in group)
+                rejected = context.get("rejected_goal_orders", []) if isinstance(context, dict) else []
+                question = ("Связанные действия входят в общие разделы инструкций. "
+                            "Можно выполнить их в предложенном порядке?")
+                if list(proposed) in rejected:
+                    question = "Какую задачу разобрать отдельно первой или нужно оформить заявку?"
+                    proposed = ()
+                sources = tuple({part.approved.document["source"]["file_id"]: part.approved
+                                 for part in by_goal.values()}.values())
+                return InstructionDecision("CLARIFY", question=question, new_request=choice.new_request,
+                                           clarification_kind="USER_GOAL",
+                                           clarification_sources=sources, proposed_goal_order=proposed)
+            positions[key] = position
+        plan = []
+        for goal_id, goal in goals.items():
+            part = by_goal.get(goal_id)
+            if part is None:
+                continue
+            if (plan and plan[-1].approved.document["source"] == part.approved.document["source"]
+                    and plan[-1].sections == part.sections):
+                previous = plan.pop()
+                plan.append(InstructionPlanPart(part.approved, (*previous.goal_ids, goal_id),
+                                                (*previous.goals, goal), part.section_ids, part.sections))
+            else:
+                plan.append(InstructionPlanPart(part.approved, (goal_id,), (goal,),
+                                                part.section_ids, part.sections))
+        return InstructionDecision("PARTIAL" if missing else "MATCH", approved=plan[0].approved,
+                                   understanding=choice.understanding, new_request=choice.new_request,
+                                   covered_goals=tuple(text for key, text in goals.items() if key in covered),
+                                   missing_goals=tuple(text for key, text in goals.items() if key in missing),
+                                   plan=tuple(plan))
 
     @staticmethod
     def _unknown_answers(context):
@@ -698,7 +1119,7 @@ class TalkKnowledge:
             response = client.post(self.base + "/api/v1/retrieval/query/collection", json={
                 "collection_names": list(self.settings.openwebui_knowledge_ids), "query": problem, "k": 8,
                 "hybrid": False,
-            })
+            }, timeout=min(8, self.settings.llm_timeout_seconds))
             response.raise_for_status()
             body = response.json()
         documents, metadata = body.get("documents"), body.get("metadatas")
@@ -732,7 +1153,9 @@ class TalkKnowledge:
             raise KnowledgeUnavailable("InvalidInstructionSelection", "instruction_selection") from None
 
     def _instruction_decision(self, client, choice, files, candidates, budget_limited, discovery_error, requested_goals,
-                              *, source_questions=False, unknown_answers=()):
+                              *, source_questions=False, unknown_answers=(), short_references=False):
+        if choice.parts or choice.section_ids:
+            raise KnowledgeUnavailable("UnexpectedInstructionPlan", "instruction_selection")
         if choice.result != "CLARIFY" and (choice.clarification_sources or choice.clarification_kind):
             raise KnowledgeUnavailable("InvalidSourceClarification", "instruction_selection")
         if choice.result != "RELATED" and choice.alternatives:
@@ -745,7 +1168,8 @@ class TalkKnowledge:
             if (choice.file_id is not None or choice.evidence or choice.question
                     or not ids or len(set(ids)) != len(ids)):
                 raise KnowledgeUnavailable("InvalidInstructionAlternatives", "instruction_selection")
-            approved = tuple(self._verified_instruction(client, item.file_id, item.evidence, files, candidates)
+            approved = tuple(self._verified_instruction(client, item.file_id, item.evidence, files, candidates,
+                                                        short_references=short_references)
                              for item in choice.alternatives)
             _search_event("instruction_selection", outcome="RELATED", candidate_count=len(candidates),
                           alternative_count=len(approved))
@@ -762,7 +1186,8 @@ class TalkKnowledge:
                 if any(question == " ".join(re.sub(r"[^\w\s]", " ", item["question"].casefold().replace("ё", "е")).split())
                        for item in unknown_answers):
                     raise KnowledgeUnavailable("InvalidSourceClarification", "instruction_selection")
-                approved = tuple(self._verified_instruction(client, item.file_id, item.evidence, files, candidates)
+                approved = tuple(self._verified_instruction(client, item.file_id, item.evidence, files, candidates,
+                                                            short_references=short_references)
                                  for item in choice.clarification_sources)
             return InstructionDecision("CLARIFY", question=choice.question, new_request=choice.new_request,
                                        clarification_kind=choice.clarification_kind,
@@ -795,7 +1220,9 @@ class TalkKnowledge:
         return InstructionDecision("MATCH", approved=approved, understanding=choice.understanding,
                                    new_request=choice.new_request)
 
-    def _covered_instruction(self, client, choice, files, candidates, goals):
+    def _covered_instruction(self, client, choice, files, candidates, goals, *, short_references=False):
+        if not short_references and any(item.section_id is not None for item in choice.covered_goals):
+            raise KnowledgeUnavailable("InvalidInstructionCoverage", "instruction_selection")
         covered = [item.goal_id for item in choice.covered_goals]
         missing = choice.missing_goal_ids
         if (not covered or len(set(covered)) != len(covered) or len(set(missing)) != len(missing)
@@ -810,7 +1237,7 @@ class TalkKnowledge:
             raise KnowledgeUnavailable("InstructionEvidenceMismatch", "instruction_selection")
         for item in choice.covered_goals:
             evidence = " ".join(item.evidence.split())
-            if len(evidence) < 20 or evidence not in content:
+            if len(evidence) < (1 if short_references else 20) or evidence not in content:
                 raise KnowledgeUnavailable("InstructionEvidenceMismatch", "instruction_selection")
             if item.support_kind == "TEXT":
                 if item.image_numbers:
@@ -822,7 +1249,8 @@ class TalkKnowledge:
             captions = [" ".join(original.illustrations[number].caption.split()) for number in item.image_numbers]
             if not any(evidence in caption for caption in captions):
                 raise KnowledgeUnavailable("InstructionImageEvidenceMismatch", "instruction_selection")
-        approved = self._verified_instruction(client, choice.file_id, choice.covered_goals[0].evidence, files, candidates)
+        approved = self._verified_instruction(client, choice.file_id, choice.covered_goals[0].evidence, files, candidates,
+                                              short_references=short_references)
         _search_event("instruction_selection", outcome=choice.result, candidate_count=len(candidates),
                       covered_goal_count=len(covered), missing_goal_count=len(missing), selected=True)
         return InstructionDecision(choice.result, approved=approved, understanding=choice.understanding,
@@ -830,14 +1258,14 @@ class TalkKnowledge:
                                    covered_goals=tuple(text for key, text in goals.items() if key in covered),
                                    missing_goals=tuple(text for key, text in goals.items() if key in missing))
 
-    def _verified_instruction(self, client, file_id, evidence, files, candidates):
+    def _verified_instruction(self, client, file_id, evidence, files, candidates, *, short_references=False):
         """Apply the same original-source proof to answers and offered alternatives."""
         if file_id not in files or file_id not in candidates:
             raise KnowledgeUnavailable("InvalidInstructionMatch", "instruction_selection")
         approved = candidates[file_id]
         evidence = " ".join(evidence.split())
         original = " ".join(approved.candidate.content.split())
-        if len(evidence) < 20 or evidence not in original:
+        if len(evidence) < (1 if short_references else 20) or evidence not in original:
             raise KnowledgeUnavailable("InstructionEvidenceMismatch", "instruction_selection")
         current = self._read(client, file_id, self._files(client))
         if current.document["source"] != approved.document["source"]:

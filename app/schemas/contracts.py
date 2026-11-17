@@ -62,9 +62,12 @@ class UnderstandingReply(StrictModel):
 
 class SupportTaskFact(StrictModel):
     key: Literal["equipment_type", "equipment_model", "application", "connection", "completed", "scope",
-                 "error_text", "symptoms", "current_step"]
+                 "error_text", "symptoms", "current_step", "condition"]
     value: str = Field(min_length=1, max_length=200)
     evidence: str = Field(min_length=1, max_length=300)
+    entity: str = Field(default="", max_length=120)
+    attribute: str = Field(default="", max_length=80)
+    negated: StrictBool = False
 
 
 class SupportTaskGoal(StrictModel):

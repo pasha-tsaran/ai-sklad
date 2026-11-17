@@ -411,6 +411,74 @@ def test_a_new_task_cannot_reuse_old_message_evidence():
         }))
 
 
+@pytest.mark.parametrize("returned_ids", [("g1", "g2"), ("g2", "g1"), ("g9", "g9")])
+def test_a_new_task_assigns_fresh_ids_independently_of_the_model_returned_identifiers(returned_ids):
+    previous = compound_task()
+    previous.update(question="Какой режим используется?", question_field="connection")
+    previous = update_task_state("не знаю", previous, previous["question"], UnderstandingModel())
+    previous["source"] = {"file_id": "untrusted-old-source"}
+    unchanged = copy.deepcopy(previous)
+    message = "В программе Вектор хочу открыть корпоративную почту и дождаться первых писем"
+    state = update_task_state(message, previous, "Какой режим используется?", UnderstandingModel({
+        "new_task": True,
+        "facts": [fact("application", "Вектор")],
+        "goals": [goal("Открыть корпоративную почту", "открыть корпоративную почту", returned_ids[0]),
+                  goal("Дождаться первых писем", "дождаться первых писем", returned_ids[1])],
+    }))
+    assert state["goals"] == {
+        "g1": {"text": "Открыть корпоративную почту", "evidence": "открыть корпоративную почту"},
+        "g2": {"text": "Дождаться первых писем", "evidence": "дождаться первых писем"},
+    }
+    assert state["facts"] == [fact("application", "Вектор")]
+    assert state["messages"] == [message] and state["unknown_answers"] == []
+    assert state["new_task"] is True and "source" not in state
+    assert previous == unchanged
+
+
+@pytest.mark.parametrize("reply", [
+    {"facts": [fact("equipment_model", "Zebra DS2208")]},
+    {"goals": [goal("Открыть корпоративную почту", "Настроить почту", "g1")]},
+])
+def test_new_task_id_normalization_keeps_strict_current_message_evidence_validation(reply):
+    previous = compound_task()
+    unchanged = copy.deepcopy(previous)
+    with pytest.raises(ValueError, match="InvalidTaskEvidence"):
+        update_task_state("Хочу открыть корпоративную почту", previous, "", UnderstandingModel({
+            "new_task": True, **reply,
+        }))
+    assert previous == unchanged
+
+
+def test_current_task_still_rejects_a_goal_id_that_was_never_assigned():
+    previous = compound_task()
+    with pytest.raises(ValueError, match="UnknownTaskGoal"):
+        update_task_state("увеличить громкость", previous, "", UnderstandingModel({
+            "goals": [goal("увеличить громкость", "увеличить громкость", "g9")],
+        }))
+
+
+def test_real_task_adapter_can_switch_tasks_when_the_model_reuses_a_prior_goal_identifier():
+    previous = compound_task()
+    message = "Хочу открыть корпоративную почту в новой программе"
+    observed = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        allowed = body["response_format"]["json_schema"]["schema"]["$defs"]["SupportTaskGoal"]["properties"]["goal_id"]
+        assert "g2" in allowed["anyOf"][0]["enum"]
+        observed.append(json.loads(body["messages"][-1]["content"]))
+        reply = {"new_task": True, "goals": [{"goal_id": "g2", "text": "Открыть корпоративную почту",
+                                               "evidence": "открыть корпоративную почту"}]}
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(reply)},
+                                                      "finish_reason": "stop"}]})
+
+    model = OpenWebUILLM(model_settings(), httpx.MockTransport(handler))
+    state = update_task_state(message, previous, "", model)
+    assert len(observed) == 1
+    assert state["goals"] == {"g1": {"text": "Открыть корпоративную почту", "evidence": "открыть корпоративную почту"}}
+    assert state["facts"] == [] and state["messages"] == [message]
+
+
 def test_history_is_bounded_and_retains_current_message():
     state = None
     for number in range(20):
@@ -467,6 +535,48 @@ def test_background_application_is_included_only_when_the_goal_itself_requires_i
         "facts": [fact("application", "1С")], "goals": [goal("В 1С настроить обмен")],
     }))
     assert task_query(state) == "В 1С настроить обмен"
+
+
+def test_connections_of_distinct_devices_and_negative_conditions_survive_followups():
+    message = "Первый терминал по Wi-Fi, второй по USB. Bluetooth не используется. Нужен обмен."
+    first = update_task_state(message, None, "", UnderstandingModel({
+        "facts": [
+            {**fact("connection", "Wi-Fi"), "entity": "Первый терминал"},
+            {**fact("connection", "USB"), "entity": "второй"},
+            {**fact("connection", "Bluetooth", "Bluetooth не используется"), "negated": True},
+        ], "goals": [goal("Нужен обмен")],
+    }))
+    later = update_task_state("На первом теперь кабель USB", first, "", UnderstandingModel({
+        "facts": [{**fact("connection", "USB", "кабель USB"), "entity": "Первый терминал"}],
+    }))
+    assert [(item.get("entity", ""), item["value"], item.get("negated", False))
+            for item in later["facts"]] == [("второй", "USB", False), ("", "Bluetooth", True),
+                                           ("Первый терминал", "USB", False)]
+    query = task_query(later)
+    assert "Не Bluetooth" in query and "Первый терминал" in query and "второй" in query
+    assert later["goals"] == first["goals"]
+
+
+def test_future_properties_preserve_independent_attributes_and_explicit_polarity_changes():
+    state = update_task_state("Папка личная, архив отключён. Нужно открыть отчёт.", None, "", UnderstandingModel({
+        "facts": [{**fact("condition", "личная"), "attribute": "область папки"},
+                  {**fact("condition", "архив", "архив отключён"), "attribute": "режим", "negated": True}],
+        "goals": [goal("открыть отчёт")],
+    }))
+    changed = update_task_state("Теперь архив включён", state, "", UnderstandingModel({
+        "facts": [{**fact("condition", "архив", "архив включён"), "attribute": "режим"}],
+    }))
+    assert changed["facts"] == [state["facts"][0],
+                                 {"key": "condition", "value": "архив", "evidence": "архив включён",
+                                  "attribute": "режим"}]
+    assert "область папки" in task_query(changed) and "Не архив" not in task_query(changed)
+
+
+def test_default_fact_extensions_preserve_preexisting_serialized_shape():
+    state = update_task_state("USB. Открыть папку", None, "", UnderstandingModel({
+        "facts": [fact("connection", "USB")], "goals": [goal("Открыть папку")],
+    }))
+    assert state["facts"] == [{"key": "connection", "value": "USB", "evidence": "USB"}]
 
 
 def test_error_and_followup_messages_retain_the_current_goal_step_and_scope():

@@ -18,6 +18,7 @@ from app.services.llm.openwebui import OpenWebUILLM
 from app.services.nextcloud.account import AccountClient, AccountError
 from app.services.nextcloud.delivery import deliver_one
 from app.services.nextcloud.poller import poll_once
+from app.services.rag.catalog_worker import synchronize_knowledge
 from app.services.nextcloud.progress import recover_progress, tick_progress
 from app.services.nextcloud.typing import NativeTyping
 
@@ -102,9 +103,10 @@ def run(settings, *, once=False):
                     break
             return
         # Slow model calls cannot pause room discovery or the preceding text/photo deliveries.
-        with ThreadPoolExecutor(max_workers=3, thread_name_prefix="talk") as pool, closing(NativeTyping(settings)) as progress_client:
-            polling = processing = progressing = None
+        with ThreadPoolExecutor(max_workers=4, thread_name_prefix="talk") as pool, closing(NativeTyping(settings)) as progress_client:
+            polling = processing = progressing = indexing = None
             next_poll = 0.0
+            next_index = 0.0
             while True:
                 guard.execute(text("SELECT 1"))  # Exit if the singleton lock's session is lost.
                 if polling is not None and polling.done():
@@ -126,6 +128,15 @@ def run(settings, *, once=False):
                     except Exception:
                         pass  # Optional status updates never stop support delivery.
                     progressing = None
+                if indexing is not None and indexing.done():
+                    try:
+                        result = indexing.result()
+                        event("talk.knowledge_index", complete=result.get("complete") is True,
+                              ready=result.get("indexed_count", result.get("ready")), status=result.get("status"))
+                    except Exception as exc:
+                        event("talk.knowledge_index_error", error_code=error_code(exc))
+                    indexing = None
+                    next_index = time.monotonic() + 300
                 if polling is None and time.monotonic() >= next_poll:
                     polling = pool.submit(poll_once, factory, settings)
                 if processing is None:
@@ -134,6 +145,8 @@ def run(settings, *, once=False):
                         processing = pool.submit(process_one, factory, settings, llm, account_id=account_id)
                 if progressing is None:
                     progressing = pool.submit(tick_progress, factory, settings, progress_client)
+                if indexing is None and time.monotonic() >= next_index:
+                    indexing = pool.submit(synchronize_knowledge, factory, settings, refresh=True)
                 deliver_one(factory, settings, delivery_client)
                 time.sleep(0.5)
 

@@ -5,6 +5,7 @@ lists only that exact knowledge route; it never follows collection/search links.
 """
 
 import json
+import math
 from urllib.parse import quote
 from uuid import UUID
 
@@ -79,7 +80,15 @@ def list_knowledge_files(client, base, knowledge_id):
             if file_id in seen:
                 raise KnowledgeFilesError("KnowledgeFilesChangedDuringPagination")
             seen.add(file_id)
-            files.append({"id": file_id, "filename": filename})
+            revision = {}
+            metadata = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+            for key in ("hash", "updated_at", "size", "etag"):
+                value = item.get(key, metadata.get(key))
+                if isinstance(value, str) and len(value) <= 512:
+                    revision[key] = value
+                elif type(value) in {int, float} and math.isfinite(value):
+                    revision[key] = value
+            files.append({"id": file_id, "filename": filename, **revision})
         if len(files) == total:
             return files
     raise KnowledgeFilesError("KnowledgeFilesPaginationLimitExceeded")

@@ -50,7 +50,8 @@ def test_real_v011_items_envelope_reads_all_pages_without_root_directory_filter_
         })
 
     result, requests = run_pages(page)
-    assert result == [{"id": file["id"], "filename": file["filename"]} for file in files]
+    assert result == [{"id": file["id"], "filename": file["filename"], "hash": file["hash"],
+                       "updated_at": file["updated_at"], "size": file["meta"]["size"]} for file in files]
     assert [request.url.params["page"] for request in requests] == ["1", "2", "3"]
     assert all(request.url.host == "webui.example.invalid" for request in requests)
     assert "fixture-owner" not in json.dumps(result) and "data" not in json.dumps(result)

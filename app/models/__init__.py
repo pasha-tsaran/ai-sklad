@@ -23,6 +23,7 @@ from app.models.entities import (
 from app.models.talk import TalkAccount, TalkInbox, TalkRoom
 from app.models.device import DeviceCollection
 from app.models.retrieval import SuccessfulRetrieval
+from app.models.knowledge_index import KnowledgeIndex, KnowledgeIndexImage
 
 __all__ = [
     "AuditEvent",
@@ -37,6 +38,8 @@ __all__ = [
     "Job",
     "KnowledgeChunk",
     "KnowledgeDocument",
+    "KnowledgeIndex",
+    "KnowledgeIndexImage",
     "Message",
     "MessageAttachment",
     "RequestReceipt",

@@ -30,6 +30,28 @@ def replies_since(before, after):
     return assistants(after)[len(assistants(before)):]
 
 
+@pytest.mark.parametrize("error,expected_code", [
+    (ValueError("UnknownTaskGoal"), "UnknownTaskGoal"),
+    (ValueError("InvalidTaskEvidence"), "InvalidTaskEvidence"),
+    (ValueError("Untrusted message with employee@example.test"), "ValueError"),
+    (RuntimeError("Untrusted message with employee@example.test"), "RuntimeError"),
+])
+def test_task_failure_reports_only_known_machine_codes(model_chat, monkeypatch, error, expected_code):
+    chat = model_chat([])
+    chat.talk.settings.talk_confirm_understanding = True
+    failures = []
+    monkeypatch.setattr("app.services.chat.talk_dialogue.report_failure", failures.append)
+
+    def understand(*args):
+        raise error
+
+    chat.model.understand_task = understand
+    result = chat.send("Нужно открыть рабочую программу.")
+    assert any(text == UNAVAILABLE for text, _ in assistants(result))
+    assert [(failure.stage, failure.code) for failure in failures] == [("task_understanding", expected_code)]
+    assert result["flow"]["task_state"]["messages"] == ["Нужно открыть рабочую программу."]
+
+
 CASES = [
     {
         "id": "outlook",
@@ -289,12 +311,22 @@ def test_a_missing_coarse_equipment_type_can_still_be_asked_before_search(model_
     assert not chat.model.calls and not result["attempts"]
 
 
-def test_real_adapter_reference_selection_reaches_durable_original_photo_without_generating_quotes(model_chat):
+@pytest.mark.parametrize("resume_previous_task", [False, True])
+def test_real_adapter_reference_selection_reaches_durable_original_photo_without_generating_quotes(
+    model_chat, resume_previous_task,
+):
     opening = "Нужно впервые подключить рабочую папку в программе ПотокДело."
     caption = "Для первого подключения рабочей папки в ПотокДело выберите пункт «Корпоративная папка» в начальном окне."
     data = instruction([caption], image_data=png("green"))
     chat = model_chat([], rows=[(DOC, "Новый запуск ПотокДело.docx", data)])
     chat.talk.settings.talk_confirm_understanding = True
+    sequence = 1
+    if resume_previous_task:
+        legacy_question(
+            chat, "Нужно уменьшить громкость считывателя.", "Уменьшить громкость считывателя",
+            "уменьшить громкость считывателя", "Какой результат нужен?", application="СтараяПрограмма",
+        )
+        sequence = 2
     calls = []
     selected = {}
 
@@ -308,16 +340,20 @@ def test_real_adapter_reference_selection_reaches_durable_original_photo_without
         if "message" in payload:
             assert payload["message"] == opening
             response = {
+                "new_task": resume_previous_task,
                 "facts": [{"key": "application", "value": "ПотокДело", "evidence": "ПотокДело"},
                           {"key": "scope", "value": "application", "evidence": "в программе ПотокДело"}],
                 "goals": [{"text": "Первое подключение рабочей папки в ПотокДело",
-                           "evidence": "впервые подключить рабочую папку в программе ПотокДело"}],
+                           "evidence": "впервые подключить рабочую папку в программе ПотокДело",
+                           "goal_id": "g1" if resume_previous_task else None}],
                 "question": "Какой протокол доступа использует эта папка — SMB или WebDAV?",
                 "question_field": "connection",
             }
         else:
             assert payload["evidence_references"] is True
             assert payload["source_clarification_required"] is True
+            assert list(payload["requested_goals"].values()) == ["Первое подключение рабочей папки в ПотокДело"]
+            assert "СтараяПрограмма" not in json.dumps(payload, ensure_ascii=False)
             assert "candidate_image_captions" not in payload and "candidate_image_numbers" not in payload
             file_id, registry = next(iter(payload["candidates"].items()))
             evidence_id, proof = next((key, item) for key, item in registry.items()
@@ -337,12 +373,12 @@ def test_real_adapter_reference_selection_reaches_durable_original_photo_without
     chat.model.select_instruction = adapter.select_instruction
     chat.model.supports_source_clarification = True
     chat.model.name = adapter.name
-    pending = chat.send(opening)
+    pending = chat.send(opening, sequence)
     assert len(calls) == 2 and "understanding_confirmation" in pending["flow"]
     assert not pending["attempts"] and not any(photo for _, photo in assistants(pending))
     assert all("SMB" not in text and "WebDAV" not in text and UNAVAILABLE not in text
                for text, _ in assistants(pending))
-    accepted = chat.send("Да, правильно", 2)
+    accepted = chat.send("Да, правильно", sequence + 1)
     assert len(calls) == 2 and len(accepted["attempts"]) == 1
     attempt = accepted["attempts"][0]
     assert selected["text"] in attempt.evidence["content"]
