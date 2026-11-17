@@ -29,6 +29,7 @@ from app.services.chat.talk_dialogue import UNAVAILABLE, process_one
 from app.services.llm.openwebui import OpenWebUILLM
 from app.services.nextcloud.account import AccountClient
 from app.services.nextcloud.inbound_media import parse_inbound_media
+from app.services.nextcloud.interruption import is_resume_request, latest_paused
 from app.services.rag.talk import TalkKnowledge
 
 
@@ -61,11 +62,13 @@ CASES = [
         {"message": "Да, правильно", "source": "24-4_", "photos": True},
     ]},
     {"id": "topic-switch-during-output", "turns": [
-        {"message": "Другая задача. Уменьшить громкость сканера штрихкодов.", "source": "37_", "confirm": True},
-        {"message": "Да, правильно", "wait_delivery": False},
         {"message": "Другая задача. Хочу впервые открыть рабочую почту в Outlook на компьютере.",
          "source": "31_", "confirm": True},
-        {"message": "Да, правильно", "source": "31_", "photos": True},
+        {"message": "Да, правильно", "source": "31_", "wait_delivery": False, "interrupt": True},
+        {"message": "Как уменьшить громкость сканера штрихкодов?",
+         "source": "37_", "confirm": True, "pause_previous": True},
+        {"message": "Да, правильно", "source": "37_", "photos": True, "keep_paused": True},
+        {"message": "Продолжи предыдущий ответ", "source": "31_", "resume_previous": True},
     ]},
 ]
 
@@ -88,7 +91,30 @@ def source_names(flow):
     return list(dict.fromkeys(source["filename"] for source in sources if source.get("filename")))
 
 
-def snapshot(factory, room_id, previous_ids):
+def resumed_delivery_ids(factory, room_id, message):
+    if not is_resume_request(message):
+        return []
+    with factory() as session:
+        room = session.get(TalkRoom, room_id)
+        paused = latest_paused(session, room) if room else None
+        return paused.get("delivery_ids", []) if paused else []
+
+
+def delivery_states(factory, room_id, delivery_ids):
+    with factory() as session:
+        room = session.get(TalkRoom, room_id)
+        check(room is not None, "EvaluationRoomMissing")
+        rows = session.execute(select(Delivery, Message.sequence, Message.content).join(Message).where(
+            Delivery.id.in_(delivery_ids), Delivery.account_id == room.account_id,
+            Delivery.room_token == room.room_token, Message.incident_id == room.incident_id,
+        ).order_by(Message.sequence)).all()
+        return [{"id": row.id, "message_id": row.message_id, "remote_id": row.remote_id,
+                 "status": row.status, "tries": row.tries, "provenance": copy.deepcopy(row.provenance),
+                 "sequence": sequence, "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest()}
+                for row, sequence, content in rows]
+
+
+def snapshot(factory, room_id, previous_ids, *, resumed_ids=()):
     with factory() as session:
         room = session.get(TalkRoom, room_id)
         check(room is not None, "EvaluationRoomMissing")
@@ -96,17 +122,23 @@ def snapshot(factory, room_id, previous_ids):
         rows = session.scalars(select(Message).where(
             Message.incident_id == room.incident_id, Message.role == "assistant",
         ).order_by(Message.sequence)).all()
-        fresh = [row for row in rows if row.id not in previous_ids]
+        resumed_messages = set(session.scalars(select(Delivery.message_id).where(
+            Delivery.id.in_(resumed_ids), Delivery.account_id == room.account_id,
+            Delivery.room_token == room.room_token,
+        )))
+        fresh = [row for row in rows if row.id not in previous_ids or row.id in resumed_messages]
         identifiers = [row.id for row in fresh]
         pictures = session.scalars(select(MessageAttachment).where(
             MessageAttachment.message_id.in_(identifiers), MessageAttachment.content_type == "image/png",
         )).all()
         deliveries = session.scalars(select(Delivery).where(Delivery.message_id.in_(identifiers))).all()
         return {"flow": copy.deepcopy(room.flow or {}), "state": incident.state if incident else None,
-                "texts": [row.content for row in fresh], "sources": source_names(room.flow or {}),
+                "texts": [row.content for row in fresh], "message_ids": identifiers,
+                "sources": source_names(room.flow or {}),
                 "photos": [{"sha256": image.sha256, "message_id": image.message_id} for image in pictures],
-                "deliveries": [{"message_id": row.message_id, "remote_id": row.remote_id,
-                                "status": row.status} for row in deliveries]}
+                "deliveries": [{"id": row.id, "message_id": row.message_id, "remote_id": row.remote_id,
+                                "status": row.status, "provenance": copy.deepcopy(row.provenance)}
+                               for row in deliveries]}
 
 
 def room_message_ids(factory, room_id):
@@ -139,6 +171,7 @@ class ControllerRunner:
 
     def turn(self, message, *, wait_delivery=True):
         previous = room_message_ids(self.factory, self.room_id)
+        resumed_ids = resumed_delivery_ids(self.factory, self.room_id, message)
         self.sequence += 1
         with self.factory() as session, session.begin():
             if self.complete_previous:
@@ -148,7 +181,13 @@ class ControllerRunner:
                                   occurred_at=now()))
         check(process_one(self.factory, self.settings, self.model, account_id=self.account_id), "NoControllerTurn")
         self.complete_previous = wait_delivery
-        return snapshot(self.factory, self.room_id, previous)
+        if wait_delivery:
+            with self.factory() as session, session.begin():
+                session.execute(update(Delivery).where(Delivery.status == "PENDING").values(status="SENT"))
+        return snapshot(self.factory, self.room_id, previous, resumed_ids=resumed_ids)
+
+    def delivery_states(self, delivery_ids):
+        return delivery_states(self.factory, self.room_id, delivery_ids)
 
     def close(self):
         self.engine.dispose()
@@ -191,6 +230,7 @@ class TalkRunner:
 
     def turn(self, message, *, wait_delivery=True):
         previous = room_message_ids(self.factory, self.room_id)
+        resumed_ids = resumed_delivery_ids(self.factory, self.room_id, message)
         remote_id = self.employee.send(self.token, message, "evaluation-" + uuid4().hex,
                                        expected_employee=self.bot_id)
         deadline = time.monotonic() + self.timeout
@@ -202,12 +242,13 @@ class TalkRunner:
                 done = inbox is not None and inbox.status == "DONE"
                 check(inbox is None or inbox.status not in {"FAILED", "IGNORED"}, "TalkInputFailed")
             if done:
-                result = snapshot(self.factory, self.room_id, previous)
+                result = snapshot(self.factory, self.room_id, previous, resumed_ids=resumed_ids)
                 check(all(row["status"] not in {"FAILED", "UNKNOWN"} for row in result["deliveries"]),
                       "TalkDeliveryFailed")
                 if not wait_delivery or all(row["status"] in {"SENT", "CANCELLED", "PAUSED"}
                                             for row in result["deliveries"]):
                     if wait_delivery:
+                        check(all(row["status"] == "SENT" for row in result["deliveries"]), "ReplyNotDelivered")
                         self.verify_photos(result)
                     return result
             time.sleep(1)
@@ -215,6 +256,9 @@ class TalkRunner:
 
     def verify_photos(self, result):
         expected = {row["message_id"]: row["sha256"] for row in result["photos"]}
+        photo_deliveries = [row["message_id"] for row in result["deliveries"] if row["message_id"] in expected]
+        check(len(photo_deliveries) == len(set(photo_deliveries)), "DuplicatePhotoDelivery")
+        check(set(photo_deliveries) == set(expected), "PhotoDeliveryMissing")
         for delivery in result["deliveries"]:
             digest = expected.get(delivery["message_id"])
             if digest is None:
@@ -231,14 +275,29 @@ class TalkRunner:
                                                        media["files"][0], expected_employee=self.bot_id)
             check(hashlib.sha256(photo.data).hexdigest() == digest, "PhotoPixelsChanged")
 
+    def delivery_states(self, delivery_ids):
+        return delivery_states(self.factory, self.room_id, delivery_ids)
+
     def close(self):
         pass
 
 
 def validate_turn(result, expected):
     check(not any(UNAVAILABLE in text for text in result["texts"]), "ServiceErrorReply")
+    if "message_ids" in result:
+        delivered_ids = [row["message_id"] for row in result["deliveries"]]
+        check(len(delivered_ids) == len(set(delivered_ids)), "DuplicateOutputDelivery")
+        check(set(delivered_ids) == set(result["message_ids"]), "OutputDeliveryMissing")
     if expected.get("source"):
         check(any(name.startswith(expected["source"]) for name in result["sources"]), "WrongInstruction")
+        technical = [row for row in result["deliveries"] if row.get("provenance")]
+        check(all(row["provenance"].get("filename", "").startswith(expected["source"])
+                  for row in technical), "WrongDeliveredInstruction")
+        if expected.get("photos") or expected.get("resume_previous") or result["photos"]:
+            check(bool(technical), "InstructionProvenanceMissing")
+            by_message = {row["message_id"]: row for row in result["deliveries"]}
+            check(all(by_message.get(photo["message_id"], {}).get("provenance")
+                      for photo in result["photos"]), "PhotoProvenanceMissing")
     if expected.get("confirm"):
         check(bool(result["flow"].get("understanding_confirmation")), "UnderstandingConfirmationMissing")
     if expected.get("question"):
@@ -251,18 +310,65 @@ def validate_turn(result, expected):
         check(bool(result["flow"].get("task_state", {}).get("unknown_answers")), "UnknownAnswerLost")
 
 
+def validate_interruption(runner, result, expected, interrupted):
+    if expected.get("interrupt"):
+        rows = runner.delivery_states([row["id"] for row in result["deliveries"]])
+        pending = [row["id"] for row in rows if row["status"] == "PENDING"]
+        check(bool(pending), "InterruptionNotObserved")
+        plan = result["flow"].get("instruction_plan", {})
+        check(type(plan.get("cursor")) is int and bool(plan.get("digest")), "InterruptionPlanMissing")
+        return {"original": {row["id"]: row for row in rows}, "pending": pending,
+                "paused": [], "plan": copy.deepcopy(plan)}
+    if not any(expected.get(key) for key in ("pause_previous", "keep_paused", "resume_previous")):
+        return interrupted
+    check(bool(interrupted), "InterruptedResponseMissing")
+    rows = runner.delivery_states(list(interrupted["original"]))
+    current = {row["id"]: row for row in rows}
+    check(set(current) == set(interrupted["original"]), "InterruptedDeliveryMissing")
+    for delivery_id, original in interrupted["original"].items():
+        row = current[delivery_id]
+        check(row["message_id"] == original["message_id"] and row["provenance"] == original["provenance"]
+              and row["sequence"] == original["sequence"]
+              and row["content_sha256"] == original["content_sha256"], "InterruptedOutputChanged")
+        completed = interrupted.get("sent_before_resume", {}).get(delivery_id)
+        if completed or original["status"] == "SENT":
+            completed = completed or original
+            check(row["status"] == "SENT" and row["remote_id"] == completed["remote_id"]
+                  and row["tries"] == completed["tries"], "SentOutputReplayed")
+    if expected.get("pause_previous"):
+        interrupted["paused"] = [delivery_id for delivery_id in interrupted["pending"]
+                                 if current[delivery_id]["status"] == "PAUSED"]
+        check(bool(interrupted["paused"]), "InterruptionNotObserved")
+        check(all(row["status"] != "PENDING" for row in rows), "PreviousOutputStillQueued")
+        interrupted["sent_before_resume"] = {row["id"]: row for row in rows if row["status"] == "SENT"}
+        return interrupted
+    paused = [current[delivery_id] for delivery_id in interrupted["paused"]]
+    check(bool(paused), "InterruptedResponseMissing")
+    if expected.get("keep_paused"):
+        check(all(row["status"] == "PAUSED" and row["remote_id"] is None for row in paused), "PreviousOutputResumedEarly")
+        return interrupted
+    check(all(row["status"] == "SENT" for row in paused), "PreviousOutputNotResumed")
+    check(set(interrupted["paused"]).issubset(row["id"] for row in result["deliveries"]), "ResumedOutputNotObserved")
+    restored = result["flow"].get("instruction_plan", {})
+    check(restored.get("digest") == interrupted["plan"]["digest"]
+          and restored.get("cursor") == interrupted["plan"]["cursor"], "ResumePositionChanged")
+    return interrupted
+
+
 def run_cases(runner, cases, *, progress=None):
     rows = []
     for case in cases:
+        interrupted = None
         for index, turn in enumerate(case["turns"], 1):
             started = time.monotonic()
             row = {"case": case["id"], "turn": index}
             try:
                 result = runner.turn(turn["message"], wait_delivery=turn.get("wait_delivery", True))
                 validate_turn(result, turn)
+                interrupted = validate_interruption(runner, result, turn, interrupted)
                 photo_hashes = [photo["sha256"] for photo in result["photos"]]
                 continuation_count = 0
-                while turn.get("photos") and result["flow"].get("has_more"):
+                while (turn.get("photos") or turn.get("resume_previous")) and result["flow"].get("has_more"):
                     check(continuation_count < 100, "ContinuationLimitExceeded")
                     previous_cursor = result["flow"].get("instruction_plan", {}).get("cursor")
                     result = runner.turn("Продолжить")
@@ -274,6 +380,8 @@ def run_cases(runner, cases, *, progress=None):
                     continuation_count += 1
                 row.update(status="ok", sources=result["sources"], photos=len(photo_hashes),
                            continuations=continuation_count)
+                if turn.get("pause_previous") or turn.get("resume_previous"):
+                    row["paused_deliveries"] = len(interrupted["paused"])
             except Exception as error:
                 code = str(error) if isinstance(error, EvaluationFailure) else type(error).__name__
                 row.update(status="error", error_code=code if re.fullmatch(r"[A-Za-z0-9_]{1,100}", code)
