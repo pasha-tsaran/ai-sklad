@@ -127,6 +127,10 @@ MATCH допустим только при покрытии всех целей 
 части целей верни PARTIAL с одним file_id, покрытыми целями и оставшимися ID.
 Для MATCH/PARTIAL с covered_goals верхнее evidence оставь пустым, question пустым.
 Не выдавай частичную инструкцию как решение всей задачи и не теряй вторую цель.
+Если coverage_retry=true, прежний служебный ответ неверно учёл цели. Исправь
+разбиение тех же requested_goals на covered_goals и missing_goal_ids. Не выдумывай
+подтверждение для заполнения схемы. При отсутствии доказательств верни NO_KNOWLEDGE
+с пустым covered_goals и всеми исходными ID в missing_goal_ids.
 
 CLARIFY означает один короткий вопрос, file_id=null, evidence пустое.
 READ запрашивает точный file_id из каталога, если ещё нужен оригинал. Можно один
@@ -396,6 +400,8 @@ class TalkKnowledge:
                 bounded_context = self._instruction_context(context)
                 requested_goals = self._requested_goals(context)
                 new_request = False
+                coverage_retried = False
+                model_calls = 0
                 for decision_number in range(2):
                     payload = {"actual_problem": problem, "context": bounded_context,
                                "knowledge_ids": list(self.settings.openwebui_knowledge_ids), "catalogue": catalogue,
@@ -406,47 +412,62 @@ class TalkKnowledge:
                                "read_available": decision_number == 0}
                     if isinstance(context, dict) and context.get("clarification_retry") is True:
                         payload["allow_clarification"] = False
+                    if coverage_retried:
+                        payload["coverage_retry"] = True
                     if requested_goals:
                         payload["requested_goals"] = requested_goals
                         payload["candidate_image_numbers"] = {
                             key: list(approved.illustrations) for key, approved in candidates.items()
                         }
-                    payload_chars = len(json.dumps(payload, ensure_ascii=False))
-                    if payload_chars > MAX_SELECTION_PAYLOAD_CHARS:
-                        raise KnowledgeUnavailable("SelectionPayloadTooLarge", "instruction_selection")
-                    _search_event("instruction_selection_request", call_number=decision_number + 1,
-                                  approved_files=len(files), candidate_count=len(candidates),
-                                  catalogue_chars=len(json.dumps(catalogue, ensure_ascii=False)),
-                                  source_chars=sum(len(item.candidate.content) for item in candidates.values()),
-                                  context_chars=len(json.dumps(bounded_context, ensure_ascii=False)),
-                                  payload_chars=payload_chars)
-                    choice = self._instruction_selection(payload)
-                    if choice.result == "CLARIFY" and payload.get("allow_clarification") is False:
-                        raise KnowledgeUnavailable("RepeatedInstructionClarification", "instruction_selection")
-                    new_request = new_request or choice.new_request
-                    if choice.result == "READ":
-                        _search_event("instruction_read_request", call_number=decision_number + 1,
-                                      in_catalogue=choice.file_id in files,
-                                      already_loaded=choice.file_id in candidates,
-                                      extra_fields=bool(choice.evidence or choice.question or choice.alternatives
-                                                        or choice.covered_goals or choice.missing_goal_ids))
-                        if (decision_number or choice.file_id not in files
-                                or choice.evidence or choice.question or choice.alternatives
-                                or choice.covered_goals or choice.missing_goal_ids):
-                            raise KnowledgeUnavailable("InvalidInstructionRead", "instruction_selection")
-                        approved = self._read(client, choice.file_id, files)
-                        if len(approved.candidate.content) > MAX_SELECTION_SOURCE_CHARS:
-                            raise KnowledgeUnavailable("SelectionSourceTooLarge", "instruction_selection")
-                        updated = {**candidates, choice.file_id: approved}
-                        total = sum(len(item.candidate.content) for item in updated.values())
-                        if len(updated) <= MAX_SELECTION_CANDIDATES and total <= MAX_SELECTION_SOURCE_CHARS:
-                            candidates = updated
-                        else:
-                            candidates = {choice.file_id: approved}
-                            budget_limited = budget_limited or total > MAX_SELECTION_SOURCE_CHARS
-                        continue
-                    return self._instruction_decision(client, choice.model_copy(update={"new_request": new_request}),
-                                                      files, candidates, budget_limited, discovery_error, requested_goals)
+                    while True:
+                        payload_chars = len(json.dumps(payload, ensure_ascii=False))
+                        if payload_chars > MAX_SELECTION_PAYLOAD_CHARS:
+                            raise KnowledgeUnavailable("SelectionPayloadTooLarge", "instruction_selection")
+                        model_calls += 1
+                        _search_event("instruction_selection_request", call_number=model_calls,
+                                      approved_files=len(files), candidate_count=len(candidates),
+                                      catalogue_chars=len(json.dumps(catalogue, ensure_ascii=False)),
+                                      source_chars=sum(len(item.candidate.content) for item in candidates.values()),
+                                      context_chars=len(json.dumps(bounded_context, ensure_ascii=False)),
+                                      payload_chars=payload_chars)
+                        choice = self._instruction_selection(payload)
+                        if choice.result == "CLARIFY" and payload.get("allow_clarification") is False:
+                            raise KnowledgeUnavailable("RepeatedInstructionClarification", "instruction_selection")
+                        new_request = new_request or choice.new_request
+                        if choice.result == "READ":
+                            _search_event("instruction_read_request", call_number=model_calls,
+                                          in_catalogue=choice.file_id in files,
+                                          already_loaded=choice.file_id in candidates,
+                                          extra_fields=bool(choice.evidence or choice.question or choice.alternatives
+                                                            or choice.covered_goals or choice.missing_goal_ids))
+                            if (decision_number or choice.file_id not in files
+                                    or choice.evidence or choice.question or choice.alternatives
+                                    or choice.covered_goals or choice.missing_goal_ids):
+                                raise KnowledgeUnavailable("InvalidInstructionRead", "instruction_selection")
+                            approved = self._read(client, choice.file_id, files)
+                            if len(approved.candidate.content) > MAX_SELECTION_SOURCE_CHARS:
+                                raise KnowledgeUnavailable("SelectionSourceTooLarge", "instruction_selection")
+                            updated = {**candidates, choice.file_id: approved}
+                            total = sum(len(item.candidate.content) for item in updated.values())
+                            if len(updated) <= MAX_SELECTION_CANDIDATES and total <= MAX_SELECTION_SOURCE_CHARS:
+                                candidates = updated
+                            else:
+                                candidates = {choice.file_id: approved}
+                                budget_limited = budget_limited or total > MAX_SELECTION_SOURCE_CHARS
+                            break
+                        try:
+                            return self._instruction_decision(
+                                client, choice.model_copy(update={"new_request": new_request}),
+                                files, candidates, budget_limited, discovery_error, requested_goals,
+                            )
+                        except KnowledgeUnavailable as error:
+                            if error.code != "InvalidInstructionCoverage" or not requested_goals:
+                                raise
+                            self._coverage_error(choice, requested_goals, coverage_retried)
+                            if coverage_retried:
+                                raise
+                            coverage_retried = True
+                            payload = {**payload, "coverage_retry": True}
                 raise KnowledgeUnavailable("InstructionReadLimitExceeded", "instruction_selection")
         except KnowledgeUnavailable as error:
             report_failure(error)
@@ -455,6 +476,16 @@ class TalkKnowledge:
             failure = KnowledgeUnavailable(type(error).__name__, "instruction_selection")
             report_failure(failure)
             raise failure from None
+
+    @staticmethod
+    def _coverage_error(choice, goals, retried):
+        covered = [item.goal_id for item in choice.covered_goals]
+        missing = choice.missing_goal_ids
+        _search_event("instruction_coverage_error", outcome=choice.result, expected_goal_count=len(goals),
+                      covered_goal_count=len(covered), missing_goal_count=len(missing), retry_used=retried,
+                      unknown_goal_ids=bool((set(covered) | set(missing)) - set(goals)),
+                      overlapping_goals=bool(set(covered) & set(missing)),
+                      duplicate_goals=len(covered) != len(set(covered)) or len(missing) != len(set(missing)))
 
     @staticmethod
     def _requested_goals(context):
@@ -487,13 +518,13 @@ class TalkKnowledge:
                  if _uuid(shown.get("file_id")) and isinstance(shown.get("filename"), str)
                  and allowed_source_filename(shown["filename"]) else {})
         fields = [
-            ("task_state", context.get("task_state")),
             ("current_message", context.get("current_message")),
+            ("shown_source", shown),
+            ("active_task", context.get("active_task")),
+            ("task_state", context.get("task_state")),
             ("answered_questions", [question[:300] for question in context.get("answered_questions", [])[-8:]
                                     if isinstance(question, str) and question.strip()]
              if isinstance(context.get("answered_questions"), list) else []),
-            ("active_task", context.get("active_task")),
-            ("shown_source", shown),
             ("previous_question", context.get("previous_question")),
             ("technical_facts", facts),
             ("verified_previous_source", {"file_id": previous_id} if _uuid(previous_id) else {}),
@@ -525,6 +556,8 @@ class TalkKnowledge:
     def _instruction_candidates(self, client, problem, context, files):
         previous = context.get("verified_previous_source", {}) if isinstance(context, dict) else {}
         previous_id = previous.get("file_id") if isinstance(previous, dict) else None
+        shown = context.get("shown_source", {}) if isinstance(context, dict) else {}
+        shown_id = shown.get("file_id") if isinstance(shown, dict) else None
         discovery_error = None
         if len(files) <= MAX_SELECTION_CANDIDATES:
             selected = list(files)
@@ -546,8 +579,8 @@ class TalkKnowledge:
                 discovery_error = error
                 vector_ids = []
             selected = list(dict.fromkeys(scanner_ids + vector_ids + named_ids))
-        if previous_id in files:
-            selected = list(dict.fromkeys([previous_id] + selected))
+        hints = [key for key in (shown_id, previous_id) if isinstance(key, str) and key in files]
+        selected = list(dict.fromkeys(hints + selected))
         originals, total = {}, 0
         # A ranked window is ordinary retrieval. The model still receives the
         # complete permitted catalogue and can request one other original.
@@ -625,8 +658,13 @@ class TalkKnowledge:
         if choice.result == "NO_KNOWLEDGE":
             if choice.file_id is not None or choice.evidence or choice.question:
                 raise KnowledgeUnavailable("InvalidInstructionAbsence", "instruction_selection")
-            if (choice.covered_goals or len(choice.missing_goal_ids) != len(requested_goals)
-                    or set(choice.missing_goal_ids) != set(requested_goals)):
+            missing = choice.missing_goal_ids
+            if not missing and not choice.covered_goals:
+                # Absence cannot authorize any action. An omitted accounting
+                # field means every requested goal is still unsupported.
+                missing = list(requested_goals)
+            if (choice.covered_goals or len(missing) != len(requested_goals)
+                    or set(missing) != set(requested_goals)):
                 raise KnowledgeUnavailable("InvalidInstructionCoverage", "instruction_selection")
             if budget_limited:
                 raise KnowledgeUnavailable("SelectionBudgetIncomplete", "instruction_selection")

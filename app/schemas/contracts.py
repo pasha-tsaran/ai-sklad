@@ -61,7 +61,8 @@ class UnderstandingReply(StrictModel):
 
 
 class SupportTaskFact(StrictModel):
-    key: Literal["equipment_type", "equipment_model", "application", "connection", "completed", "scope"]
+    key: Literal["equipment_type", "equipment_model", "application", "connection", "completed", "scope",
+                 "error_text", "symptoms", "current_step"]
     value: str = Field(min_length=1, max_length=200)
     evidence: str = Field(min_length=1, max_length=300)
 
@@ -79,7 +80,8 @@ class SupportTaskUnderstanding(StrictModel):
     replace_goals: StrictBool = False
     replacement_evidence: str = Field(default="", max_length=300)
     question: str = Field(default="", max_length=300)
-    question_field: Literal["equipment_type", "goal", "connection", "application", "symptoms", "other"] | None = None
+    question_field: Literal["equipment_type", "goal", "connection", "application", "symptoms",
+                            "error_text", "current_step", "other"] | None = None
 
 
 class FollowupResult(StrictModel):

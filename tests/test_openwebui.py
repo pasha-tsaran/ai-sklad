@@ -306,6 +306,35 @@ def test_selection_rejects_candidate_outside_the_catalogue_before_sending():
         model.select_instruction({"catalogue": {}, "candidates": {"outside": "Чужой источник"}})
 
 
+@pytest.mark.parametrize("with_goals", [False, True])
+@pytest.mark.parametrize("availability", [None, True, False, "false", 0])
+def test_instruction_schema_disallows_another_read_only_after_explicit_budget_exhaustion(with_goals, availability):
+    from app.services.rag.talk import InstructionSelection
+
+    file_id = "00000000-0000-4000-8000-000000000001"
+    payload = {"catalogue": {file_id: "Материал.md"}, "candidates": {file_id: "Исходный текст."}}
+    if availability is not None:
+        payload["read_available"] = availability
+    if with_goals:
+        payload["requested_goals"] = {"g1": "Сбросить настройки"}
+
+    def handler(request):
+        body = json.loads(request.content)
+        schema = body["response_format"]["json_schema"]["schema"]
+        outcomes = schema["properties"]["result"]["enum"]
+        assert ("READ" in outcomes) is (availability is not False)
+        assert ("PARTIAL" in outcomes) is with_goals
+        assert ("covered_goals" in schema["properties"]) is with_goals
+        assert ("covered_goals" in schema.get("required", [])) is with_goals
+        assert ("missing_goal_ids" in schema.get("required", [])) is with_goals
+        assert body["max_tokens"] == (768 if with_goals else 512)
+        return httpx.Response(200, json={"choices": [{"message": {"content": '{"result":"NO_KNOWLEDGE"}'}}]})
+
+    result = OpenWebUILLM(settings(), httpx.MockTransport(handler)).select_instruction(payload)
+    assert result.result == "NO_KNOWLEDGE"
+    assert "READ" in InstructionSelection.model_json_schema()["properties"]["result"]["enum"]
+
+
 @pytest.mark.parametrize("value,expected", [(None, None), ("", None), ("16384", 16384)])
 def test_optional_context_window_accepts_unset_compose_value_and_explicit_size(value, expected):
     configured = Settings(openwebui_num_ctx=value, _env_file=None)

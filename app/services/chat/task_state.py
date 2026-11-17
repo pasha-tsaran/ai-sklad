@@ -54,6 +54,15 @@ def _evidenced(evidence, authority):
     return bool(evidence) and any(evidence in message for message in authority)
 
 
+def remember_task_message(message, previous=None):
+    """Retain employee wording after a failed model call without accepting new facts."""
+    if not isinstance(message, str) or not message.strip() or len(message) > 6000:
+        raise ValueError("InvalidTaskMessage")
+    state = _previous_state(previous)
+    state["messages"] = _history(state["messages"], message)
+    return state
+
+
 def update_task_state(message, previous, previous_question, llm):
     """Merge validated deltas; documents and assistant questions cannot supply facts."""
     if not isinstance(message, str) or not message.strip() or len(message) > 6000:
@@ -100,7 +109,12 @@ def update_task_state(message, previous, previous_question, llm):
         updated_goal_ids.append(goal_id)
     if existing.keys() <= set(updated_goal_ids):
         goals = {goal_id: goals[goal_id] for goal_id in updated_goal_ids}
-    if len(state["facts"]) > 12 or len(goals) > 8:
+    while len(state["facts"]) > 12:
+        completed = next((index for index, item in enumerate(state["facts"]) if item["key"] == "completed"), None)
+        if completed is None:
+            raise ValueError("TaskStateTooLarge")
+        state["facts"].pop(completed)
+    if len(goals) > 8:
         raise ValueError("TaskStateTooLarge")
     state.update({"goals": goals, "messages": _history(state["messages"], message),
                   "question": update.question, "question_field": update.question_field,
@@ -109,8 +123,14 @@ def update_task_state(message, previous, previous_question, llm):
 
 
 def task_query(state):
-    """Retrieve the desired work, excluding already completed setup and background apps."""
+    """Retrieve current work and reported conditions without completed setup steps."""
     task = _previous_state(state)
     parts = [fact["value"] for fact in task["facts"] if fact["key"] in {"equipment_type", "equipment_model"}]
+    software = any(fact["key"] == "scope" and fact["value"] in {"application", "software"}
+                   for fact in task["facts"])
+    if software:
+        parts += [fact["value"] for fact in task["facts"] if fact["key"] == "application"]
     parts += [goal["text"] for goal in task["goals"].values()]
+    parts += [fact["value"] for fact in task["facts"]
+              if fact["key"] in {"connection", "current_step", "error_text", "symptoms"}]
     return "\n".join(dict.fromkeys(parts))

@@ -50,6 +50,8 @@ class OpenWebUILLM:
                 goal_ids = list(payload["requested_goals"])
                 coverage["properties"]["goal_id"]["enum"] = goal_ids
                 selection_schema["properties"]["missing_goal_ids"]["items"]["enum"] = goal_ids
+                selection_schema["required"] = [*selection_schema.get("required", []),
+                                                "covered_goals", "missing_goal_ids"]
             task_goal = selection_schema.get("$defs", {}).get("SupportTaskGoal")
             if task_goal:
                 goal_ids = list(payload.get("previous_state", {}).get("goals", {}))
@@ -59,6 +61,10 @@ class OpenWebUILLM:
                 )
             if payload.get("allow_clarification") is False and "result" in selection_schema["properties"]:
                 selection_schema["properties"]["result"]["enum"].remove("CLARIFY")
+            if payload.get("read_available") is False and "result" in selection_schema["properties"]:
+                outcomes = selection_schema["properties"]["result"].get("enum", [])
+                if "READ" in outcomes:
+                    outcomes.remove("READ")
         # LangChain orchestrates prompt -> existing internal transport -> strict validation.
         # No cloud model, autonomous tools or external memory service is introduced.
         request_options = {"selection_schema": selection_schema}

@@ -9,7 +9,7 @@ from pydantic import ValidationError
 
 from app.core.config import Settings
 from app.schemas.contracts import SupportTaskUnderstanding
-from app.services.chat.task_state import task_query, update_task_state
+from app.services.chat.task_state import remember_task_message, task_query, update_task_state
 from app.services.llm.openwebui import OpenWebUILLM
 from app.services.llm.prompts import SUPPORT_TASK_TASK
 
@@ -189,6 +189,37 @@ def test_history_is_bounded_and_retains_current_message():
     assert state["messages"] == ["я" * 6000]
 
 
+def test_failure_memory_preserves_employee_wording_without_changing_facts_or_goals():
+    previous = compound_task()
+    unchanged = copy.deepcopy(previous)
+    state = remember_task_message("На 4 шаге неверный пароль", previous)
+    assert state["messages"] == [*previous["messages"], "На 4 шаге неверный пароль"]
+    assert state["facts"] == previous["facts"] and state["goals"] == previous["goals"]
+    assert previous == unchanged and state["new_task"] is False
+    continued = update_task_state("причем в браузере зашел нормально", state, "", UnderstandingModel({
+        "facts": [fact("error_text", "неверный пароль"),
+                   fact("completed", "В браузере вход выполнен", "в браузере зашел нормально")],
+    }))
+    assert any(item["key"] == "error_text" for item in continued["facts"])
+    assert continued["goals"] == previous["goals"]
+
+
+def test_failure_memory_is_bounded_and_accepts_an_empty_previous_state():
+    state = None
+    for number in range(20):
+        message = f"Ошибка {number} " + "я" * 600
+        state = remember_task_message(message, state)
+        assert len(state["messages"]) <= 12 and sum(map(len, state["messages"])) <= 6000
+        assert state["messages"][-1] == message
+        assert state["facts"] == [] and state["goals"] == {}
+
+
+@pytest.mark.parametrize("message", [None, "", "  ", "я" * 6001], ids=["null", "empty", "blank", "oversized"])
+def test_failure_memory_rejects_invalid_messages(message):
+    with pytest.raises(ValueError, match="InvalidTaskMessage"):
+        remember_task_message(message)
+
+
 def test_validated_fact_evidence_survives_pruned_message_history():
     previous = compound_task()
     previous["messages"] = ["Более позднее уточнение"]
@@ -203,6 +234,86 @@ def test_background_application_is_included_only_when_the_goal_itself_requires_i
         "facts": [fact("application", "1С")], "goals": [goal("В 1С настроить обмен")],
     }))
     assert task_query(state) == "В 1С настроить обмен"
+
+
+def test_error_and_followup_messages_retain_the_current_goal_step_and_scope():
+    messages = [
+        "Нужно загрузить файл в Nextcloud",
+        "На 4 шаге выдает ошибку",
+        "неверный пароль",
+        "причем в браузере зашел нормально",
+        "Я же писал уже тебе что нужно сделать, все то же самое",
+    ]
+    model = UnderstandingModel(
+        {"facts": [fact("application", "Nextcloud"), fact("scope", "application", "загрузить файл в Nextcloud")],
+         "goals": [goal("Загрузить файл в Nextcloud", "загрузить файл в Nextcloud")]},
+        {"facts": [fact("current_step", "Шаг 4", "4 шаге"),
+                   fact("symptoms", "Ошибка при загрузке файла", messages[1])],
+         "question": "Какой текст ошибки появляется на этом шаге?", "question_field": "error_text"},
+        {"facts": [fact("error_text", "неверный пароль")]},
+        {"facts": [fact("completed", "В браузере вход выполнен", "в браузере зашел нормально")]},
+        {},
+    )
+    state = None
+    for message in messages:
+        state = update_task_state(message, state, state["question"] if state else "", model)
+        assert state["new_task"] is False
+    assert state["goals"] == {
+        "g1": {"text": "Загрузить файл в Nextcloud", "evidence": "загрузить файл в Nextcloud"},
+    }
+    values = {item["key"]: item["value"] for item in state["facts"]}
+    assert values["scope"] == "application"
+    assert values["current_step"] == "Шаг 4" and values["error_text"] == "неверный пароль"
+    assert values["completed"] == "В браузере вход выполнен"
+    query = task_query(state)
+    assert "Nextcloud" in query and "Загрузить файл" in query
+    assert "Шаг 4" in query and "неверный пароль" in query
+    assert "Ошибка при загрузке файла" in query and "В браузере вход выполнен" not in query
+    assert state["messages"] == messages
+
+
+@pytest.mark.parametrize("scope,include_application", [("application", True), ("software", True), ("hardware", False)])
+def test_query_uses_application_only_for_software_scope(scope, include_application):
+    state = update_task_state("В программе Альфа нужно изменить громкость", None, "", UnderstandingModel({
+        "facts": [fact("application", "Альфа"), fact("scope", scope, "изменить громкость")],
+        "goals": [goal("изменить громкость")],
+    }))
+    assert ("Альфа" in task_query(state)) is include_application
+
+
+def test_error_and_current_step_are_replaced_only_by_new_reported_values():
+    state = update_task_state("На шаге 4 ошибка доступа", None, "", UnderstandingModel({
+        "facts": [fact("current_step", "шаг 4", "шаге 4"), fact("error_text", "ошибка доступа")],
+    }))
+    state = update_task_state("Теперь шаг 5, файл не найден", state, "", UnderstandingModel({
+        "facts": [fact("current_step", "шаг 5"), fact("error_text", "файл не найден")],
+    }))
+    assert [item["key"] for item in state["facts"]] == ["current_step", "error_text"]
+    assert "ошибка доступа" not in task_query(state) and "шаг 4" not in task_query(state)
+    assert "файл не найден" in task_query(state) and "шаг 5" in task_query(state)
+
+
+def test_assistant_question_cannot_supply_an_unreported_error():
+    with pytest.raises(ValueError, match="InvalidTaskEvidence"):
+        update_task_state("Не получилось", None, "Ошибка «неверный пароль»?", UnderstandingModel({
+            "facts": [fact("error_text", "неверный пароль")],
+        }))
+
+
+def test_latest_error_can_replace_old_completed_history_when_fact_budget_is_full():
+    previous = {"facts": [fact("application", "Nextcloud"), fact("scope", "application"),
+                           fact("current_step", "Шаг 4")]
+                + [fact("completed", f"Проверка {number} выполнена") for number in range(9)],
+                "goals": {"g1": {"text": "Загрузить файл", "evidence": "Загрузить файл"}},
+                "messages": ["Загрузить файл"]}
+    unchanged = copy.deepcopy(previous)
+    state = update_task_state("неверный пароль", previous, "Какой текст ошибки?", UnderstandingModel({
+        "facts": [fact("error_text", "неверный пароль")],
+    }))
+    assert len(state["facts"]) == 12
+    assert any(item["key"] == "error_text" and item["value"] == "неверный пароль" for item in state["facts"])
+    assert not any(item["value"] == "Проверка 0 выполнена" for item in state["facts"])
+    assert state["goals"] == previous["goals"] and previous == unchanged
 
 
 @pytest.mark.parametrize("message", [None, "", "  ", "я" * 6001], ids=["null", "empty", "blank", "oversized"])

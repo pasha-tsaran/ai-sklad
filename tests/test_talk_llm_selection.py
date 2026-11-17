@@ -922,6 +922,169 @@ def test_absence_accounts_for_every_requested_goal_without_inventing_a_source():
         knowledge.search_with_llm("Сброс и громкость", {"requested_goals": REQUESTED_GOALS})
 
 
+@pytest.mark.parametrize("accounting", [{}, {"missing_goal_ids": []}])
+def test_absence_without_optional_goal_accounting_preserves_all_unresolved_goals(accounting):
+    knowledge, _, calls = selection_store()
+    knowledge.selector = lambda payload: calls.append(payload) or {"result": "NO_KNOWLEDGE", **accounting}
+    result = knowledge.search_with_llm("QR-сканер: сброс и громкость", {"requested_goals": REQUESTED_GOALS})
+    assert result.result == "NO_KNOWLEDGE"
+    assert result.approved is None and result.alternatives == () and result.covered_goals == ()
+    assert result.missing_goals == (RESET_GOAL, VOLUME_GOAL)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("missing", [["reset"], ["reset", "unknown"], ["reset", "reset", "volume"]])
+def test_explicit_incorrect_absence_accounting_is_not_normalized(missing):
+    knowledge, _, _ = selection_store()
+    knowledge.selector = lambda payload: {"result": "NO_KNOWLEDGE", "missing_goal_ids": missing}
+    with pytest.raises(KnowledgeUnavailable, match="InvalidInstructionCoverage"):
+        knowledge.search_with_llm("Сброс и громкость", {"requested_goals": REQUESTED_GOALS})
+
+
+@pytest.mark.parametrize("contradiction,error", [
+    ({"file_id": DOC}, "InvalidInstructionAbsence"),
+    ({"evidence": EVIDENCE}, "InvalidInstructionAbsence"),
+    ({"question": "Какое устройство?"}, "InvalidInstructionAbsence"),
+    ({"covered_goals": [goal_coverage("volume", VOLUME_EVIDENCE)]}, "InvalidInstructionCoverage"),
+])
+def test_absence_accounting_inference_cannot_hide_a_contradictory_instruction(contradiction, error):
+    knowledge, _, _ = selection_store()
+    knowledge.selector = lambda payload: {"result": "NO_KNOWLEDGE", **contradiction}
+    with pytest.raises(KnowledgeUnavailable, match=error):
+        knowledge.search_with_llm("Сброс и громкость", {"requested_goals": REQUESTED_GOALS})
+
+
+@pytest.mark.parametrize("failure", ["budget", "retrieval"])
+def test_inferred_absence_still_requires_complete_retrieval(failure):
+    knowledge, _, _ = selection_store()
+    candidates = knowledge._instruction_candidates
+
+    def incomplete(client, problem, context, files):
+        originals, _, _ = candidates(client, problem, context, files)
+        discovery_error = KnowledgeUnavailable("RequestTimedOut", "retrieval") if failure == "retrieval" else None
+        return originals, failure == "budget", discovery_error
+
+    knowledge._instruction_candidates = incomplete
+    knowledge.selector = lambda payload: {"result": "NO_KNOWLEDGE"}
+    with pytest.raises(KnowledgeUnavailable, match="RequestTimedOut" if failure == "retrieval" else "SelectionBudgetIncomplete"):
+        knowledge.search_with_llm("Сброс QR-сканера", {"requested_goals": {"reset": RESET_GOAL}})
+
+
+@pytest.mark.parametrize("final_result", ["MATCH", "NO_KNOWLEDGE"])
+def test_malformed_goal_coverage_gets_one_source_preserving_format_repair(final_result):
+    knowledge, _, _ = selection_store()
+    calls = []
+    responses = [{"result": "MATCH", "file_id": DOC}]
+    responses.append(goal_selection("MATCH", [
+        goal_coverage("volume", EVIDENCE, support_kind="TEXT", image_numbers=[]),
+    ]) if final_result == "MATCH" else {"result": "NO_KNOWLEDGE"})
+
+    def select(payload):
+        calls.append(copy.deepcopy(payload))
+        return responses.pop(0)
+
+    knowledge.selector = select
+    result = knowledge.search_with_llm("Изменить громкость", {"requested_goals": {"volume": VOLUME_GOAL}})
+    assert result.result == final_result and len(calls) == 2
+    assert calls[1]["coverage_retry"] is True and "coverage_retry" not in calls[0]
+    assert calls[1]["catalogue"] == calls[0]["catalogue"]
+    assert calls[1]["candidates"] == calls[0]["candidates"]
+    assert calls[1]["requested_goals"] == calls[0]["requested_goals"]
+    assert (result.approved is not None) is (final_result == "MATCH")
+
+
+def test_persistent_malformed_coverage_stops_after_one_repair_and_logs_only_counts(caplog):
+    knowledge, _, _ = selection_store()
+    calls = []
+
+    def select(payload):
+        calls.append(payload)
+        return goal_selection("MATCH", [
+            goal_coverage("PRIVATE-GOAL", EVIDENCE, support_kind="TEXT", image_numbers=[]),
+        ], ["PRIVATE-GOAL", "PRIVATE-GOAL"])
+
+    knowledge.selector = select
+    with caplog.at_level("INFO", logger="ai-support"):
+        with pytest.raises(KnowledgeUnavailable, match="InvalidInstructionCoverage"):
+            knowledge.search_with_llm("PRIVATE-PROBLEM", {"requested_goals": {"volume": VOLUME_GOAL}})
+    assert len(calls) == 2
+    records = [record.fields for record in caplog.records if record.message == "talk.knowledge_search"
+               and record.fields.get("stage") == "instruction_coverage_error"]
+    assert len(records) == 2 and [row["retry_used"] for row in records] == [False, True]
+    assert all(row["expected_goal_count"] == 1 and row["covered_goal_count"] == 1
+               and row["missing_goal_count"] == 2 and row["unknown_goal_ids"]
+               and row["overlapping_goals"] and row["duplicate_goals"] for row in records)
+    assert "PRIVATE-" not in json.dumps(records) and EVIDENCE not in json.dumps(records, ensure_ascii=False)
+
+
+@pytest.mark.parametrize("read_first", [False, True])
+def test_format_repair_and_original_read_share_a_three_call_limit(read_first):
+    knowledge, _ = large_catalogue()
+    calls = []
+    malformed = {"result": "MATCH", "file_id": OTHER}
+    read = {"result": "READ", "file_id": OTHER}
+    responses = [read, malformed] if read_first else [malformed, read]
+    responses.append({"result": "MATCH", "file_id": OTHER, "covered_goals": [
+        goal_coverage("volume", EVIDENCE, support_kind="TEXT", image_numbers=[]),
+    ]})
+
+    def select(payload):
+        calls.append(copy.deepcopy(payload))
+        return responses.pop(0)
+
+    knowledge.selector = select
+    result = knowledge.search_with_llm("Настроить звук", {"requested_goals": {"volume": VOLUME_GOAL}})
+    assert result.result == "MATCH" and result.approved.document["source"]["file_id"] == OTHER
+    assert len(calls) == 3 and calls[-1]["read_available"] is False
+    assert calls[-1]["coverage_retry"] is True
+
+
+def test_format_repair_never_retries_an_original_evidence_failure():
+    knowledge, _, _ = selection_store()
+    calls = []
+    knowledge.selector = lambda payload: calls.append(payload) or goal_selection("MATCH", [
+        goal_coverage("volume", "Этой цитаты нет в оригинале инструкции.", support_kind="TEXT", image_numbers=[]),
+    ])
+    with pytest.raises(KnowledgeUnavailable, match="InstructionEvidenceMismatch"):
+        knowledge.search_with_llm("Изменить громкость", {"requested_goals": {"volume": VOLUME_GOAL}})
+    assert len(calls) == 1
+
+
+def test_current_source_hint_is_loaded_before_optional_index_hits_and_still_needs_proof():
+    knowledge, _ = large_catalogue()
+    calls = []
+    knowledge.selector = lambda payload: calls.append(payload) or match(OTHER)
+    source = {"file_id": OTHER, "filename": "Другой документ.md"}
+    result = knowledge.search_with_llm("На четвёртом шаге ошибка", {"shown_source": source})
+    assert result.result == "MATCH" and result.approved.document["source"]["file_id"] == OTHER
+    assert list(calls[0]["candidates"])[0] == OTHER
+    assert calls[0]["context"]["shown_source"] == source
+
+
+def test_current_source_hint_cannot_load_an_original_outside_the_allowed_catalogue():
+    knowledge, state, calls = selection_store()
+    result = knowledge.search_with_llm("Ошибка на четвёртом шаге", {
+        "shown_source": {"file_id": OTHER, "filename": "Другой документ.md"},
+    })
+    assert result.result == "MATCH" and result.approved.document["source"]["file_id"] == DOC
+    assert set(calls[0]["candidates"]) == {DOC}
+    assert not any(OTHER in request.url.path for request in state["calls"])
+
+
+def test_long_task_state_does_not_displace_current_source_or_latest_error():
+    knowledge, _, _ = selection_store()
+    source = {"file_id": DOC, "filename": "Параметры устройства.docx"}
+    bounded = knowledge._instruction_context({
+        "shown_source": source, "active_task": "Загрузить файл в приложение",
+        "current_message": "Неверный пароль при загрузке, в браузере вход работает",
+        "task_state": {"facts": ["старый контекст" * 500]},
+    })
+    assert bounded["shown_source"] == source
+    assert bounded["current_message"] == "Неверный пароль при загрузке, в браузере вход работает"
+    assert bounded["active_task"] == "Загрузить файл в приложение"
+    assert "task_state" not in bounded
+
+
 @pytest.mark.parametrize("goals", [[], {"": "Цель"}, {"goal": ""}, {"goal": "x" * 301}, {"goal": "a\nb"},
                                   {"goal": None}, {"цель": "Цель"}, {str(index): "Цель" for index in range(9)}])
 def test_invalid_requested_goals_fail_before_any_model_selection(goals):
