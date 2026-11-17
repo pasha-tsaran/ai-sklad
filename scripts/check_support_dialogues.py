@@ -260,7 +260,20 @@ def run_cases(runner, cases, *, progress=None):
             try:
                 result = runner.turn(turn["message"], wait_delivery=turn.get("wait_delivery", True))
                 validate_turn(result, turn)
-                row.update(status="ok", sources=result["sources"], photos=len(result["photos"]))
+                photo_hashes = [photo["sha256"] for photo in result["photos"]]
+                continuation_count = 0
+                while turn.get("photos") and result["flow"].get("has_more"):
+                    check(continuation_count < 100, "ContinuationLimitExceeded")
+                    previous_cursor = result["flow"].get("instruction_plan", {}).get("cursor")
+                    result = runner.turn("Продолжить")
+                    validate_turn(result, {"source": turn.get("source")})
+                    current_cursor = result["flow"].get("instruction_plan", {}).get("cursor")
+                    check(type(previous_cursor) is int and type(current_cursor) is int
+                          and current_cursor > previous_cursor, "InstructionProgressStalled")
+                    photo_hashes.extend(photo["sha256"] for photo in result["photos"])
+                    continuation_count += 1
+                row.update(status="ok", sources=result["sources"], photos=len(photo_hashes),
+                           continuations=continuation_count)
             except Exception as error:
                 code = str(error) if isinstance(error, EvaluationFailure) else type(error).__name__
                 row.update(status="error", error_code=code if re.fullmatch(r"[A-Za-z0-9_]{1,100}", code)

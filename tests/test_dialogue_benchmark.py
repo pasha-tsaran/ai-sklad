@@ -59,6 +59,35 @@ def test_benchmark_stops_the_failed_case_and_keeps_report_free_of_private_text()
     assert "private" not in json.dumps(report)
 
 
+def test_benchmark_completes_every_selected_batch_before_the_next_scenario():
+    class Runner:
+        mode = "real_qwen_controller"
+
+        def __init__(self):
+            self.calls = []
+
+        def turn(self, text, **options):
+            self.calls.append(text)
+            more = len(self.calls) == 1
+            return result(flow={"has_more": more, "instruction_plan": {"cursor": len(self.calls)}},
+                          sources=["31_Example.docx"], photos=[{"sha256": str(len(self.calls))}])
+
+    runner = Runner()
+    report = run_cases(runner, [{"id": "full-guide", "turns": [{"message": "question", "photos": True,
+                                                                  "source": "31_"}]}])
+    assert runner.calls == ["question", "Продолжить"]
+    assert report["status"] == "ok" and report["turns"][0]["photos"] == 2
+    assert report["turns"][0]["continuations"] == 1
+
+
+def test_benchmark_rejects_restarted_or_stalled_step_progress():
+    runner = SimpleNamespace(mode="real_qwen_controller", turn=lambda *args, **kwargs: result(
+        flow={"has_more": True, "instruction_plan": {"cursor": 3}}, photos=[{"sha256": "image"}],
+    ))
+    report = run_cases(runner, [{"id": "stalled-guide", "turns": [{"message": "question", "photos": True}]}])
+    assert report["status"] == "error" and report["turns"][0]["error_code"] == "InstructionProgressStalled"
+
+
 def test_controller_benchmark_uses_an_isolated_database_and_the_production_entry_point(monkeypatch):
     monkeypatch.setattr("scripts.check_support_dialogues.OpenWebUILLM", lambda settings: MockLLM())
     settings = Settings(_env_file=None, database_url="postgresql://production-is-never-opened",
