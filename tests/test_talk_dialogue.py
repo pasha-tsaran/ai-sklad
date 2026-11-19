@@ -14,7 +14,7 @@ from app.models.talk import TalkAccount, TalkInbox, TalkRoom
 from app.schemas.contracts import AnalysisResult, DialogueResult
 from app.services.chat.talk_dialogue import (
     BACK_TO_BOT, CHANGED, CLARIFY_QUESTIONS, ESCALATION_MENU, INTAKE_QUESTIONS,
-    RESUME_GUIDE, UNAVAILABLE, process_one,
+    RESUME_GUIDE, SUPPORT_OFFER, UNAVAILABLE, process_one,
 )
 from app.services.llm.mock import MockLLM
 from app.services.rag.documents import Illustration
@@ -235,14 +235,15 @@ def test_changed_or_unavailable_source_never_sends_the_next_photos(talk, change)
     assert after["flow"] == before["flow"] and len(after["attempts"]) == 1
 
 
-def test_no_matching_instruction_requests_form_without_spending_an_attempt(talk):
+def test_no_matching_instruction_offers_optional_mail_without_spending_an_attempt(talk):
     knowledge = Knowledge()
     knowledge.missing = True
     talk.incoming(QUESTION)
     talk.process(knowledge)
     state = talk.snapshot()
-    assert state["attempts"] == [] and state["incident"].pending_action == "COLLECT_ESCALATION_DETAILS"
+    assert state["attempts"] == [] and state["incident"].pending_action is None
     assert "подходящую утверждённую инструкцию пока не нашёл" in assistants(state)[0][0]
+    assert assistants(state)[0][0].endswith(SUPPORT_OFFER)
     assert state["incident"].failed_attempts == 0
 
 
@@ -384,18 +385,80 @@ def test_room_revoked_during_source_check_cannot_enqueue_a_reply(talk):
         assert session.scalar(select(func.count()).select_from(Delivery)) == 0
 
 
-def test_only_five_failed_solutions_are_offered_before_form_escalation(talk):
-    files = [str(uuid5(NAMESPACE_URL, f"approved-guide-{i}")) for i in range(6)]
+def test_talk_can_offer_more_than_five_solutions_until_candidates_run_out(talk):
+    files = [str(uuid5(NAMESPACE_URL, f"approved-guide-{i}")) for i in range(7)]
     knowledge = Knowledge([approved(1, file_id) for file_id in files])
     talk.incoming(QUESTION)
     talk.process(knowledge)
-    for sequence in range(2, 7):
+    for sequence in range(2, 9):
         talk.incoming("Не помогло", sequence)
         talk.process(knowledge)
     state = talk.snapshot()
-    assert len(state["attempts"]) == 5 and state["incident"].failed_attempts == 5
-    assert state["incident"].pending_action == "COLLECT_ESCALATION_DETAILS"
-    assert len(knowledge.searches) == 5
+    assert len(state["attempts"]) == 7 and state["incident"].failed_attempts == 7
+    assert state["incident"].pending_action is None and "escalation" not in state["flow"]
+    assert state["attempts"][-1].ordinal == 7
+    assert assistants(state)[-1][0].endswith(SUPPORT_OFFER)
+
+
+@pytest.mark.parametrize("decline", [False, True])
+def test_optional_mail_offer_does_not_interrupt_dialogue_and_repeats_after_ten_messages(talk, decline):
+    knowledge = Knowledge()
+    knowledge.missing = True
+    talk.incoming(QUESTION)
+    assert talk.process(knowledge)
+    first = talk.snapshot()
+    assert assistants(first)[-1][0].endswith(SUPPORT_OFFER)
+    assert first["incident"].pending_action is None
+    next_sequence = 2
+    if decline:
+        talk.incoming("Нет, не надо", next_sequence)
+        assert talk.process(knowledge)
+        assert assistants(talk.snapshot())[-1][0] == "Хорошо, продолжим."
+        next_sequence += 1
+    for offset in range(10):
+        talk.incoming(QUESTION, next_sequence + offset)
+        assert talk.process(knowledge)
+        state = talk.snapshot()
+        assert state["incident"].pending_action is None
+        assert (SUPPORT_OFFER in assistants(state)[-1][0]) == (offset == 9)
+
+
+def test_optional_mail_offer_starts_form_only_after_affirmative_reply(talk):
+    knowledge = Knowledge()
+    knowledge.missing = True
+    talk.incoming(QUESTION)
+    assert talk.process(knowledge)
+    assert talk.snapshot()["incident"].pending_action is None
+    talk.incoming("Да", 2)
+    assert talk.process(knowledge)
+    assert talk.snapshot()["flow"]["escalation"]["stage"] == "FORM"
+    with talk.env.factory() as session:
+        assert session.scalar(select(func.count()).select_from(Escalation)) == 0
+
+
+def test_clarifying_question_does_not_offer_mail(talk):
+    talk.incoming("Настройка сканера")
+    assert talk.process(Knowledge())
+    state = talk.snapshot()
+    assert state["flow"]["clarification_keys"]
+    assert SUPPORT_OFFER not in assistants(state)[-1][0]
+    assert state["incident"].pending_action is None
+
+
+def test_expired_mail_offer_waits_through_clarification(talk):
+    knowledge = Knowledge()
+    knowledge.missing = True
+    talk.incoming(QUESTION)
+    assert talk.process(knowledge)
+    for sequence in range(2, 11):
+        talk.incoming("Спасибо", sequence)
+        assert talk.process(knowledge)
+    talk.incoming("Другая задача. Настройка сканера", 11)
+    assert talk.process(knowledge)
+    state = talk.snapshot()
+    assert state["flow"]["clarification_keys"]
+    assert SUPPORT_OFFER not in assistants(state)[-1][0]
+    assert state["incident"].pending_action is None
 
 
 def test_restart_recovery_preserves_progress_and_stale_inflight_result_cannot_finish(talk):
@@ -508,7 +571,8 @@ def test_factual_clarification_is_not_repeated_or_used_to_spend_an_attempt(talk)
         talk.process(knowledge, Factual())
     state = talk.snapshot()
     assert sum(text == CLARIFY_QUESTIONS["DEVICE_MODEL"] for text, _ in assistants(state)) == 1
-    assert not state["attempts"] and state["incident"].pending_action == "COLLECT_ESCALATION_DETAILS"
+    assert not state["attempts"] and state["incident"].pending_action is None
+    assert SUPPORT_OFFER not in assistants(state)[0][0] and assistants(state)[-1][0].endswith(SUPPORT_OFFER)
 
 
 def test_existing_source_takes_precedence_over_unnecessary_model_questionnaire(talk):
@@ -598,7 +662,7 @@ def test_feedback_during_form_keeps_the_form_and_does_not_restart_alternative_gu
     talk.process(knowledge)
     talk.incoming("Не помогло", 2)
     talk.process(knowledge)
-    talk.incoming("1", 3)
+    talk.incoming("Да", 3)
     talk.process(knowledge)
     before = talk.snapshot()
     assert before["incident"].pending_action == "COLLECT_ESCALATION_DETAILS"

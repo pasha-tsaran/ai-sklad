@@ -66,7 +66,7 @@ class Incident(Entity, Base):
     has_user_photos: Mapped[bool] = mapped_column(Boolean, default=False, server_default=text("false"))
     closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     __table_args__ = (
-        CheckConstraint("failed_attempts BETWEEN 0 AND 5"),
+        CheckConstraint("failed_attempts >= 0", name="incidents_failed_attempts_check"),
         CheckConstraint(
             "state IN ('NEW','DIAGNOSING','SOLUTION_PROPOSED','WAITING_FEEDBACK','RESOLVED','ESCALATED')"
         ),
@@ -152,7 +152,7 @@ class SolutionAttempt(Entity, Base):
     __table_args__ = (
         UniqueConstraint("incident_id", "ordinal"),
         UniqueConstraint("incident_id", "solution_id"),
-        CheckConstraint("ordinal BETWEEN 1 AND 5"),
+        CheckConstraint("ordinal >= 1", name="solution_attempts_ordinal_check"),
         Index(
             "uq_pending_attempt",
             "incident_id",

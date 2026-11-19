@@ -8,7 +8,7 @@ from sqlalchemy import func, select
 from app.models import Escalation, Feedback, Message, MessageAttachment, SuccessfulRetrieval
 from app.models.talk import TalkRoom
 from app.schemas.contracts import DialogueResult
-from app.services.chat.talk_dialogue import CHANGED, UNAVAILABLE, process_one
+from app.services.chat.talk_dialogue import CHANGED, SUPPORT_OFFER, UNAVAILABLE, process_one
 from app.services.rag.success import cache_key
 from integrations.openwebui.approved_instruction_images import read_docx_images
 from tests.test_openwebui_instruction_images import instruction, png
@@ -92,14 +92,13 @@ def test_rejecting_related_instructions_offers_support_without_a_failed_attempt(
     offered = chat.send(PROBLEM)
     rejected = chat.send(answer, 2)
     assert "instruction_offer" not in rejected["flow"]
-    assert rejected["flow"]["escalation"]["stage"] == "CHOICE"
-    assert "instruction_offer" not in rejected["flow"]["escalation"]["resume"]["flow"]
+    assert "escalation" not in rejected["flow"] and rejected["incident"].pending_action is None
     new_text = "\n".join(text for text, _ in assistants(rejected)[len(assistants(offered)):])
-    assert "поддержк" in new_text.casefold()
+    assert new_text.endswith(SUPPORT_OFFER)
     assert not rejected["attempts"] and rejected["incident"].failed_attempts == 0
     assert len(chat.model.calls) == 1
     no_ticket_or_feedback(chat)
-    resumed = chat.send("2", 3)
+    resumed = chat.send("Нет, не надо", 3)
     assert "instruction_offer" not in resumed["flow"] and "escalation" not in resumed["flow"]
     assert not any(photo for _, photo in assistants(resumed))
     assert len(chat.model.calls) == 1
@@ -193,7 +192,7 @@ def test_a_natural_language_rejection_offers_support_without_using_the_alternati
     chat.model.interpret_instruction_offer = interpret
     result = chat.send(answer, 2)
     assert calls == [answer]
-    assert result["flow"]["escalation"]["stage"] == "CHOICE"
+    assert "escalation" not in result["flow"] and assistants(result)[-1][0].endswith(SUPPORT_OFFER)
     assert "instruction_offer" not in result["flow"]
     assert not result["attempts"] and not any(photo for _, photo in assistants(result))
     assert len(chat.model.calls) == 1 and result["incident"].failed_attempts == 0

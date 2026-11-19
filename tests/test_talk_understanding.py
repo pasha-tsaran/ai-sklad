@@ -8,7 +8,7 @@ from app.models import Escalation, Feedback, Message, MessageAttachment, Success
 from app.models.talk import TalkRoom
 from app.schemas.contracts import DialogueResult
 from app.services.chat.policies import FORM_ACTION
-from app.services.chat.talk_dialogue import CHANGED, UNAVAILABLE, _text_turn, process_one
+from app.services.chat.talk_dialogue import CHANGED, SUPPORT_OFFER, UNAVAILABLE, _text_turn, process_one
 from app.services.llm.mock import MockLLM
 from integrations.openwebui.approved_instruction_images import read_docx_images
 from tests.test_openwebui_instruction_images import instruction, png
@@ -85,11 +85,13 @@ def test_verified_match_first_confirms_understanding_without_sending_steps_or_ph
     no_ticket_or_feedback(chat)
 
 
-@pytest.mark.parametrize("answer", ["Да", "Верно"])
+@pytest.mark.parametrize("answer", ["Да", "Верно", None], ids=["yes", "correct", "shown-title"])
 def test_short_confirmation_sends_original_photo_without_selecting_again(model_chat, answer):
     data = instruction([VOLUME], image_data=png("blue"))
     chat = enabled_chat(model_chat, [match()], rows=[(DOC, FILENAME, data)])
     first = chat.send(QUESTION)
+    if answer is None:
+        answer = first["flow"]["understanding_confirmation"]["scope_entries"][0]["title"]
     accepted = chat.send(answer, 2)
     replies = following_replies(first, accepted)
     photos = [photo for _, photo in replies if photo]
@@ -171,7 +173,8 @@ def test_rejected_identical_scope_is_not_presented_for_confirmation_again(model_
     correction = chat.send("Мне надо уменьшить громкость сканера", 3)
     assert "understanding_confirmation" not in correction["flow"]
     assert correction["incident"].result == "NO_KNOWLEDGE"
-    assert correction["incident"].escalation_reason == "NO_KNOWLEDGE"
+    assert correction["incident"].pending_action is None
+    assert assistants(correction)[-1][0].endswith(SUPPORT_OFFER)
     assert len(chat.model.calls) == 2
     assert "Что должно быть иначе" not in "\n".join(
         text for text, _ in following_replies(rejected, correction))

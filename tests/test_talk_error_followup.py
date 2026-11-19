@@ -4,7 +4,7 @@ import copy
 
 import pytest
 
-from app.services.chat.talk_dialogue import UNAVAILABLE, _model_clarification
+from app.services.chat.talk_dialogue import SUPPORT_OFFER, UNAVAILABLE, _model_clarification
 from app.services.chat.talk_dialogue import process_one
 from app.services.rag.talk import KnowledgeUnavailable
 from tests.test_openwebui_instruction_images import instruction, png
@@ -254,7 +254,7 @@ def test_generic_selection_question_repaired_to_the_previous_question_is_retried
     assert any(item["key"] == "error_text" and item["value"] == "неверный пароль"
                for item in result["flow"]["task_state"]["facts"])
     assert len(result["attempts"]) == 1 and result["incident"].failed_attempts == 0
-    assert result["flow"]["escalation"]["stage"] == "CHOICE"
+    assert "escalation" not in result["flow"] and replies[-1][0].endswith(SUPPORT_OFFER)
     continued = chat.send("причем в браузере зашел нормально", 5)
     previous = calls[-1]["previous"]
     assert previous["goals"] == guide["flow"]["task_state"]["goals"]

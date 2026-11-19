@@ -6,7 +6,7 @@ import pytest
 from sqlalchemy import select
 
 from app.models import Escalation, TalkRoom
-from app.services.chat.talk_dialogue import INTAKE_QUESTIONS
+from app.services.chat.talk_dialogue import INTAKE_QUESTIONS, SUPPORT_OFFER
 from app.schemas.contracts import DialogueResult
 from tests.test_talk_dialogue import Knowledge, NoGeneration, _profile, assistants, talk as talk
 
@@ -14,11 +14,11 @@ from tests.test_talk_dialogue import Knowledge, NoGeneration, _profile, assistan
 PROBLEM = "как подключить тсд к принтеру?"
 
 
-def choice(talk, knowledge, model):
+def unresolved(talk, knowledge, model):
     knowledge.missing = True
     talk.incoming(PROBLEM)
     assert talk.process(knowledge, model)
-    assert talk.snapshot()["flow"]["escalation"]["stage"] == "CHOICE"
+    assert assistants(talk.snapshot())[-1][0].endswith(SUPPORT_OFFER)
 
 
 def no_letter(talk):
@@ -33,7 +33,7 @@ def no_letter(talk):
 
 def test_exact_screenshot_connection_followups_do_not_implicitly_start_a_form(talk):
     knowledge, model = Knowledge(), NoGeneration()
-    choice(talk, knowledge, model)
+    unresolved(talk, knowledge, model)
     for sequence, clarification in enumerate(["подключить поблютуз", "А если подключить по wi-fi?"], 2):
         count = len(knowledge.searches)
         talk.incoming(clarification, sequence)
@@ -46,10 +46,10 @@ def test_exact_screenshot_connection_followups_do_not_implicitly_start_a_form(ta
             assert "блютуз" not in latest and "bluetooth" not in latest
 
 
-@pytest.mark.parametrize("reply", ["Да", "Готово", "понятно", "по Bluetooth"])
+@pytest.mark.parametrize("reply", ["Готово", "понятно", "по Bluetooth"])
 def test_unlabelled_choice_reply_is_not_consent_to_collect_a_letter(talk, reply):
     knowledge, model = Knowledge(), NoGeneration()
-    choice(talk, knowledge, model)
+    unresolved(talk, knowledge, model)
     talk.incoming(reply, 2)
     talk.process(knowledge, model)
     no_letter(talk)
@@ -64,7 +64,9 @@ def test_unlabelled_choice_reply_is_not_consent_to_collect_a_letter(talk, reply)
 ])
 def test_technical_topic_switch_recovers_a_legacy_form_without_reusing_letter_data(talk, field, question):
     knowledge, model = Knowledge(), NoGeneration()
-    choice(talk, knowledge, model)
+    unresolved(talk, knowledge, model)
+    talk.incoming("оператор", 2)
+    assert talk.process(knowledge, model)
     with talk.env.factory() as session, session.begin():
         room = session.get(TalkRoom, talk.room_id)
         flow = copy.deepcopy(room.flow)
@@ -79,7 +81,7 @@ def test_technical_topic_switch_recovers_a_legacy_form_without_reusing_letter_da
         room.flow = flow
     knowledge.missing = False
     searches = len(knowledge.searches)
-    talk.incoming(question, 2)
+    talk.incoming(question, 3)
     assert talk.process(knowledge, model)
     state = no_letter(talk)
     assert state["incident"].pending_action is None and "escalation" not in state["flow"]

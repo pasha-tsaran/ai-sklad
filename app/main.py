@@ -9,7 +9,7 @@ from app.core.logging import configure_logging, event
 from app.db import get_engine
 
 configure_logging()
-app = FastAPI(title="ai-support", version="0.4.3", description="Grounded support, personal Talk chats and mail drafts")
+app = FastAPI(title="ai-support", version="0.4.4", description="Grounded support, personal Talk chats and mail drafts")
 app.include_router(router)
 app.include_router(talk_router)
 app.include_router(device_router)
@@ -38,8 +38,8 @@ def live():
 def ready():
     with get_engine().connect() as connection:
         revision = connection.execute(text("SELECT version_num FROM alembic_version")).scalar()
-        if revision != "0010":
-            raise HTTPException(503, {"error_code": "DatabaseMigrationRequired", "expected_revision": "0010"})
+        if revision != "0011":
+            raise HTTPException(503, {"error_code": "DatabaseMigrationRequired", "expected_revision": "0011"})
     settings = get_settings()
     return {
         "status": "ok",

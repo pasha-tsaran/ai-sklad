@@ -204,12 +204,13 @@ def load_context(session, incident, settings):
     ).all()))
     cutoff = recent[0].sequence - 1 if recent else 0
     summary = _summary(session, incident, cutoff, min(2000, max_chars // 4))
-    attempts = session.execute(
+    attempts = list(reversed(session.execute(
         select(SolutionAttempt, Feedback)
         .outerjoin(Feedback, Feedback.attempt_id == SolutionAttempt.id)
         .where(SolutionAttempt.incident_id == incident.id)
-        .order_by(SolutionAttempt.ordinal)
-    ).all()
+        .order_by(SolutionAttempt.ordinal.desc())
+        .limit(max(8, settings.memory_max_messages))
+    ).all()))
     principal = _principal(session, incident)
     current_time = now()
     records = []
@@ -289,6 +290,8 @@ def load_context(session, incident, settings):
     if _size(context) > max_chars:
         for attempt in context["short_term"]["attempts"]:
             attempt["comment"] = ""
+    while len(context["short_term"]["attempts"]) > 1 and _size(context) > max_chars:
+        context["short_term"]["attempts"].pop(0)
     if messages and _size(context) > max_chars:
         remaining = max(0, len(messages[-1]["content"]) - (_size(context) - max_chars))
         messages[-1]["content"] = _clip(messages[-1]["content"], remaining)

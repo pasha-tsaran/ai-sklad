@@ -11,7 +11,7 @@ from app.services.rag.talk import KnowledgeUnavailable, TalkKnowledge
 from integrations.openwebui.approved_instruction_images import read_docx_images, read_docx_text
 from tests.test_openwebui_instruction_images import instruction, office
 
-KB = "85cda3aa-b854-4c26-9948-12da742277ef"
+KB = "11111111-1111-4111-8111-111111111111"
 DOC = "00000000-0000-4000-8000-000000000033"
 OTHER = "00000000-0000-4000-8000-000000000099"
 FILENAME = "05_Acrobat — PDF с картинками не печатается.docx"

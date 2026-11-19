@@ -33,7 +33,7 @@ from app.services.chat.offer_adoption import adopt_instruction_offer
 from app.services.chat.messages import append_message
 from app.services.chat.instruction_plan import composite_approved, immutable_plan, render_plan, restore_plan, serialize_plan
 from app.services.chat.policies import (
-    FORM_ACTION, MAX_ATTEMPTS, TERMINAL_STATES, direct_intent, requests_support_form, resolution_feedback,
+    FORM_ACTION, TERMINAL_STATES, direct_intent, requests_support_form, resolution_feedback,
 )
 from app.services.chat.service import messenger
 from app.services.chat.question_guard import unsupported_question_content
@@ -59,14 +59,19 @@ from integrations.openwebui.automatic_instruction_images import (
     requires_support, safe_social_reply,
 )
 
-UNAVAILABLE = "Сейчас не удалось проверить базу знаний. Повторите вопрос немного позже или напишите «оператор»."
+UNAVAILABLE = "Сейчас не удалось проверить базу знаний. Повторите вопрос немного позже."
 SELECTION_UNCLEAR = ("Пока не удалось выбрать подтверждённый следующий шаг. "
-                     "Можно описать, что сейчас видно на экране, или написать «оператор» для помощи специалиста.")
+                     "Можно описать, что сейчас видно на экране.")
 INDEX_UPDATING = ("База знаний ещё обрабатывает новые материалы. Ваш вопрос сохранён. "
-                  "Повторите его немного позже или напишите «оператор».")
+                  "Повторите его немного позже.")
 CHANGED = "Инструкция изменилась или доступ к ней недоступен. Продолжение приостановлено до проверки актуального источника."
 ESCALATION_MENU = ("Как продолжим?\n1 — оформить письмо в техническую поддержку.\n"
                    "2 — продолжить диалог с ботом.\n\nМожно ответить цифрой или словами. Заявка пока не отправлена.")
+SUPPORT_OFFER = "Составить письмо для отправки в техническую поддержку?"
+SUPPORT_OFFER_INTERVAL = 10
+SUPPORT_OFFER_KEY = "_support_letter_offer"
+NO_INSTRUCTION = "По вашему описанию подходящую утверждённую инструкцию пока не нашёл."
+NO_OTHER_SOLUTION = "Других подходящих утверждённых решений пока не нашёл."
 OFFER_CHOICE = "Какой вариант подходит? Напишите его номер или «нет»."
 UNDERSTANDING_CHOICE = "Правильно ли я понял вашу задачу? Подтвердите или коротко поправьте меня."
 UNDERSTANDING_CORRECTION = "Что именно нужно сделать? Коротко поправьте моё понимание задачи."
@@ -124,6 +129,7 @@ class Turn:
     confirmed_computer: str | None = None
     media_notice: str | None = None
     block_sources: list | None = None
+    failed_previous: bool = False
 
 
 class _TimedProxy:
@@ -897,6 +903,12 @@ def _understanding_turn(message, flow, context, llm, knowledge, settings):
             "вы", "меня", "подтверждаю", "совершенно", "абсолютно",
     } and affirmation_words.intersection({"да", "ага", "верно", "правильно", "подтверждаю"})):
         accepted = True
+    scope_entries = confirmation.get("scope_entries", [])
+    guide = confirmation["guide_flow"]
+    if (len(scope_entries) == 1 and len((guide.get("task_state") or {}).get("goals", {})) <= 1
+            and guide.get("coverage_mode") != "partial" and "?" not in message):
+        title = normalized_query(scope_entries[0].get("title"))
+        accepted = accepted or bool(title and normalized_query(message) == title)
     rejected = normalized in {"нет", "неверно", "неправильно", "не то", "это не то", "не так"}
     user_flow = {**confirmation["guide_flow"], **flow}
     correction = {key: copy.deepcopy(user_flow[key]) for key in (
@@ -907,7 +919,6 @@ def _understanding_turn(message, flow, context, llm, knowledge, settings):
                       reselect_source=True)
     correction.setdefault("opening_query", flow.get("clarification_query", ""))
     rejected_scopes = list(correction.get("rejected_scope_ids", []))
-    scope_entries = confirmation.get("scope_entries", [])
     scope_identity = confirmation.get("scope_identity") or _confirmation_identity(
         confirmation["guide_flow"], scope_entries,
     )
@@ -1043,9 +1054,8 @@ def _goal_order_turn(message, flow, context, llm, knowledge, settings):
             rejected_orders.append(order)
         state = remember_task_message(message, state)
         restored.update(task_state=state, rejected_goal_orders=rejected_orders[-8:])
-        return Turn("REPLY", [("Сохраняю указанный вами порядок действий. "
-                               "Для него пока не удалось составить подтверждённую последовательность. "
-                               "Можно уточнить задачу или написать «оператор» для помощи специалиста.", None)],
+        return Turn("UNRESOLVED", [("Сохраняю указанный вами порядок действий. "
+                               "Для него пока не удалось составить подтверждённую последовательность.", None)],
                     flow=restored)
     return Turn("REPLY", [("Можно изменить порядок действий, как предложено выше? "
                            "Ответьте «да», «нет» или поправьте задачу.", None)])
@@ -1335,7 +1345,7 @@ def _diagnostic_followup_turn(message, flow, context, llm, knowledge):
 def _search_diagnostic_followup(message, flow, context, llm, knowledge):
     search = getattr(knowledge, "search_with_llm", None)
     if not callable(search):
-        return Turn("REPLY", [(NO_DIAGNOSTIC_STEPS, None)], flow=flow)
+        return Turn("UNRESOLVED", [(NO_DIAGNOSTIC_STEPS, None)], flow=flow)
     original_state = copy.deepcopy(flow["task_state"])
     goals = original_state["goals"]
     observations = [fact["value"] for fact in original_state["facts"]
@@ -1366,7 +1376,7 @@ def _search_diagnostic_followup(message, flow, context, llm, knowledge):
     if turn.action == "NO_KNOWLEDGE":
         observation = re.sub(r"([\\`*_{}\[\]()<>])", r"\\\1", _redact(message[:300]))
         notice = "Учёл уточнение «" + observation + "».\n\n" + NO_DIAGNOSTIC_STEPS
-        return Turn("REPLY", [(notice, None)], flow=flow)
+        return Turn("UNRESOLVED", [(notice, None)], flow=flow)
     retained = turn.flow if turn.flow is not None else diagnostic
     if not retained.get("understanding_confirmation"):
         retained = {**copy.deepcopy(flow), **retained}
@@ -1604,8 +1614,8 @@ def _retrieve_support_turn(message, flow, context, llm, knowledge):
                         or not all(knowledge.is_current(source) for source in sources)):
                     raise KnowledgeUnavailable("InvalidGoalOrderProposal", "instruction_selection")
                 if list(proposed_order) in flow.get("rejected_goal_orders", []):
-                    return Turn("REPLY", [("Сохраняю ваш порядок действий. Для него подтверждённая "
-                        "последовательность пока не найдена. Можно уточнить задачу или написать «оператор».", None)],
+                    return Turn("UNRESOLVED", [("Сохраняю ваш порядок действий. Для него подтверждённая "
+                        "последовательность пока не найдена.", None)],
                         flow=copy.deepcopy(flow))
                 prompt = question + "\n\nПредлагаемый порядок действий\n" + "\n".join(
                     f"{index}. {goals[goal_id]['text']}" for index, goal_id in enumerate(proposed_order, 1)
@@ -1996,6 +2006,13 @@ def _text_turn(message, flow, context, previous_pending, llm, knowledge, setting
         if flow.get("escalation", {}).get("profile_prefilled"):
             return _intake_prompt(_prefill_intake(flow, context))
         return _profile_form_request(flow, context)
+    if previous_pending != FORM_ACTION and context.get("support_offer_pending"):
+        reply = _normalized(message)
+        if "?" not in message and reply in {"да", "давайте", "да составь", "да составьте", "составь", "составьте"}:
+            return _profile_form_request(flow, context)
+        if "?" not in message and reply in {"нет", "не надо", "нет не надо", "не нужно", "нет не нужно",
+                                           "не надо спасибо", "нет спасибо", "не сейчас", "письмо не нужно"}:
+            return Turn("SUPPORT_DECLINED", [("Хорошо, продолжим.", None)])
     intent = direct_intent(message)
     if previous_pending == FORM_ACTION:
         choice = _escalation_choice(message)
@@ -2062,7 +2079,7 @@ def _text_turn(message, flow, context, previous_pending, llm, knowledge, setting
     if feedback:
         if feedback == "SUCCESS":
             return Turn("PARTIAL_SUCCESS" if flow.get("coverage_mode") == "partial" else "SUCCESS")
-        if flow.get("source") and context.get("incident", {}).get("failed_attempts", 0) < MAX_ATTEMPTS - 1:
+        if flow.get("source"):
             search_flow = {key: copy.deepcopy(flow[key]) for key in (
                 "task_state", "task_query", "opening_query", "answered_questions",
             ) if key in flow}
@@ -2073,6 +2090,11 @@ def _text_turn(message, flow, context, previous_pending, llm, knowledge, setting
                 return Turn("REPLY", [(UNAVAILABLE, None)])
             if following.action == "GUIDE":
                 following.action = "RETRY_GUIDE"
+                return following
+            if following.action == "REPLY" and following.flow and any(following.flow.get(key) for key in (
+                "clarification_question", "understanding_confirmation", "instruction_offer", "goal_order_offer",
+            )):
+                following.failed_previous = True
                 return following
         return Turn("FAILED")
     if _step_confirmed(message) and not flow:
@@ -2116,7 +2138,7 @@ def _report_failed_inbox(session, inbox, room, principal):
     append_message(session, incident.id, "user", inbox.content, "RECEIVED")
     _deliver(session, incident, [(
         "Не удалось обработать предыдущее сообщение из-за временной ошибки. "
-        "Текущий шаг сохранён. Напишите вопрос ещё раз или «оператор», чтобы оформить письмо в поддержку.", None,
+        "Текущий шаг сохранён. Напишите вопрос ещё раз.", None,
     )])
     incident.version += 1
     audit(session, incident.id, "talk.turn_failure_reported", inbox_id=inbox.id,
@@ -2209,6 +2231,12 @@ def _claim(factory, settings, account_id):
         incident.pending_action, incident.version = "PROCESSING", incident.version + 1
         context = load_context(session, incident, settings)
         context["channel_profile"] = channel_profile(room, incident.id)
+        offer = (room.profile or {}).get(SUPPORT_OFFER_KEY, {})
+        if offered_message := offer.get("message_id"):
+            context["support_offer_pending"] = bool(session.scalar(select(Delivery.id).where(
+                Delivery.message_id == offered_message, Delivery.room_token == room.room_token,
+                Delivery.account_id == room.account_id, Delivery.status == "SENT",
+            ).limit(1)))
         flow = copy.deepcopy(room.flow or {})
         room.flow = {**flow, "_processing": {"inbox_id": inbox.id, "tries": inbox.tries, "previous": previous}}
         return {"inbox_id": inbox.id, "room_id": room.id, "incident_id": incident.id, "version": incident.version,
@@ -2261,19 +2289,40 @@ def _offer_escalation(session, incident, reason, flow, context):
     if problem:
         incident.description = problem[-8000:]
     incident.state, incident.pending_action = "DIAGNOSING", FORM_ACTION
-    incident.result = "NO_KNOWLEDGE" if reason == "NO_KNOWLEDGE" else "ESCALATE"
+    incident.result = "ESCALATE"
     incident.escalation_reason = reason
-    prefix = {
-        "ATTEMPTS_EXHAUSTED": "Пять решений не помогли. Новые решения больше не предлагаются.",
-        "NO_KNOWLEDGE": ("По вашему описанию подходящую утверждённую инструкцию пока не нашёл. "
-                         "Можно обратиться к специалисту технической поддержки."),
-        "NO_MORE_SOLUTIONS": "Других подходящих утверждённых решений нет.",
-    }.get(reason)
-    if flow.get("declined_instruction_offer"):
-        prefix = "Для описанной ситуации подходящая утверждённая инструкция не найдена. Предложенные варианты вам не подошли."
-    _deliver(session, incident, [((prefix + "\n\n" if prefix else "") + ESCALATION_MENU, None)])
+    _deliver(session, incident, [(ESCALATION_MENU, None)])
     audit(session, incident.id, "incident.escalation_choice_requested", reason=reason)
     return {**flow, "escalation": {"stage": "CHOICE", "resume": resume}}
+
+
+def _advance_support_offer(room, visible, declined):
+    profile = room.profile or {}
+    if offer := profile.get(SUPPORT_OFFER_KEY):
+        remaining = 0 if offer.get("message_id") and not visible else max(0, offer["remaining"] - 1)
+        if declined:
+            remaining = SUPPORT_OFFER_INTERVAL
+        room.profile = {**profile, SUPPORT_OFFER_KEY: {"remaining": remaining}}
+
+
+def _deliver_unresolved(session, room, incident, text):
+    profile = room.profile or {}
+    if profile.get(SUPPORT_OFFER_KEY, {}).get("remaining", 0):
+        _deliver(session, incident, [(text, None)])
+        return
+    message = _deliver(session, incident, [(text + "\n\n" + SUPPORT_OFFER, None)])
+    room.profile = {**profile, SUPPORT_OFFER_KEY: {"remaining": SUPPORT_OFFER_INTERVAL, "message_id": message.id}}
+    audit(session, incident.id, "talk.support_letter_offered")
+
+
+def _no_solution_flow(flow, context):
+    retained = {key: copy.deepcopy(flow[key]) for key in (
+        "task_state", "task_query", "opening_query", "answered_questions", "excluded",
+        "rejected_scope_ids", "rejected_scope_entries", "answered_conditions",
+    ) if key in flow}
+    if problem := _last_problem(flow, context):
+        retained["clarification_query"] = problem
+    return retained
 
 
 def _finish(factory, turn, claimed, llm, settings):
@@ -2299,6 +2348,7 @@ def _finish(factory, turn, claimed, llm, settings):
         incident.pending_action = claimed["previous"]["pending"]
         incident.result = claimed["previous"]["result"]
         room.flow = claimed["flow"]
+        _advance_support_offer(room, claimed["context"].get("support_offer_pending"), turn.action == "SUPPORT_DECLINED")
         first_sequence = session.scalar(select(func.coalesce(func.max(Message.sequence), 0)).where(
             Message.incident_id == incident.id,
         ))
@@ -2308,6 +2358,14 @@ def _finish(factory, turn, claimed, llm, settings):
         if turn.media_notice:
             _deliver(session, incident, [(turn.media_notice, None)])
         pending = _attempt(session, incident)
+        if pending and (turn.action == "RETRY_GUIDE" or turn.failed_previous):
+            pending.status = "FAILED"
+            session.add(Feedback(attempt_id=pending.id, helped=False, comment=""))
+            incident.failed_attempts += 1
+            if turn.failed_previous:
+                incident.state, incident.result = "DIAGNOSING", None
+            session.flush()
+            pending = None
         if turn.action == "DELIVERY_RESUME":
             if not resume_response(session, room, incident, inbox, turn.resume or {}):
                 _deliver(session, incident, [("Предыдущий ответ уже завершён или его нельзя безопасно продолжить. "
@@ -2317,27 +2375,22 @@ def _finish(factory, turn, claimed, llm, settings):
                      block_sources=turn.block_sources)
             room.flow = turn.flow
         elif turn.action in {"GUIDE", "RETRY_GUIDE"}:
-            if turn.action == "RETRY_GUIDE" and pending:
-                pending.status = "FAILED"
-                session.add(Feedback(attempt_id=pending.id, helped=False, comment=""))
-                incident.failed_attempts += 1
-                session.flush()
-                pending = None
             source = turn.approved.document["source"]
             existing = session.scalar(select(SolutionAttempt).where(
                 SolutionAttempt.incident_id == incident.id,
                 SolutionAttempt.solution_id == turn.approved.candidate.solution_id,
             ))
             same = bool(existing is not None and pending is not None and existing.id == pending.id)
-            attempts = session.scalars(select(SolutionAttempt).where(SolutionAttempt.incident_id == incident.id)).all()
             if existing and existing.evidence.get("talk_source") != source:
                 _deliver(session, incident, [(CHANGED, None)])
             elif existing and existing.status not in {"UNASSESSED", "WAITING_FEEDBACK"}:
                 # A failed solution already owns its unique feedback record.
                 # Do not repeat it as a new attempt or silently reset the result.
-                room.flow = _offer_escalation(session, incident, "NO_MORE_SOLUTIONS", room.flow, claimed["context"])
-            elif existing is None and len(attempts) >= MAX_ATTEMPTS:
-                room.flow = _offer_escalation(session, incident, "ATTEMPTS_EXHAUSTED", turn.flow, claimed["context"])
+                room.flow = _no_solution_flow(turn.flow, claimed["context"])
+                incident.state, incident.result, incident.escalation_reason = "DIAGNOSING", "NO_KNOWLEDGE", None
+                if pending:
+                    pending.status = "UNASSESSED"
+                _deliver_unresolved(session, room, incident, NO_OTHER_SOLUTION)
             else:
                 if not same and pending:
                     pending.status = "UNASSESSED"
@@ -2354,8 +2407,11 @@ def _finish(factory, turn, claimed, llm, settings):
                                     "steps": candidate.steps, "source": candidate.source, "talk_source": source}
                         if saved_plan := turn.flow.get("instruction_plan"):
                             evidence["instruction_plan"] = immutable_plan(saved_plan)
+                        previous_ordinal = session.scalar(select(func.max(SolutionAttempt.ordinal)).where(
+                            SolutionAttempt.incident_id == incident.id,
+                        )) or 0
                         session.add(SolutionAttempt(
-                            incident_id=incident.id, solution_id=candidate.solution_id, ordinal=len(attempts) + 1,
+                            incident_id=incident.id, solution_id=candidate.solution_id, ordinal=previous_ordinal + 1,
                             message_id=first.id, evidence=evidence,
                             retrieval_score=candidate.score, llm_backend=llm.name,
                         ))
@@ -2390,9 +2446,8 @@ def _finish(factory, turn, claimed, llm, settings):
                         saved["task_query"] = task_query(state)
                     room.flow = {**saved, "coverage_mode": "partial_completed"}
                     incident.state, incident.pending_action, incident.result = "DIAGNOSING", None, "PARTIAL"
-                    _deliver(session, incident, [("Спасибо за обратную связь. Подтверждённая часть выполнена. "
-                        f"Для действий «{remaining}» подтверждённых шагов пока нет. "
-                        "Для помощи специалиста напишите «оператор».", None)])
+                    _deliver_unresolved(session, room, incident, "Спасибо за обратную связь. Подтверждённая часть выполнена. "
+                        f"Для действий «{remaining}» подтверждённых шагов пока нет.")
                 elif helped:
                     incident.state, incident.pending_action, incident.closed_at = "RESOLVED", None, now()
                     session.flush()
@@ -2410,14 +2465,35 @@ def _finish(factory, turn, claimed, llm, settings):
                 else:
                     incident.failed_attempts += 1
                     excluded = list(dict.fromkeys((room.flow or {}).get("excluded", []) + [pending.evidence["talk_source"]["file_id"]]))
-                    room.flow = {**(room.flow or {}), "excluded": excluded, "has_more": False}
-                    room.flow = _offer_escalation(session, incident,
-                        "ATTEMPTS_EXHAUSTED" if incident.failed_attempts >= MAX_ATTEMPTS else "NO_MORE_SOLUTIONS",
-                        room.flow, claimed["context"])
+                    room.flow = _no_solution_flow({**(room.flow or {}), "excluded": excluded}, claimed["context"])
+                    incident.state, incident.result, incident.escalation_reason = "DIAGNOSING", "NO_KNOWLEDGE", None
+                    _deliver_unresolved(session, room, incident, NO_OTHER_SOLUTION)
         elif turn.action == "HUMAN":
             room.flow = _offer_escalation(session, incident, "USER_REQUEST", turn.flow or room.flow, claimed["context"])
         elif turn.action == "NO_KNOWLEDGE":
-            room.flow = _offer_escalation(session, incident, "NO_KNOWLEDGE", turn.flow or room.flow, claimed["context"])
+            previous = turn.flow or room.flow
+            same_guide = pending is not None and previous.get("source") == pending.evidence.get("talk_source")
+            if same_guide:
+                room.flow = previous
+                incident.state = "WAITING_FEEDBACK"
+            else:
+                room.flow = _no_solution_flow(previous, claimed["context"])
+                if pending:
+                    pending.status = "UNASSESSED"
+                incident.state = "DIAGNOSING"
+            incident.pending_action, incident.result = None, "NO_KNOWLEDGE"
+            incident.escalation_reason = None
+            if problem := room.flow.get("clarification_query"):
+                incident.description = problem[-8000:]
+            text = NO_INSTRUCTION
+            if previous.get("declined_instruction_offer"):
+                text += " Предложенные варианты вам не подошли."
+            _deliver_unresolved(session, room, incident, text)
+        elif turn.action == "UNRESOLVED":
+            room.flow = turn.flow if turn.flow is not None else room.flow
+            if incident.pending_action == FORM_ACTION:
+                incident.pending_action, incident.escalation_reason = None, None
+            _deliver_unresolved(session, room, incident, turn.blocks[0][0])
         elif turn.action == "FORM_REQUEST":
             incident.pending_action = FORM_ACTION
             incident.escalation_reason = incident.escalation_reason or "USER_REQUEST"
