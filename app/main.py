@@ -9,7 +9,7 @@ from app.core.logging import configure_logging, event
 from app.db import get_engine
 
 configure_logging()
-app = FastAPI(title="ai-support", version="0.4.4", description="Grounded support, personal Talk chats and mail drafts")
+app = FastAPI(title="ai-support", version="0.6.0", description="Grounded support, personal Talk chats and mail drafts")
 app.include_router(router)
 app.include_router(talk_router)
 app.include_router(device_router)
@@ -49,7 +49,8 @@ def ready():
         "nextcloud": settings.nextcloud_backend,
         "mail": settings.mail_backend,
         "rag": settings.knowledge_backend,
-        "knowledge_configured": bool(settings.openwebui_knowledge_ids)
+        "knowledge_settings_source": "profile" if settings.openwebui_sync_profile else "env",
+        "knowledge_configured": (None if settings.openwebui_sync_profile else bool(settings.openwebui_knowledge_ids))
         if settings.knowledge_backend == "openwebui"
         else True,
         "demo_knowledge": settings.seed_demo_knowledge,

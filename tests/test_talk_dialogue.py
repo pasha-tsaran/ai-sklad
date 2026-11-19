@@ -76,7 +76,7 @@ class Knowledge:
 
 @pytest.fixture
 def talk(env):
-    settings = Settings(_env_file=None, nextcloud_base_url=BASE, knowledge_backend="openwebui",
+    settings = Settings(_env_file=None, talk_dialogue_mode="legacy", nextcloud_base_url=BASE, knowledge_backend="openwebui",
                         openwebui_api_key="test", openwebui_knowledge_ids=[KB], seed_demo_knowledge=False)
     with env.factory() as session, session.begin():
         account = TalkAccount(server_url=BASE, username="bot-uid", activated_at=now() - timedelta(days=1))

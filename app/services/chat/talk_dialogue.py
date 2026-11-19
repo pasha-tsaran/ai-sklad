@@ -130,6 +130,7 @@ class Turn:
     media_notice: str | None = None
     block_sources: list | None = None
     failed_previous: bool = False
+    agent_documents: list = field(default_factory=list)
 
 
 class _TimedProxy:
@@ -389,6 +390,10 @@ def _continue_from_letter(message, flow, context, llm, knowledge, settings):
     """A work question resumes support; unfinished personal form fields stay out of retrieval."""
     saved = flow.get("escalation", {}).get("resume", {})
     restored = copy.deepcopy(saved.get("flow", {key: value for key, value in flow.items() if key != "escalation"}))
+    if restored.get("agent"):
+        # Keep the agent's expected reply even if escalation preceded the first instruction.
+        return Turn("RESUME", [("Продолжим с того же места. Заявка не отправлена.", None)],
+                    flow=restored, resume=saved)
     text = normalized_query(message)
     if text in {"да", "нет", "готово", "понятно", "ок", "хорошо", "не знаю"}:
         return Turn("RESUME", [(BACK_TO_BOT, None)], flow=restored, resume=saved)
@@ -2032,6 +2037,12 @@ def _text_turn(message, flow, context, previous_pending, llm, knowledge, setting
         # Everything else here is employee data for the pending letter. It must
         # not be classified as chat or used to search for another instruction.
         return _intake_turn(message, flow, llm, context)
+    if getattr(settings, "talk_dialogue_mode", "legacy") == "agent" and callable(getattr(llm, "agent_action", None)):
+        if intent == "HUMAN":
+            return Turn("HUMAN")
+        from app.services.chat.agent_dialogue import run_agent
+
+        return run_agent(message, flow, context, llm, knowledge, settings)
     if flow.get("understanding_confirmation"):
         if intent == "HUMAN":
             return Turn("HUMAN")
@@ -2272,7 +2283,7 @@ def _offer_escalation(session, incident, reason, flow, context):
     if existing and existing.get("resume"):
         resume = existing["resume"]
     else:
-        if pending is None and not saved_flow.get("understanding_confirmation"):
+        if pending is None and not saved_flow.get("understanding_confirmation") and not saved_flow.get("agent"):
             # A failed/exhausted guide must not become a fresh waiting attempt
             # simply because the employee backs out of the support menu.
             problem = _last_problem(saved_flow, context)
@@ -2325,6 +2336,65 @@ def _no_solution_flow(flow, context):
     return retained
 
 
+def _finish_agent(session, room, incident, turn, pending, claimed, llm, settings):
+    """Commit agent state and original media with the same transactional outbox as legacy turns."""
+    from dataclasses import replace
+
+    incident.description = (incident.description + "\n" + _redact(claimed["message"])).strip()[-8000:]
+    candidates = []
+    for approved in turn.agent_documents:
+        # Keep changed originals separate from historical attempts and snapshots.
+        identity = approved.candidate.solution_id + approved.document["source"]["sha256"]
+        candidate = replace(approved.candidate, solution_id=str(uuid5(NAMESPACE_URL, "agent:" + identity)),
+                            chunk_id=str(uuid5(NAMESPACE_URL, "agent-chunk:" + identity)))
+        save_snapshot(session, candidate)
+        candidates.append(candidate)
+    first = _deliver(session, incident, turn.blocks, block_sources=turn.block_sources)
+    room.flow = turn.flow
+    if pending is not None and not turn.flow.get("source"):
+        pending.status = "UNASSESSED"
+        pending = None
+        incident.state, incident.result = "DIAGNOSING", None
+    if candidates:
+        primary = candidates[0]
+        existing = session.scalar(select(SolutionAttempt).where(
+            SolutionAttempt.incident_id == incident.id, SolutionAttempt.solution_id == primary.solution_id,
+        ))
+        if pending is not None and (existing is None or pending.id != existing.id):
+            pending.status = "UNASSESSED"
+            session.flush()
+            pending = None
+        if existing is None:
+            ordinal = session.scalar(select(func.max(SolutionAttempt.ordinal)).where(
+                SolutionAttempt.incident_id == incident.id,
+            )) or 0
+            pending = SolutionAttempt(
+                incident_id=incident.id, solution_id=primary.solution_id, ordinal=ordinal + 1,
+                message_id=first.id, retrieval_score=primary.score, llm_backend=llm.name,
+                evidence={"title": primary.title, "version": primary.version, "chunk_id": primary.chunk_id,
+                          "content": primary.content, "steps": primary.steps, "source": primary.source,
+                          "talk_source": turn.agent_documents[0].document["source"],
+                          "agent_sources": [doc.document["source"] for doc in turn.agent_documents]},
+            )
+            session.add(pending)
+        elif existing.status in {"WAITING_FEEDBACK", "UNASSESSED"}:
+            pending = existing
+            pending.status = "WAITING_FEEDBACK"
+        incident.state, incident.result = "WAITING_FEEDBACK", "ANSWER"
+        # Only user-reported prose enters long-term resolution memory, never model-invented facts.
+        if not incident.problem_type:
+            goal = turn.flow["agent"]["memory"]["goal"]
+            incident.problem_type = (goal if goal and goal in incident.description else incident.description)[:100]
+    if turn.action == "AGENT_RESOLVED" and pending is not None:
+        pending.status = "SUCCEEDED"
+        session.add(Feedback(attempt_id=pending.id, helped=True, comment=""))
+        incident.state, incident.pending_action, incident.closed_at = "RESOLVED", None, now()
+        session.flush()
+        remember_resolution(session, incident, settings)
+        room.flow = {}
+    audit(session, incident.id, "talk.agent_reply", source_count=len(candidates), resolved=incident.state == "RESOLVED")
+
+
 def _finish(factory, turn, claimed, llm, settings):
     with factory() as session, session.begin():
         inbox = session.scalar(select(TalkInbox).where(
@@ -2366,7 +2436,9 @@ def _finish(factory, turn, claimed, llm, settings):
                 incident.state, incident.result = "DIAGNOSING", None
             session.flush()
             pending = None
-        if turn.action == "DELIVERY_RESUME":
+        if turn.action in {"AGENT_REPLY", "AGENT_RESOLVED"}:
+            _finish_agent(session, room, incident, turn, pending, claimed, llm, settings)
+        elif turn.action == "DELIVERY_RESUME":
             if not resume_response(session, room, incident, inbox, turn.resume or {}):
                 _deliver(session, incident, [("Предыдущий ответ уже завершён или его нельзя безопасно продолжить. "
                                                 "Напишите, с чем нужна помощь.", None)])
@@ -2587,11 +2659,18 @@ def process_one(factory, settings, llm, knowledge=None, *, account_id=None):
     metadata = {"message_id": claimed["inbox_id"],
                 TIMING_MARKER: {"message_id": claimed["inbox_id"], "stages_ms": {}, "stage_calls": {}}}
     try:
+        if settings.llm_backend == "openwebui" and settings.openwebui_sync_profile:
+            from app.services.llm.profile import profile_settings
+            from app.services.llm.openwebui import OpenWebUILLM
+
+            settings = profile_settings(settings, transport=getattr(llm, "transport", None))
+            llm = OpenWebUILLM(settings, transport=getattr(llm, "transport", None))
         timed_llm = _TimedProxy(llm, metadata, {"dialogue": "model_api", "analyze_context": "model_api",
                                                "understand_task": "model_api", "followup": "model_api",
                                                "extract_escalation": "model_api", "interpret_instruction_offer": "model_api",
                                                "adopt_instruction_offer": "model_api",
-                                               "interpret_understanding_reply": "model_api"})
+                                               "interpret_understanding_reply": "model_api",
+                                               "agent_action": "model_api"})
         def select_source(payload):
             with _measure(metadata, "model_api"):
                 call = getattr(llm, "_call", None)
@@ -2637,7 +2716,7 @@ def process_one(factory, settings, llm, knowledge=None, *, account_id=None):
             claimed["principal"], claimed["context"],
         )
         timed_knowledge = _TimedProxy(cached_knowledge, metadata,
-                                      {"search": "search", "search_with_llm": "search",
+                                      {"search": "search", "search_with_llm": "search", "search_candidates": "search",
                                        "read": "read", "is_current": "verify"})
         with _measure(metadata, "route"):
             paused = None
@@ -2649,7 +2728,10 @@ def process_one(factory, settings, llm, knowledge=None, *, account_id=None):
                 saved_flow = paused.get("flow", {})
                 source = saved_flow.get("source")
                 current = True
-                if saved_flow.get("instruction_plan"):
+                if saved_flow.get("agent"):
+                    current = all(timed_knowledge.is_current(item)
+                                  for item in saved_flow["agent"].get("sources", []))
+                elif saved_flow.get("instruction_plan"):
                     try:
                         restore_plan(timed_knowledge, saved_flow["instruction_plan"])
                     except KnowledgeUnavailable:

@@ -302,8 +302,9 @@ def deliver_one(factory, settings, client=None):
                 raise ValueError("TalkServiceAccountChanged")
             if provenance:
                 from app.services.rag.talk import TalkKnowledge
+                from app.services.llm.profile import profile_settings
 
-                if not TalkKnowledge(settings).is_current(provenance):
+                if not TalkKnowledge(profile_settings(settings)).is_current(provenance):
                     raise ValueError("ApprovedInstructionChanged")
             if attachment:
                 method = sender.send_file if attachment.content_type == "message/rfc822" else sender.send_image

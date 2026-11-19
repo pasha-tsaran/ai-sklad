@@ -26,7 +26,7 @@ def native_model(response):
         return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(reply)},
                                                      "finish_reason": "stop"}]})
 
-    settings = Settings(_env_file=None, llm_backend="openwebui", openwebui_api_key="test-key",
+    settings = Settings(_env_file=None, talk_dialogue_mode="legacy", llm_backend="openwebui", openwebui_api_key="test-key",
                         openwebui_model="local-test", nextcloud_backend="mock", mail_backend="mock")
     return OpenWebUILLM(settings, httpx.MockTransport(handler)), calls
 
@@ -111,7 +111,7 @@ def test_same_task_goal_repeat_retains_existing_goals_and_exact_history(monkeypa
     model.dialogue = lambda message, context: DialogueResult(route="SUPPORT")
     monkeypatch.setattr(talk_dialogue, "_retrieve_support_turn", lambda *args: talk_dialogue.Turn(
         "REPLY", [("Ищем по уточнённой задаче.", None)], flow={}))
-    settings = Settings(_env_file=None)
+    settings = Settings(_env_file=None, talk_dialogue_mode="legacy")
     result = talk_dialogue._instruction_offer_turn(message, flow, {}, model, object(), settings)
     state = result.flow["task_state"]
     assert calls[0]["previous_state"] == previous
@@ -138,7 +138,8 @@ def test_grounded_new_topic_with_mixed_unknown_has_no_stale_facts_or_goals(messa
         "REPLY", [("Ищем новую задачу.", None)], flow={}))
     flow = offer_flow()
     flow["task_state"] = previous
-    turn = talk_dialogue._instruction_offer_turn(message, flow, {}, model, object(), Settings(_env_file=None))
+    turn = talk_dialogue._instruction_offer_turn(message, flow, {}, model, object(),
+                                                Settings(_env_file=None, talk_dialogue_mode="legacy"))
     result = turn.flow["task_state"]
     assert not is_unknown_answer(message) and len(calls) == 1
     assert result["new_task"] is True and result["facts"] == []

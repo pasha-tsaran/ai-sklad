@@ -9,7 +9,7 @@ import pytest
 from sqlalchemy import select
 
 from app.models import Delivery, SuccessfulRetrieval
-from app.services.chat.talk_dialogue import CHANGED, UNAVAILABLE, process_one
+from app.services.chat.talk_dialogue import CHANGED, SUPPORT_OFFER, UNAVAILABLE, process_one
 from app.services.llm.mock import MockLLM
 from app.services.nextcloud.delivery import deliver_one
 from app.services.rag.talk import TalkKnowledge
@@ -237,7 +237,10 @@ def test_no_knowledge_is_a_single_model_decision_without_analysis_retry(model_ch
     result = chat.send("Как настроить мобильный принтер по Wi-Fi?")
     assert len(chat.model.calls) == 1 and not chat.model.analysis_calls
     assert not result["attempts"] and not any(photo for _, photo in assistants(result))
-    assert result["flow"].get("escalation")
+    # Missing knowledge offers help; it does not constitute consent to start a letter.
+    assert not result["flow"].get("escalation")
+    assert result["incident"].pending_action is None
+    assert any(SUPPORT_OFFER in text for text, _ in assistants(result))
 
 
 @pytest.mark.parametrize("response", [

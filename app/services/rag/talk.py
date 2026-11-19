@@ -571,6 +571,36 @@ class TalkKnowledge:
             report_failure(failure)
             raise failure from None
 
+    def search_candidates(self, query):
+        """Discovery only: the dialogue agent, not a second model, chooses what to read."""
+        from types import SimpleNamespace
+        from app.services.rag.catalog import bm25_rank, reciprocal_rank_fusion
+
+        if not isinstance(query, str) or not query.strip() or len(query) > 1000:
+            raise KnowledgeUnavailable("InvalidSearchQuery")
+        try:
+            with self._client() as client:
+                files = self._files(client)
+                entries = self.catalog.entries(files) if self.catalog is not None else {}
+                searchable = {key: entries.get(key) or SimpleNamespace(
+                    card={"title": item["filename"]}, content=item["filename"],
+                ) for key, item in files.items()}
+                lexical = bm25_rank(query, searchable)
+                degraded = False
+                try:
+                    semantic = self._instruction_vector_ids(client, query, files)
+                except (httpx.HTTPError, KnowledgeUnavailable, ValueError, KeyError):
+                    semantic, degraded = [], True
+                ranked = reciprocal_rank_fusion(lexical, semantic, limit=12)
+                return {"candidates": [{
+                    "file_id": key, "title": files[key]["filename"],
+                    "description": entries[key].card if key in entries else {},
+                } for key in ranked], "search_degraded": degraded}
+        except KnowledgeUnavailable:
+            raise
+        except Exception as error:
+            raise KnowledgeUnavailable(type(error).__name__, "agent_search") from None
+
     def scanner_context(self):
         """Bounded original-backed hints from this bot's approved collection only."""
         with knowledge_stage("equipment_context"), self._client() as client:

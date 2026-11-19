@@ -3,7 +3,7 @@ title: AI Support — фотографии утверждённых инстру
 author: AI Support
 description: Ищет и читает утверждённые инструкции, показывает исходные фотографии DOCX.
 required_open_webui_version: 0.11.0
-version: 0.3.2
+version: 0.4.0
 license: MIT
 """
 
@@ -448,6 +448,8 @@ class _OpenWebUI:
 
 class Tools:
     class Valves(BaseModel):
+        sync_model_profile: bool = Field(default=False, description="Брать коллекции из сохранённого профиля модели.")
+        settings_model_id: str = Field(default="ai-support", description="Административный источник настроек, не ID из сообщения пользователя.")
         allowed_knowledge_ids: list[str] = Field(
             default_factory=lambda: ["85cda3aa-b854-4c26-9948-12da742277ef"],
             description="Только утверждённые коллекции знаний. Пустой список запрещает поиск и чтение инструкций.",
@@ -464,6 +466,24 @@ class Tools:
             raise ToolError("not_configured", "Администратор должен указать корректные ID разрешённых баз знаний в Valves инструмента.")
         return list(dict.fromkeys(str(UUID(value)) for value in allowed))
 
+    async def _resolved_ids(self, user, request):
+        if not self.valves.sync_model_profile:
+            return self._allowed_ids(user, request)
+        if not request or not isinstance(user, dict) or not user.get("id"):
+            raise ToolError("missing_context", "Нужен авторизованный пользователь Open WebUI.")
+        from open_webui.models.models import Models
+
+        profile = await Models.get_model_by_id(self.valves.settings_model_id)
+        if profile is None or not profile.is_active:
+            raise ToolError("not_configured", "Профиль поддержки недоступен.")
+        items = profile.meta.knowledge or []
+        if (not isinstance(items, list) or not items or len(items) > 20
+                or any(not isinstance(item, dict) or item.get("type") != "collection"
+                       or not _uuid(item.get("id")) for item in items)):
+            raise ToolError("not_configured", "В профиле должны быть подключены коллекции знаний.")
+        # Every subsequent source/search call still verifies current-user collection access.
+        return list(dict.fromkeys(str(UUID(item["id"])) for item in items))
+
     @_measure_tool
     async def search_approved_instructions(self, query: str, count: int = 8,
                                            __user__=None, __request__=None) -> str:
@@ -476,7 +496,7 @@ class Tools:
         :return: JSON ok/knowledge_ids/chunks, or an error without source contents.
         """
         try:
-            allowed = self._allowed_ids(__user__, __request__)
+            allowed = await self._resolved_ids(__user__, __request__)
             if (not isinstance(query, str) or not query.strip() or len(query) > 6000
                     or type(count) is not int or not 1 <= count <= 20):
                 raise ToolError("invalid_query", "Нужен короткий запрос по проблеме и корректный размер результата.")
@@ -521,7 +541,7 @@ class Tools:
 
     async def _approved_document(self, file_id, user, request):
         """Share the trust boundary between text inspection and photo delivery."""
-        allowed = self._allowed_ids(user, request)
+        allowed = await self._resolved_ids(user, request)
         if not _uuid(file_id):
             raise ToolError("invalid_file_id", "Нужен настоящий file_id инструкции из результата поиска, а не имя файла или ссылка.")
         file_id = str(UUID(file_id))
@@ -587,10 +607,11 @@ class Tools:
         display, explain each returned caption in Russian; do not invent details,
         emit duplicate Markdown images, call display_file, or generate pictures.
         If status is not displayed, do not claim that photos were shown.
-        Display only this group. When has_more is true, ask progress_message and
-        stop. The automatic Filter advances the saved flow after the user confirms
-        completing these steps. The model must not advance offset itself. Do not
-        ask users for photo numbers, file IDs or a batch size.
+        Display only the relevant group. In agent mode choose explicit image_numbers
+        from the document captions with offset=0; on a later user continuation
+        choose the next relevant numbers, not the already displayed ones. Never
+        ask users for photo numbers, file IDs or a batch size. In legacy mode
+        the automatic Filter owns pagination of auto/all selections.
         :param file_id: Actual DOCX file UUID returned by knowledge search, not filename/collection ID/URL.
         :param image_numbers: auto by default; all or an approved comma-separated subset remains supported.
         :param offset: Use 0 in model calls. Nonzero progress is reserved for the automatic Filter after user confirmation.

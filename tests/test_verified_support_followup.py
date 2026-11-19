@@ -235,7 +235,7 @@ def test_performed_recipe_sections_are_not_offered_as_new_diagnostic_excerpts():
     original = active_flow(approved)
     turn = _support_turn("Неверный пароль", original, {},
                          NoRepeatedRecipe({"facts": [fact("error_text", "Неверный пароль")]}), knowledge)
-    assert turn.action == "REPLY" and "Оставить заявку" in turn.blocks[0][0]
+    assert turn.action == "UNRESOLVED" and "Оставить заявку" in turn.blocks[0][0]
     assert not turn.flow.get("understanding_confirmation")
     assert turn.flow["instruction_plan"] == original["instruction_plan"]
 

@@ -155,21 +155,34 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Personal Nextcloud Talk account connector")
     parser.add_argument("--check", action="store_true", help="Check account and private rooms without sending")
     parser.add_argument("--check-knowledge", action="store_true", help="Read approved knowledge and photos without sending")
+    parser.add_argument("--check-profile", action="store_true", help="Validate shared settings without sending or printing the prompt")
     parser.add_argument("--check-typing", action="store_true", help="Read native typing prerequisites without joining or sending")
     parser.add_argument("--once", action="store_true", help="Run one real poll/process/delivery cycle")
     args = parser.parse_args(argv)
     configure_logging()
     try:
         settings = get_settings()
-        if args.check_typing:
+        if args.check_profile:
+            from app.services.llm.profile import profile_settings
+
+            snapshot = profile_settings(settings)
+            result = {"status": "ok" if settings.openwebui_sync_profile else "disabled",
+                      "profile": settings.openwebui_profile_id,
+                      "model": snapshot.openwebui_model,
+                      "knowledge_ids": snapshot.openwebui_knowledge_ids,
+                      "revision": snapshot.openwebui_profile_revision}
+            print(json.dumps(result, ensure_ascii=False))
+            return 0 if result["status"] == "ok" else 1
+        elif args.check_typing:
             with closing(NativeTyping(settings)) as typing:
                 result = typing.check()
             print(json.dumps(result, ensure_ascii=False))
             return 0 if result.get("status") == "ok" else 1
         elif args.check_knowledge:
             from app.services.rag.talk import TalkKnowledge
+            from app.services.llm.profile import profile_settings
 
-            result = TalkKnowledge(settings).check()
+            result = TalkKnowledge(profile_settings(settings)).check()
             print(json.dumps(result, ensure_ascii=False))
             return 0 if result["status"] == "ok" else 1
         elif args.check:

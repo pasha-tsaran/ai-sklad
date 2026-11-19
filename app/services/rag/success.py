@@ -223,6 +223,9 @@ class SuccessfulTalkKnowledge:
     def uses_llm_selection(self):
         return bool(getattr(self.delegate, "uses_llm_selection", False))
 
+    def search_candidates(self, query):
+        return self.delegate.search_candidates(query)
+
     def _forget(self, key):
         with self.factory() as session, session.begin():
             row = session.scalar(select(SuccessfulRetrieval).filter_by(user_id=self.principal, **key))

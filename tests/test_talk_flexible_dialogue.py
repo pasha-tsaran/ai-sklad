@@ -120,11 +120,13 @@ def test_printer_wifi_question_after_escalation_choice_resumes_search_instead_of
     knowledge.missing = True
     talk.incoming("Как подключить принтер к ТСД?")
     talk.process(knowledge, model)
+    talk.incoming("оператор", 2)
+    talk.process(knowledge, model)
     assert talk.snapshot()["flow"]["escalation"]["stage"] == "CHOICE"
     model.calls.clear()  # The initial genuine miss attempted the existing analysis fallback.
     knowledge.missing = False
     question = "Как подключить мобильный принтер к ТСД по Wi-Fi?"
-    talk.incoming(question, 2)
+    talk.incoming(question, 3)
     talk.process(knowledge, model)
     after = talk.snapshot()
     assert after["incident"].pending_action is None and after["incident"].state == "WAITING_FEEDBACK"
@@ -152,8 +154,10 @@ def test_new_question_with_no_answer_exits_choice_without_inventing_a_source_or_
     knowledge.missing = True
     talk.incoming("Как подключить принтер к ТСД?")
     talk.process(knowledge, model)
+    talk.incoming("оператор", 2)
+    talk.process(knowledge, model)
     question = "Как подключить мобильный принтер к ТСД по Wi-Fi?"
-    talk.incoming(question, 2)
+    talk.incoming(question, 3)
     talk.process(knowledge, model)
     after = talk.snapshot()
     assert not after["attempts"] and any(question in query for query, _, _ in knowledge.searches)

@@ -14,6 +14,11 @@ class Settings(BaseSettings):
     openwebui_base_url: str = "http://localhost:8080"
     openwebui_api_key: SecretStr = SecretStr("")
     openwebui_model: str = "ai-support"
+    openwebui_sync_profile: bool = False
+    openwebui_profile_id: str = "ai-support"
+    openwebui_system_prompt: str = Field(default="", exclude=True, repr=False)
+    openwebui_generation_params: dict = Field(default_factory=dict, exclude=True)
+    openwebui_profile_revision: str = ""
     openwebui_num_ctx: int | None = Field(default=None, ge=2048, le=131072)
     openwebui_verification_think: bool = False
     knowledge_backend: Literal["openwebui", "demo"] = "openwebui"
@@ -27,6 +32,9 @@ class Settings(BaseSettings):
     nextcloud_poll_interval_seconds: float = Field(default=3, ge=1, le=60)
     nextcloud_batch_size: int = Field(default=100, ge=1, le=100)
     talk_confirm_understanding: bool = False
+    talk_dialogue_mode: Literal["agent", "legacy"] = "agent"
+    talk_agent_max_calls: int = Field(default=12, ge=2, le=24)
+    talk_agent_context_chars: int = Field(default=100000, ge=16000, le=240000)
     device_collection_base_url: str = ""
     nextcloud_bot_secret: SecretStr = SecretStr("")
     nextcloud_allowed_rooms: list[str] = Field(default_factory=list)
@@ -55,6 +63,11 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_credentials(self):
+        if self.openwebui_sync_profile and (
+            self.llm_backend != "openwebui" or self.knowledge_backend != "openwebui"
+            or self.talk_dialogue_mode != "agent" or not self.openwebui_profile_id.strip()
+        ):
+            raise ValueError("Profile sync requires Open WebUI model/knowledge and agent dialogue")
         if not self.api_token.get_secret_value():
             raise ValueError("API_TOKEN must not be empty")
         if self.llm_backend == "openwebui" and (

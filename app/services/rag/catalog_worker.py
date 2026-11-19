@@ -5,6 +5,10 @@ from app.services.rag.talk import TalkKnowledge
 
 
 def synchronize_knowledge(factory, settings, *, refresh=False):
+    if getattr(settings, "openwebui_sync_profile", False):
+        from app.services.llm.profile import profile_settings
+
+        settings = profile_settings(settings)
     if settings.knowledge_backend != "openwebui" or not settings.openwebui_knowledge_ids:
         return {"status": "disabled", "ready": 0, "complete": False}
     catalog = KnowledgeCatalog(settings, factory)

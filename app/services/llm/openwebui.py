@@ -152,6 +152,11 @@ class OpenWebUILLM:
         self.transport = transport
         self.name = f"openwebui:{settings.openwebui_model}"[:255]
 
+    def agent_action(self, payload):
+        from app.services.llm.support_agent import agent_action
+
+        return agent_action(self, payload)
+
     def _call(self, schema, task, payload, *, fast_selection=False, max_output_tokens=None):
         output_limit = 4096 if schema is SupportTaskUnderstanding else 1536
         if max_output_tokens is not None and (
@@ -272,6 +277,11 @@ class OpenWebUILLM:
             })
             if thinking:
                 body["params"].update(think=True, num_predict=8192)
+        if selection_schema is not None and selection_schema.get("title") == "AgentAction":
+            shared_params = getattr(self.settings, "openwebui_generation_params", {})
+            body["params"] = {**body.get("params", {}), **shared_params}
+            if "temperature" in shared_params:
+                body["temperature"] = shared_params["temperature"]
         started = perf_counter()
         timeout = max(self.settings.llm_timeout_seconds, 120) if thinking else self.settings.llm_timeout_seconds
         if timeout_cap is not None:

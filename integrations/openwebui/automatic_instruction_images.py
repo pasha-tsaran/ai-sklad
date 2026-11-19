@@ -3,7 +3,7 @@ title: AI Support — фотографии к ответу автоматиче�
 author: AI Support
 description: Автоматически прикладывает фотографии утверждённой инструкции и продолжает её по шагам.
 required_open_webui_version: 0.11.0
-version: 0.6.2
+version: 0.7.0
 """
 
 # Install as an admin Function (Filter), scoped to ai-support, not as a Tool.
@@ -1078,6 +1078,7 @@ class _Runtime:
 
 class Filter:
     class Valves(BaseModel):
+        dialogue_mode: Literal["legacy", "agent"] = Field(default="legacy", description="agent: диалог и выбор фото ведёт модель через Tools; фильтр не меняет ответы.")
         priority: int = 20
         timing_enabled: bool = Field(default=True, description="Измерять этапы AI Support без записи текста сообщений.")
         show_timings: bool = Field(default=True, description="Показывать замеры в результате ai_support_timings только администратору.")
@@ -1092,6 +1093,8 @@ class Filter:
         self.valves = self.Valves()
 
     async def inlet(self, body: dict, __user__=None, __request__=None, __metadata__=None, __model__=None) -> dict:
+        if self.valves.dialogue_mode == "agent":
+            return body
         metadata = __metadata__ if isinstance(__metadata__, dict) else {}
         model_id = (__model__.get("id") if isinstance(__model__, dict) else None) or body.get("model")
         metadata.pop(TIMING_MARKER, None)
@@ -1257,6 +1260,8 @@ class Filter:
 
     async def outlet(self, body: dict, __user__=None, __request__=None, __metadata__=None,
                      __event_emitter__=None, __model__=None) -> dict:
+        if self.valves.dialogue_mode == "agent":
+            return body
         metadata = __metadata__ if isinstance(__metadata__, dict) else {}
         model_id = (__model__.get("id") if isinstance(__model__, dict) else None) or body.get("model")
         tracked = (self.valves.timing_enabled and model_id in self.valves.enabled_model_ids

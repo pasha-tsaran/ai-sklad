@@ -80,7 +80,7 @@ def test_related_setups_after_step_error_keep_active_guide_through_later_observa
     continued = _support_turn(completed, password.flow, {}, model, knowledge)
     assert len(knowledge.diagnostics) == 2
     for turn in (password, continued):
-        assert turn.action == "REPLY" and NO_DIAGNOSTIC_STEPS in turn.blocks[0][0]
+        assert turn.action == "UNRESOLVED" and NO_DIAGNOSTIC_STEPS in turn.blocks[0][0]
         assert "instruction_offer" not in turn.flow and "understanding_confirmation" not in turn.flow
         assert turn.flow["source"] == original["source"]
         assert turn.flow["instruction_plan"] == original["instruction_plan"]
