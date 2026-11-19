@@ -134,6 +134,25 @@ def test_yes_to_multiple_options_requests_a_specific_choice_without_showing_a_gu
     assert selected["flow"]["source"]["file_id"] == OTHER
 
 
+def test_comparison_of_offers_reads_original_purpose_without_asking_for_technical_details(model_chat):
+    first_purpose = "Инструкция описывает права доступа к очереди печати и не очищает очередь."
+    second_purpose = "Инструкция описывает удаление зависших заданий печати."
+    purpose_heading = "<w:p><w:r><w:t>Назначение:</w:t></w:r></w:p>"
+    first_data = instruction([CAPTION], extra_paragraph=purpose_heading + f"<w:p><w:r><w:t>{first_purpose}</w:t></w:r></w:p>")
+    second_data = instruction([SECOND_CAPTION], extra_paragraph=purpose_heading + f"<w:p><w:r><w:t>{second_purpose}</w:t></w:r></w:p>")
+    chat = model_chat([related((DOC, CAPTION), (OTHER, SECOND_CAPTION))], rows=[
+        (DOC, FILENAME, first_data), (OTHER, SECOND_FILENAME, second_data),
+    ])
+    offered = chat.send(PROBLEM)
+    explained = chat.send("В чём разница между этими вариантами?", 2)
+    text = "\n".join(content for content, _ in assistants(explained)[len(assistants(offered)):])
+    assert first_purpose in text and second_purpose in text
+    assert CAPTION not in text and SECOND_CAPTION not in text
+    assert explained["flow"]["instruction_offer"]["purpose_explained"]
+    assert explained["flow"]["instruction_offer"]["scope_entries"]
+    assert not explained["attempts"] and len(chat.model.calls) == 1
+
+
 @pytest.mark.parametrize("proof", ["второй вариант подойдет", "выдуманное подтверждение", ""])
 def test_natural_language_acceptance_requires_a_quote_from_the_employees_reply(model_chat, proof):
     data = instruction([SECOND_CAPTION], image_data=png("blue"))

@@ -43,6 +43,7 @@ def collect_details(session, user_id, incident_id, details, settings):
         return {"incident_id": incident.id, "escalation_id": existing.id, "duplicate": True}
     if incident.pending_action != FORM_ACTION:
         raise HTTPException(409, "Обращение не ожидает форму эскалации")
+    incident.escalation_reason = incident.escalation_reason or "USER_REQUEST"
     add_user_message(session, incident, "Данные заявки: " + json.dumps(data, ensure_ascii=False))
     messages = session.scalars(
         select(Message).where(Message.incident_id == incident.id).order_by(Message.sequence)

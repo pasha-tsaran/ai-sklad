@@ -18,10 +18,10 @@ from app.models import KnowledgeIndex, KnowledgeIndexImage, now
 from app.services.rag.documents import Illustration
 from app.services.rag.evidence import build_evidence_registry
 from app.services.rag.interface import Candidate
-from app.services.rag.query import _terms, normalized_query
+from app.services.rag.query import _terms, catalog_search_terms, normalized_query
 from integrations.openwebui.approved_instruction_images import MAX_SOURCE_BYTES, W, WP, _member, _validate_archive, _xml
 
-PARSER_VERSION = "source-catalog-v3"
+PARSER_VERSION = "source-catalog-v8"
 _WARNING = re.compile(r"\b(?:внимание|осторожно|предупреждение|нельзя|запрещено|"
                       r"не\s+(?:удаляйте|сканируйте|выключайте|отключайте))\b", re.I)
 _PREREQUISITE = re.compile(r"^(?:перед\s+(?:началом|настройкой|работой)|предварительн\w*|"
@@ -37,6 +37,36 @@ _ILLUSTRATION_HEADING = re.compile(
     r"(?:фото|фотографии|иллюстрации|изображения|скриншоты)(?:\s+и\s+пояснения)?|"
     r"(?:photos|photographs|illustrations|images|screenshots)(?:\s+and\s+(?:explanations|captions))?", re.I,
 )
+_CONDITIONAL_METHOD = re.compile(
+    r"^(?P<condition>(?:если|if)\b[\s\S]*?)(?P<method>"
+    r"\b(?:отдельн\w*|альтернативн\w*|друг\w*)\s+(?:способ\w*|метод\w*|вариант\w*)\b|"
+    r"\b(?:separate|alternative|another)\s+(?:method|procedure|way)\b)", re.I,
+)
+_EXCLUSIVE_METHODS = re.compile(
+    r"\b(?:выберите|используйте|примените|выполните)\s+(?:только\s+)?один\s+"
+    r"(?:из\s+(?:следующих\s+)?)?(?:способ\w*|метод\w*|вариант\w*)\b|"
+    r"\b(?:choose|select|use)\s+(?:only\s+)?one\s+(?:of\s+(?:the\s+)?(?:following\s+)?)?"
+    r"(?:methods?|options?|alternatives?|procedures?)\b", re.I,
+)
+_METHOD_HEADING = re.compile(r"^(?:способ|метод|вариант|method|option|alternative)\s*(?:№\s*)?\d+\b", re.I)
+_PROCEDURE_SCOPE_METADATA = ("parent_group_id", "condition_section_id", "condition_text",
+                             "exclusive_set_id", "exclusive_parent_group_id", "exclusive_choice_section_id")
+_IMAGE_SCOPE_METADATA = (*_PROCEDURE_SCOPE_METADATA, "scope_ambiguous", "scope_group_ids")
+_CAPTION_LABEL = re.compile(r"^(?:иллюстрация|фото|рисунок|figure|photo)\s*\d+[.)]?\s*", re.I)
+_NUMBERED_CHAPTER = re.compile(r"^[1-9]\d?(?:\.\d{1,2}){1,4}\.?\s+(?P<title>[^\W\d_]{3,}\b[^\n]{0,150})$", re.U)
+_MEASUREMENT_LABEL = re.compile(
+    r"^(?:mm|cm|mm/s|dpi|ppm|volts?|watts?|seconds?|мкм|мм|см|кг|мс|"
+    r"миллиметр(?:а|ов|ы)?|сантиметр(?:а|ов|ы)?|метр(?:а|ов|ы)?|вольт(?:а|ов)?|"
+    r"ватт(?:а|ов)?|секунд(?:а|ы)?|градус(?:а|ов)?)\b", re.I,
+)
+_PDF_PAGE = re.compile(r"^(?:(?:страница|page)\s+pdf|pdf\s+page)\s+\d+\s*$", re.I)
+_GALLERY_PLATFORMS = {
+    "phone": re.compile(r"\b(?:на|с|со|для)\s+(?:мобильн\w*\s+)?(?:телефон\w*|смартфон\w*)\b|"
+                        r"\bмобильн\w*\s+(?:приложен\w*|форм\w*|раздел\w*|выбор\w*|интерфейс\w*|верси\w*)\b|"
+                        r"\b(?:on\s+(?:a\s+)?(?:phone|smartphone)|mobile\s+(?:app|form|interface|version))\b", re.I),
+    "computer": re.compile(r"\b(?:на|с|для)\s+(?:рабоч\w*\s+)?(?:компьютер\w*|пк|ноутбук\w*)\b|"
+                           r"\b(?:desktop|on\s+(?:a\s+)?computer)\b", re.I),
+}
 
 
 def _digest(value):
@@ -157,6 +187,9 @@ def instruction_sections(document):
     heading = ""
     group_id = "procedure-" + identity[:24]
     illustration_level = None
+    galleries, current_gallery = [], None
+    logical_groups = set()
+    chapter_numbers = {}
     explicit_headings = {(item["text"], item["occurrence"]): item["level"] for item in document.get("headings", [])
                          if isinstance(item, dict) and isinstance(item.get("text"), str)
                          and type(item.get("occurrence")) is int and type(item.get("level")) is int
@@ -180,17 +213,23 @@ def instruction_sections(document):
         normalized = " ".join(text.split())
         occurrences[text] += 1
         markdown = re.match(r"^(#{1,6})\s+\S", text)
+        label = text.lstrip("# ")
+        chapter = _NUMBERED_CHAPTER.fullmatch(label)
+        if chapter and _MEASUREMENT_LABEL.match(chapter.group("title")):
+            chapter = None
+        navigation = bool(_PDF_PAGE.fullmatch(label))
         level = (positioned_headings.get((text, paragraph["paragraph"])) if positioned else
                  explicit_headings.get((text, occurrences[text])))
         if level is None and markdown:
             level = len(markdown.group(1))
+        if level is None and chapter:
+            level = min(label.split()[0].rstrip(".").count(".") + 1, 6)
         if positioned:
             images = [number for number in paragraph["image_numbers"] if type(number) is int and number in captions]
         else:
             images = [number for number, caption in captions.items()
                       if caption and (caption in normalized or len(normalized) >= 20 and normalized in caption)]
         kind = "TEXT"
-        label = text.lstrip("# ")
         if _WARNING.search(label):
             kind = "WARNING"
         elif _PREREQUISITE.search(label):
@@ -198,25 +237,319 @@ def instruction_sections(document):
         elif images:
             kind = "IMAGE"
         is_heading = level is not None or len(text) <= 100 and text.endswith(":")
-        if is_heading:
+        if is_heading and not navigation:
             heading = text.lstrip("# ").rstrip(":")
             mandatory_kind = kind if kind in {"WARNING", "PREREQUISITE"} else None
         elif mandatory_kind and kind not in {"WARNING", "PREREQUISITE"}:
             kind = mandatory_kind
         suffix = _digest([identity, ordinal, text])[:24]
-        if level is not None and illustration_level is not None and level <= illustration_level:
+        if (illustration_level is not None and not navigation
+                and (chapter or level is not None and level <= illustration_level)):
             illustration_level = None
+            current_gallery = None
         if is_heading and _ILLUSTRATION_HEADING.fullmatch(" ".join(label.rstrip(":").split())):
             illustration_level = level or 2
-        elif (level is not None and level <= 2 and illustration_level is None
+            current_gallery = []
+            galleries.append(current_gallery)
+        elif (not navigation and (chapter or level is not None and level <= 2) and illustration_level is None
               and not _SEQUENTIAL_HEADING.match(label)):
             group_id = "procedure-" + suffix
+            if chapter:
+                logical_groups.add(group_id)
+                chapter_numbers[group_id] = label.split()[0].rstrip(".")
         sections.append({"id": "section-" + suffix, "title": heading or text[:100], "text": text,
                          "kind": kind, "image_numbers": images, "ordinal": ordinal,
                          "is_heading": is_heading, "heading_level": level,
                          "group_id": group_id,
                          "step_ids": ["step-" + suffix],
                          "image_ids": [f"image-{identity[:24]}-{number}" for number in images]})
+        if group_id in logical_groups:
+            sections[-1]["logical_group_id"] = group_id
+        if current_gallery is not None:
+            current_gallery.append(sections[-1])
+    sections = _gallery_sections(_conditional_method_sections(_exclusive_method_sections(sections), captions),
+                                 captions, galleries)
+    if any(_PDF_PAGE.fullmatch(section["text"]) for section in sections):
+        _wrapped_guard_context(sections)
+    _numbered_guard_scopes(sections, chapter_numbers)
+    members = {}
+    for section in sections:
+        if (section["group_id"] in logical_groups or section.get("parent_group_id") in logical_groups
+                or section.get("exclusive_set_id")):
+            members.setdefault(section["group_id"], []).append(section["id"])
+    digests = {group: _digest(ids) for group, ids in members.items()}
+    for section in sections:
+        if section["group_id"] in digests:
+            section["group_membership_digest"] = digests[section["group_id"]]
+    return sections
+
+
+def _wrapped_guard_context(sections):
+    """Classify a soft-wrapped sentence before making any fragment mandatory."""
+    fence = None
+    index = 0
+    while index < len(sections):
+        first = sections[index]
+        marker = re.match(r"^\s*(`{3,}|~{3,})", first["text"])
+        if marker:
+            fence = None if fence == marker[1][0] else marker[1][0]
+        if fence or marker or first["is_heading"] or first["image_numbers"]:
+            index += 1
+            continue
+        unit = [first]
+        while index + len(unit) < len(sections) and len(unit) < 12:
+            following = sections[index + len(unit)]
+            previous = unit[-1]
+            if (following["group_id"] != first["group_id"] or following["is_heading"]
+                    or following["image_numbers"] or len(previous["text"]) > 120 or len(following["text"]) > 120
+                    or re.search(r"[.!?。！？:;]\s*$", previous["text"])
+                    or _SEQUENTIAL_HEADING.match(following["text"])
+                    or re.match(r"^\s*(?:`{3,}|~{3,}|[-*•]\s)", following["text"])
+                    or not (following["text"][0].islower()
+                            or re.search(r"\b(?:не|и|или|по|в|с|к|для|из|на|от|при|до|без)\s*$",
+                                         previous["text"], re.I))):
+                break
+            unit.append(following)
+        if len(unit) > 1:
+            complete = " ".join(section["text"] for section in unit)
+            title = first["title"]
+            kind = ("WARNING" if _WARNING.search(complete) or _WARNING.search(title) else
+                    "PREREQUISITE" if _PREREQUISITE.search(complete) or _PREREQUISITE.search(title) else "TEXT")
+            for section in unit:
+                section["kind"] = kind
+        index += len(unit)
+
+
+def _numbered_guard_scopes(sections, chapter_numbers):
+    """Keep manual-chapter requirements inside their own original scope."""
+    if not chapter_numbers:
+        return
+    first_chapter = min(section["ordinal"] for section in sections if section.get("logical_group_id"))
+    for section in sections:
+        if section["kind"] not in {"WARNING", "PREREQUISITE"} or section["ordinal"] < first_chapter:
+            continue
+        chapter = chapter_numbers.get(section.get("logical_group_id"))
+        groups = {section["group_id"]}
+        if chapter:
+            groups.update(candidate["group_id"] for candidate in sections
+                          if (number := chapter_numbers.get(candidate.get("logical_group_id")))
+                          and (number == chapter or number.startswith(chapter + ".")))
+        section["guard_scope_group_ids"] = sorted(groups)
+
+
+def _exclusive_method_sections(sections):
+    """Split numbered methods only when the original explicitly requires one choice."""
+    for root in dict.fromkeys(section["group_id"] for section in sections):
+        original = [section for section in sections if section["group_id"] == root]
+        methods = [section for section in original if section["is_heading"]
+                   and _METHOD_HEADING.match(section["text"].lstrip("# "))]
+        if len(methods) < 2:
+            continue
+        first = methods[0]
+        if not any(_EXCLUSIVE_METHODS.search(section["text"]) for section in original
+                   if section["ordinal"] < first["ordinal"]):
+            continue
+        level = first["heading_level"]
+        choices = {section["id"] for section in methods if section["heading_level"] == level}
+        if len(choices) < 2:
+            continue
+        choice = None
+        for section in original:
+            if section["id"] in choices:
+                choice = section["id"]
+            elif section["is_heading"] and (section["heading_level"] or 6) <= (level or 6):
+                choice = None
+            if choice is not None:
+                section.update(group_id="choice-" + choice.removeprefix("section-"),
+                               exclusive_set_id=root, exclusive_parent_group_id=root,
+                               exclusive_choice_section_id=choice)
+    return sections
+
+
+def instruction_scope_groups(sections, selected_groups, *, include_parents=True):
+    """Resolve source-declared dependencies and shared alternative-method context."""
+    parents = {}
+    for section in sections:
+        related = [section.get("exclusive_parent_group_id")]
+        if include_parents:
+            related.append(section.get("parent_group_id"))
+        parents.setdefault(section["group_id"], set()).update(group for group in related if group)
+    result = set(selected_groups)
+    pending = list(result)
+    while pending:
+        for group in parents.get(pending.pop(), ()):
+            if group not in result:
+                result.add(group)
+                pending.append(group)
+    return result
+
+
+def instruction_scope_guard(section, groups):
+    return (section["kind"] in {"WARNING", "PREREQUISITE"}
+            and not section["image_numbers"]
+            and (not section.get("guard_scope_group_ids") or bool(set(section["guard_scope_group_ids"]) & groups))
+            and (not section.get("exclusive_set_id") or section["group_id"] in groups))
+
+
+def _caption_scope(caption, texts, *, strongest_unique=False):
+    """Find source-backed action labels before falling back to lexical evidence."""
+    normalized = normalized_query(caption)
+    labels_present = {}
+    for group, paragraphs in texts.items():
+        labels = [normalized_query(label) for text in paragraphs
+                  for quoted in re.findall(r'[«“"]([^»”"]+)[»”"]', text)
+                  for label in re.split(r"\s*(?:→|->)\s*", quoted)]
+        labels_present[group] = any(len(label) >= 8 and label in normalized for label in labels)
+    matched = [group for group, present in labels_present.items() if present]
+    if matched and (not strongest_unique or len(matched) == 1):
+        return matched
+
+    def triples(text):
+        words = normalized_query(text).split()
+        return set(zip(words, words[1:], words[2:]))
+
+    caption_phrases = triples(caption)
+    matched = [group for group, paragraphs in texts.items()
+               if any(caption_phrases & triples(text) for text in paragraphs)]
+    if matched and (not strongest_unique or len(matched) == 1):
+        return matched
+    terms = {group: _terms("\n".join(paragraphs)) for group, paragraphs in texts.items()}
+    caption_terms = _terms(caption)
+    scores = {group: (len((values - set().union(*(other for key, other in terms.items() if key != group)))
+                         & caption_terms), len(values & caption_terms)) for group, values in terms.items()}
+    if strongest_unique:
+        best = max(scores.values(), default=(0, 0))
+        return [group for group, score in scores.items() if score[0] and score == best]
+    return [group for group, score in scores.items() if score[0] >= 2]
+
+
+def _gallery_sections(sections, captions, galleries):
+    """Associate a shared appendix with its original logical procedure, using source text only."""
+    body_start = 0
+    for gallery in galleries:
+        body = sections[body_start:gallery[0]["ordinal"] - 1]
+        body_start = gallery[-1]["ordinal"]
+        texts, metadata = {}, {}
+        for section in body:
+            if not section["image_numbers"] and not _CAPTION_LABEL.match(section["text"]):
+                texts.setdefault(section["group_id"], []).append(section["text"])
+                metadata[section["group_id"]] = {key: section[key] for key in _PROCEDURE_SCOPE_METADATA
+                                                  if key in section}
+        body_groups = {section["group_id"] for section in body if not section["is_heading"]
+                       and not section["image_numbers"] and not _CAPTION_LABEL.match(section["text"])}
+        texts = {group: paragraphs for group, paragraphs in texts.items() if group in body_groups}
+        if len(texts) < 2:
+            continue
+        numbered = any(_NUMBERED_CHAPTER.fullmatch(section["text"].lstrip("# ")) for section in body)
+        platform_groups = {platform: [group for group, paragraphs in texts.items()
+                                      if pattern.search("\n".join(paragraphs))]
+                           for platform, pattern in _GALLERY_PLATFORMS.items()}
+        pictures = [section for section in gallery if section["image_numbers"]]
+        explicit_scopes = {}
+        for index, section in enumerate(pictures):
+            matched = {group for number in section["image_numbers"]
+                       for platform, pattern in _GALLERY_PLATFORMS.items() if pattern.search(captions[number])
+                       for group in platform_groups[platform]}
+            if len(matched) == 1:
+                explicit_scopes[index] = matched.pop()
+        image_scopes = {}
+        for index, section in enumerate(pictures):
+            preceding = [position for position in explicit_scopes if position < index]
+            following = [position for position in explicit_scopes if position > index]
+            group = explicit_scopes.get(index)
+            if group is None and preceding and following:
+                before, after = explicit_scopes[max(preceding)], explicit_scopes[min(following)]
+                if before == after:
+                    group = before
+            if all(re.match(r"^(?:логотип|logo)\b", captions[number], re.I) for number in section["image_numbers"]):
+                scope = {"group_id": "decoration-" + section["id"].removeprefix("section-")}
+            else:
+                matched = ([group] if group is not None else list(dict.fromkeys(
+                    candidate for number in section["image_numbers"]
+                    for candidate in _caption_scope(captions[number], texts, strongest_unique=numbered))))
+                if len(matched) == 1:
+                    group = matched[0]
+                    scope = {"group_id": group, **metadata[group]}
+                else:
+                    scope = {"group_id": "ambiguous-" + section["id"].removeprefix("section-"),
+                             "scope_ambiguous": True, "scope_group_ids": matched or list(texts)}
+            for key in _IMAGE_SCOPE_METADATA:
+                section.pop(key, None)
+            section.update(scope)
+            for number in section["image_numbers"]:
+                image_scopes[number] = scope
+        for section in gallery:
+            if section["image_numbers"]:
+                continue
+            text = normalized_query(section["text"])
+            scopes = [scope for number, scope in image_scopes.items() if normalized_query(captions[number]) in text]
+            if scopes and all(scope == scopes[0] for scope in scopes):
+                for key in _IMAGE_SCOPE_METADATA:
+                    section.pop(key, None)
+                section.update(scopes[0])
+    return sections
+
+
+def _conditional_method_sections(sections, captions):
+    """Keep explicitly conditional alternative methods outside their parent scope."""
+    groups = dict.fromkeys(section["group_id"] for section in sections
+                           if not section["image_numbers"] and _CONDITIONAL_METHOD.search(section["text"]))
+    for root in groups:
+        original = [section for section in sections if section["group_id"] == root]
+        branches, texts, appendix = {}, {root: []}, set()
+        current, in_appendix = root, False
+        for section in original:
+            label = section["text"].lstrip("# ").rstrip(":")
+            if section["is_heading"] and _ILLUSTRATION_HEADING.fullmatch(" ".join(label.split())):
+                in_appendix = True
+            if in_appendix:
+                appendix.add(section["id"])
+            elif not section["image_numbers"] and (method := _CONDITIONAL_METHOD.search(section["text"])):
+                current = "conditional-" + section["id"].removeprefix("section-")
+                branches[current] = {**{key: section[key] for key in _PROCEDURE_SCOPE_METADATA if key in section},
+                                     "parent_group_id": root, "condition_section_id": section["id"],
+                                     "condition_text": method.group("condition").rstrip(" \t\r\n,;:—–-")}
+                texts[current] = []
+            if not in_appendix and current != root and section["kind"] not in {"WARNING", "PREREQUISITE"}:
+                section.update(group_id=current, **branches[current])
+            if (not in_appendix and not section["is_heading"] and not section["image_numbers"]
+                    and not _CAPTION_LABEL.match(section["text"])):
+                texts[section["group_id"]].append(section["text"])
+
+        image_scopes = {}
+        for section in original:
+            if not section["image_numbers"]:
+                continue
+            matched = list(dict.fromkeys(group for number in section["image_numbers"]
+                                         for group in _caption_scope(captions[number], texts)))
+            if len(matched) == 1:
+                group = matched[0]
+                metadata = {"group_id": group, **branches.get(group, {})}
+            else:
+                metadata = {"group_id": "ambiguous-" + section["id"].removeprefix("section-"),
+                            "scope_ambiguous": True, "scope_group_ids": matched or list(texts)}
+            for key in _IMAGE_SCOPE_METADATA:
+                section.pop(key, None)
+            section.update(metadata)
+            for number in section["image_numbers"]:
+                image_scopes[number] = metadata
+
+        for section in original:
+            if section["image_numbers"] or not (section["id"] in appendix or _CAPTION_LABEL.match(section["text"])):
+                continue
+            normalized = normalized_query(section["text"])
+            matching = [number for number in image_scopes if normalized_query(captions[number]) in normalized]
+            if matching:
+                scopes = [image_scopes[number] for number in matching]
+                for key in _IMAGE_SCOPE_METADATA:
+                    section.pop(key, None)
+                if all(scope == scopes[0] for scope in scopes):
+                    section.update(scopes[0])
+                else:
+                    section.update(group_id="ambiguous-" + section["id"].removeprefix("section-"),
+                                   scope_ambiguous=True,
+                                   scope_group_ids=list(dict.fromkeys(group for scope in scopes
+                                                                      for group in scope.get("scope_group_ids", [scope["group_id"]]))))
     return sections
 
 
@@ -261,7 +594,7 @@ def build_catalog_entry(approved):
 def _tokens(value):
     words = []
     for word in normalized_query(value).split():
-        words.extend([word] if word.isdigit() else sorted(_terms(word)))
+        words.extend([word] if word.isdigit() else sorted(catalog_search_terms(word)))
     return words
 
 

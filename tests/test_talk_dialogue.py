@@ -23,7 +23,7 @@ from app.services.rag.talk import ApprovedTalkDocument, KnowledgeUnavailable
 from integrations.openwebui.automatic_instruction_images import _source_notes, instruction_blocks, render_steps
 from tests.test_openwebui_instruction_images import png
 
-KB = "85cda3aa-b854-4c26-9948-12da742277ef"
+KB = "11111111-1111-4111-8111-111111111111"
 DOC = "00000000-0000-4000-8000-000000000033"
 OTHER = "00000000-0000-4000-8000-000000000044"
 BASE = "https://nextcloud.example.invalid"
@@ -242,7 +242,7 @@ def test_no_matching_instruction_requests_form_without_spending_an_attempt(talk)
     talk.process(knowledge)
     state = talk.snapshot()
     assert state["attempts"] == [] and state["incident"].pending_action == "COLLECT_ESCALATION_DETAILS"
-    assert "В базе знаний нет ответа" in assistants(state)[0][0]
+    assert "подходящую утверждённую инструкцию пока не нашёл" in assistants(state)[0][0]
     assert state["incident"].failed_attempts == 0
 
 

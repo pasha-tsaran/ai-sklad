@@ -12,6 +12,7 @@ _NOISE = frozenset("как что где для при или мой мне ме
                    "база базе знаний docx xlsx pdf md txt файл файла".split())
 _KEYWORDS = ("принтер", "сканер", "терминал", "подключить", "настроить", "штрихкод", "bluetooth")
 _CONNECTIONS = frozenset({"wifi", "bluetooth", "usb", "ethernet"})
+_SHORT_TECHNICAL_TERMS = frozenset({"1с", "qr", "ip"})
 # Equipment plus a generic action says very little about applicability. Such
 # hits need semantic confirmation; named transports, applications and symptoms
 # can still support an inexpensive, specific direct match.
@@ -34,6 +35,9 @@ _WIFI_ALIAS = rf"(?:wi{_ALIAS_SEPARATOR}fi|(?:вай|ви){_ALIAS_SEPARATOR}(?:�
 _BLUETOOTH_ALIAS = rf"(?:blue{_ALIAS_SEPARATOR}tooth|бл[юу]ту[зсф](?:а|у|ом|е)?|(?:блю|блу){_ALIAS_SEPARATOR}ту[зс](?:а|у|ом|е)?)"
 _NEXTCLOUD_ALIAS = rf"(?:next{_ALIAS_SEPARATOR}cloud|некст{_ALIAS_SEPARATOR}кл[ао]уд)"
 _PRODUCT_ALIASES = (
+    (r"1c", "1с"),
+    (r"qr[- ]?код\w*", "qr код"),
+    (r"ip[- ]адрес\w*", "ip адрес"),
     (rf"{_NEXTCLOUD_ALIAS}{_ALIAS_SEPARATOR}(?:talk|т[оа]лк)(?:а|у|ом|е)?", "nextcloud talk"),
     (_NEXTCLOUD_ALIAS, "nextcloud"),
     (rf"(?:forti{_ALIAS_SEPARATOR}gate|форт[ие]?{_ALIAS_SEPARATOR}г[еэ]й?т(?:а|у|ом|е|ы|ов)?)", "fortigate"),
@@ -100,8 +104,20 @@ def retrieval_query(value):
 
 def _terms(value):
     words = [_word(word) for word in normalized_query(value).split()]
-    return {word if word in _CONNECTIONS else word[:5] for word in words
-            if word not in _NOISE and not word.isdigit() and (len(word) >= 3 or word == "1с")}
+    return {word if word in _CONNECTIONS or any(character.isdigit() for character in word) else word[:5]
+            for word in words if word not in _NOISE and not word.isdigit()
+            and (len(word) >= 3 or word in _SHORT_TECHNICAL_TERMS
+                 or any(character.isdigit() for character in word))}
+
+
+def catalog_search_terms(value):
+    """Connect descriptions of print contrast across catalogue languages."""
+    terms = _terms(value)
+    contrast_words = ("контраст", "насыщ", "бледн", "темнот", "темнее",
+                      "contrast", "darkness", "darker", "faded")
+    if any(word.startswith(contrast_words) for word in normalized_query(value).split()):
+        terms.add("printcontrast")
+    return terms
 
 
 def _connections(value):

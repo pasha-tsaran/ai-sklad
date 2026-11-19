@@ -11,10 +11,11 @@ class Settings(BaseSettings):
     database_url: str = "postgresql+psycopg://support:local-demo-db@localhost:5432/support"
     api_token: SecretStr = SecretStr("local-demo-token")
     llm_backend: Literal["mock", "openwebui"] = "mock"
-    openwebui_base_url: str = "https://ai.collant.ru"
+    openwebui_base_url: str = "http://localhost:8080"
     openwebui_api_key: SecretStr = SecretStr("")
     openwebui_model: str = "ai-support"
     openwebui_num_ctx: int | None = Field(default=None, ge=2048, le=131072)
+    openwebui_verification_think: bool = False
     knowledge_backend: Literal["openwebui", "demo"] = "openwebui"
     openwebui_knowledge_ids: list[str] = Field(default_factory=list)
     knowledge_max_chars: int = Field(default=200000, ge=1000, le=200000)

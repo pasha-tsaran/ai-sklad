@@ -34,6 +34,41 @@ def fact(key, value, evidence=None):
     return {"key": key, "value": value, "evidence": evidence or value}
 
 
+@pytest.mark.parametrize("opening,answer,target", [
+    ("Настройка сканера", "Уменьшить громкость сканера штрихкодов", "Уменьшить громкость сканера штрихкодов"),
+    ("Нужно настроить принтер", "Настроить печать этикеток на принтере", "Настроить печать этикеток на принтере"),
+])
+def test_initial_goal_answer_keeps_its_pending_frame_even_if_the_model_marks_it_new(opening, answer, target):
+    question = "Какой результат настройки вам нужен?"
+    model = UnderstandingModel({"new_task": True, "question": question, "question_field": "goal"},
+                               {"new_task": True, "goals": [goal(target, answer)]})
+    previous = update_task_state(opening, None, "", model)
+    result = update_task_state(answer, previous, question, model)
+    assert result["new_task"] is False and result["messages"] == [opening, answer]
+    assert result["goals"]["g1"]["text"] == target
+
+
+@pytest.mark.parametrize("answer", ["Мне нужен первый вход в Outlook", "Другая задача. Уменьшить громкость сканера"])
+def test_a_different_application_or_explicit_new_task_can_replace_an_empty_goal_frame(answer):
+    question = "Какой результат настройки сканера вам нужен?"
+    model = UnderstandingModel({"question": question, "question_field": "goal"},
+                               {"new_task": True, "goals": [goal(answer)]})
+    previous = update_task_state("Настройка сканера", None, "", model)
+    result = update_task_state(answer, previous, question, model)
+    assert result["new_task"] is True and result["messages"] == [answer]
+
+
+def test_a_shared_computer_does_not_turn_a_new_outlook_topic_into_a_scanner_goal_answer():
+    opening = "Нужно настроить сканер на компьютере"
+    answer = "Первый вход в Outlook на этом компьютере"
+    question = "Какой результат настройки сканера нужен?"
+    model = UnderstandingModel({"question": question, "question_field": "goal"},
+                               {"new_task": True, "goals": [goal(answer)]})
+    previous = update_task_state(opening, None, "", model)
+    result = update_task_state(answer, previous, question, model)
+    assert result["new_task"] is True and result["messages"] == [answer]
+
+
 def compound_task():
     message = "Zebra DS2208: сначала сбросить настройки, затем увеличить громкость"
     model = UnderstandingModel({
@@ -41,6 +76,79 @@ def compound_task():
         "goals": [goal("сбросить настройки"), goal("увеличить громкость")],
     })
     return update_task_state(message, None, "", model)
+
+
+def test_explicit_goal_kind_and_discovery_aliases_survive_state_roundtrip_without_becoming_query_facts():
+    message = "Нужен внутренний номер руководства склада"
+    aliases = ["внутренний телефон руководство", "warehouse management extension number"]
+    state = update_task_state(message, None, "", UnderstandingModel({"goals": [{
+        **goal("Найти телефон руководства", message), "kind": "LOOKUP", "search_queries": aliases,
+    }]}))
+    assert state["goals"]["g1"]["kind"] == "LOOKUP"
+    assert state["goals"]["g1"]["search_queries"] == aliases
+    query = task_query(state)
+    assert query == "Найти телефон руководства" and aliases[1] not in query
+    continued = remember_task_message("Ещё нужен номер", state)
+    assert continued["goals"] == state["goals"]
+    updated = update_task_state("Руководство именно склада", continued, "", UnderstandingModel({
+        "goals": [goal("Найти телефон руководства склада", "Руководство именно склада", "g1")],
+    }))
+    assert updated["goals"]["g1"]["kind"] == "LOOKUP" and updated["goals"]["g1"]["search_queries"] == aliases
+
+
+def test_explicit_action_kind_stays_distinguishable_from_a_legacy_unspecified_goal():
+    message = "Открыть рабочую почту"
+    legacy = update_task_state(message, None, "", UnderstandingModel({"goals": [goal(message)]}))
+    explicit = update_task_state(message, None, "", UnderstandingModel({"goals": [{
+        **goal(message), "kind": "ACTION", "search_queries": [],
+    }]}))
+    assert legacy["goals"]["g1"] == {"text": message, "evidence": message}
+    assert explicit["goals"]["g1"] == {
+        "text": message, "evidence": message, "kind": "ACTION", "search_queries": [],
+    }
+    assert remember_task_message("Не получилось", explicit)["goals"] == explicit["goals"]
+
+
+def test_explicit_goal_kind_update_replaces_previous_lookup_metadata():
+    first = "Узнать громкость"
+    state = update_task_state(first, None, "", UnderstandingModel({"goals": [{
+        **goal(first), "kind": "LOOKUP", "search_queries": ["beeper volume"],
+    }]}))
+    later = "Теперь хочу уменьшить громкость"
+    state = update_task_state(later, state, "", UnderstandingModel({"goals": [{
+        **goal("Уменьшить громкость", later, "g1"), "kind": "ACTION", "search_queries": ["decrease volume"],
+    }]}))
+    assert state["goals"]["g1"]["kind"] == "ACTION"
+    assert state["goals"]["g1"]["search_queries"] == ["decrease volume"]
+
+
+@pytest.mark.parametrize("queries", [["x"] * 4, ["x" * 161], [""], ["one\ntwo"]])
+def test_goal_discovery_aliases_are_bounded_and_single_line(queries):
+    with pytest.raises(ValidationError):
+        SupportTaskUnderstanding.model_validate({"goals": [{
+            **goal("Найти телефон"), "kind": "LOOKUP", "search_queries": queries,
+        }]})
+
+
+def test_guide_context_is_passed_only_to_explicitly_capable_providers_and_not_to_new_tasks():
+    guide = {"sources": [{"sections": [{"text": "Откройте приложение."}]}]}
+    legacy = UnderstandingModel({})
+    state = update_task_state("На этом шаге ошибка", None, "", legacy, guide_context=guide)
+    assert len(legacy.calls) == 1 and not state["facts"]
+
+    class GuideModel(UnderstandingModel):
+        supports_guide_context = True
+
+        def understand_task(self, message, previous_state, previous_question, *, guide_context=None):
+            self.guide = guide_context
+            return super().understand_task(message, previous_state, previous_question)
+
+    capable = GuideModel({})
+    update_task_state("На этом шаге ошибка", state, "", capable, guide_context=guide)
+    assert capable.guide == guide
+    new_task = GuideModel({})
+    update_task_state("Другая задача. Открыть почту", state, "", new_task, guide_context=guide)
+    assert new_task.guide is None
 
 
 @pytest.mark.parametrize("message", [
@@ -168,6 +276,8 @@ def test_both_goals_are_retained_without_another_model_call(message):
     "не могу определить", "не могу сказать", "без понятия", "понятия не имею",
     "не уверен", "не уверена", "затрудняюсь ответить", "не помню",
     "не понимаю вопрос", "Не знаю, помогите", "не знаю, что это значит",
+    "Не знаю, я в этом не разбираюсь.", "Я не знаю и не могу определить.",
+    "Ну, я не знаю. Не понимаю вопрос.", "К сожалению, не помню, честно.",
 ])
 def test_unknown_answer_keeps_every_goal_and_fact_without_a_model_call(message):
     previous = compound_task()
@@ -203,6 +313,9 @@ def test_unknown_without_an_asked_question_still_uses_normal_task_understanding(
 @pytest.mark.parametrize("message", [
     "не знаю, но подключено по USB", "не знаю, теперь другая задача",
     "не понимаю, почему не работает", "не знаю название, устройство пищит",
+    "Не знаю, я в этом не разбираюсь, но подключено по USB.",
+    "Не знаю, и теперь другая задача: хочу подключить почту.",
+    "Не знаю пароль", "Не уверен, можно ли сбрасывать сканер",
     "Exchange", "да", "нет", "сначала сброс, потом громкость", None,
 ])
 def test_unknown_shortcut_does_not_swallow_additional_conditions_or_another_task(message):
@@ -535,14 +648,15 @@ def test_real_task_adapter_can_switch_tasks_when_the_model_reuses_a_prior_goal_i
         observed.append(json.loads(body["messages"][-1]["content"]))
         reply = {"new_task": True, "facts": [], "question": "", "question_field": None,
                  "goals": [{"goal_id": "g2", "text": "Открыть корпоративную почту",
-                                               "evidence": "открыть корпоративную почту"}]}
+                           "evidence": "открыть корпоративную почту", "kind": "ACTION", "search_queries": []}]}
         return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(reply)},
                                                       "finish_reason": "stop"}]})
 
     model = OpenWebUILLM(model_settings(), httpx.MockTransport(handler))
     state = update_task_state(message, previous, "", model)
     assert len(observed) == 1
-    assert state["goals"] == {"g1": {"text": "Открыть корпоративную почту", "evidence": "открыть корпоративную почту"}}
+    assert state["goals"] == {"g1": {"text": "Открыть корпоративную почту", "evidence": "открыть корпоративную почту",
+                                      "kind": "ACTION", "search_queries": []}}
     assert state["facts"] == [] and state["messages"] == [message]
 
 
@@ -768,6 +882,15 @@ def test_task_prompt_defers_configuration_questions_to_the_actual_sources():
     assert "IMAP" not in SUPPORT_TASK_TASK and "Outlook" not in SUPPORT_TASK_TASK
 
 
+def test_task_prompt_distinguishes_static_facts_from_workflows_and_preserves_object_identity():
+    assert "подачи обращения — ACTION" in SUPPORT_TASK_TASK
+    assert "Готовое значение, перечень требований" in SUPPORT_TASK_TASK
+    assert "Просьба настроек\nдля начала конкретной работы задаёт ACTION" in SUPPORT_TASK_TASK
+    assert "пока сотрудник не назвал второй" in SUPPORT_TASK_TASK
+    assert "первый и второй принтер" in SUPPORT_TASK_TASK
+    assert "ширина и высота не заменяются одной\nшириной" in SUPPORT_TASK_TASK
+
+
 def model_settings():
     return Settings(_env_file=None, llm_backend="openwebui", openwebui_api_key="test-key",
                     openwebui_model="local-qwen")
@@ -778,16 +901,23 @@ def test_real_adapter_task_stage_has_its_own_user_only_payload_and_bounded_budge
 
     def handler(request):
         body = json.loads(request.content)
-        assert body["max_tokens"] == 1536
-        assert body["params"] == {"think": False, "max_tokens": 1536, "temperature": 0}
+        assert body["max_tokens"] == 4096
+        assert body["params"] == {"think": False, "max_tokens": 4096, "temperature": 0}
         assert body["tools"] == [] and body["tool_ids"] == []
         assert body["features"]["web_search"] is False
         schema = body["response_format"]["json_schema"]["schema"]
         assert schema["title"] == "SupportTaskUnderstanding"
         assert schema["$defs"]["SupportTaskGoal"]["properties"]["goal_id"]["anyOf"][0]["enum"] == ["g1", "g2"]
         payload = json.loads(body["messages"][-1]["content"])
-        assert payload == {"message": "Сначала сброс", "previous_state": previous,
-                           "previous_question": "Что сделать сначала?"}
+        assert {key: payload[key] for key in ("message", "previous_state", "previous_question")} == {
+            "message": "Сначала сброс", "previous_state": previous,
+            "previous_question": "Что сделать сначала?",
+        }
+        assert payload["user_evidence_references"] is True
+        assert "Сначала сброс" in payload["user_evidence"].values()
+        assert payload["current_user_evidence_ids"] == [
+            key for key, text in payload["user_evidence"].items() if text in "Сначала сброс"
+        ]
         assert "catalogue" not in payload and "candidates" not in payload
         assert "JSON Schema: " not in body["messages"][0]["content"]
         response = {"new_task": False, "facts": [], "goals": [], "question": "", "question_field": None}
@@ -815,17 +945,18 @@ def test_explicit_task_boundary_removes_old_goal_identifiers_from_the_real_model
         assert payload["previous_state"]["messages"] == [] and payload["previous_question"] == ""
         response = {"new_task": False, "facts": [], "question": "", "question_field": None,
                     "goals": [{"text": "Открыть рабочую почту", "evidence": "открыть рабочую почту",
-                               "goal_id": None}]}
+                               "goal_id": None, "kind": "ACTION", "search_queries": []}]}
         return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(response)},
                                                      "finish_reason": "stop"}]})
 
     model = OpenWebUILLM(model_settings(), httpx.MockTransport(handler))
     state = update_task_state(message, previous, "Какое действие выполнить сначала?", model)
     assert len(calls) == 1 and state["new_task"] is True
-    assert list(state["goals"].values()) == [{"text": "Открыть рабочую почту", "evidence": "открыть рабочую почту"}]
+    assert list(state["goals"].values()) == [{"text": "Открыть рабочую почту", "evidence": "открыть рабочую почту",
+                                           "kind": "ACTION", "search_queries": []}]
 
 
-@pytest.mark.parametrize("budget", [False, 0, 127, 1537, 2.5, "512"])
+@pytest.mark.parametrize("budget", [False, 0, 127, 4097, 2.5, "512"])
 def test_fast_output_budget_rejects_invalid_or_unbounded_values(budget):
     model = OpenWebUILLM(model_settings())
     with pytest.raises(ValueError, match="InvalidOutputTokenBudget"):

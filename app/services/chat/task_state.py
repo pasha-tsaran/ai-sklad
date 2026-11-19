@@ -4,6 +4,7 @@ import copy
 import re
 
 from app.schemas.contracts import SupportTaskFact, SupportTaskGoal, SupportTaskUnderstanding, SupportUnknownAnswer
+from app.services.chat.pending_task import continues_pending_goal
 
 
 _BOTH = {
@@ -19,6 +20,14 @@ _UNKNOWN_ANSWERS = {
     "не помню", "я не помню", "не понимаю вопрос", "я не понимаю вопрос",
     "не понимаю что вы спрашиваете", "я не понимаю что вы спрашиваете",
 }
+_UNKNOWN_PHRASE = "(?:" + "|".join(
+    re.escape(phrase) for phrase in sorted(_UNKNOWN_ANSWERS, key=len, reverse=True)
+) + ")"
+_UNKNOWN_SEQUENCE = re.compile(
+    rf"^(?:(?:ну|вообще|честно|пока|к сожалению)\s+)?{_UNKNOWN_PHRASE}"
+    rf"(?:\s+(?:(?:и|а|но)\s+)?{_UNKNOWN_PHRASE})*"
+    r"(?:\s+(?:вообще|честно|пока))?$"
+)
 _NEW_TASK_BOUNDARY = re.compile(
     r"^(?:пожалуйста\s+)?(?:а\s+)?(?:(?:теперь|сейчас|у\s+меня)\s+){0,2}(?:"
     r"(?:другая|новая|следующая)\s+(?:задача|проблема|тема)|"
@@ -46,7 +55,18 @@ def is_unknown_answer(message):
         return False
     text = _normalized(message)
     text = re.sub(r"\s+(?:пожалуйста|подскажите|помоги|помогите)$", "", text)
-    return text in _UNKNOWN_ANSWERS
+    return bool(_UNKNOWN_SEQUENCE.fullmatch(text))
+
+
+def _goal_record(goal, previous=None):
+    """Preserve explicit discovery metadata while keeping legacy goal records usable."""
+    record = {"text": goal.text, "evidence": goal.evidence}
+    for name in ("kind", "search_queries"):
+        if name in goal.model_fields_set:
+            record[name] = copy.deepcopy(getattr(goal, name))
+        elif previous is not None and name in previous:
+            record[name] = copy.deepcopy(previous[name])
+    return record
 
 
 def _previous_state(previous):
@@ -65,7 +85,7 @@ def _previous_state(previous):
         if not isinstance(item, dict):
             raise ValueError("InvalidTaskState")
         goal = SupportTaskGoal.model_validate({**item, "goal_id": goal_id})
-        goals[goal_id] = {"text": goal.text, "evidence": goal.evidence}
+        goals[goal_id] = _goal_record(goal)
     messages = previous.get("messages", [])
     unknown = previous.get("unknown_answers", [])
     if (len(facts) > 12 or len(goals) > 8 or not isinstance(messages, list)
@@ -121,7 +141,7 @@ def remember_task_message(message, previous=None):
     return state
 
 
-def update_task_state(message, previous, previous_question, llm):
+def update_task_state(message, previous, previous_question, llm, *, guide_context=None):
     """Merge validated deltas; documents and assistant questions cannot supply facts."""
     if not isinstance(message, str) or not message.strip() or len(message) > 6000:
         raise ValueError("InvalidTaskMessage")
@@ -129,18 +149,25 @@ def update_task_state(message, previous, previous_question, llm):
     prior = _previous_state(None if explicit_new_task else previous)
     if explicit_new_task:
         previous_question = ""
-    if is_unknown_answer(message) and isinstance(previous_question, str) and previous_question.strip():
+    has_previous_question = isinstance(previous_question, str) and bool(previous_question.strip())
+    if is_unknown_answer(message) and (has_previous_question or prior["goals"]):
         return {**copy.deepcopy(prior), "messages": _history(prior["messages"], message),
                 "question": "", "question_field": None,
-                "unknown_answers": _unknown_answer(prior, previous_question, message),
+                "unknown_answers": (_unknown_answer(prior, previous_question, message)
+                                    if has_previous_question else copy.deepcopy(prior["unknown_answers"])),
                 "new_task": False}
     if len(prior["goals"]) >= 2 and _normalized(message) in _BOTH:
         return {**copy.deepcopy(prior), "messages": _history(prior["messages"], message),
                 "question": "", "question_field": None, "new_task": False}
-    raw = llm.understand_task(message, copy.deepcopy(prior), previous_question)
+    options = ({"guide_context": guide_context}
+               if guide_context is not None and not explicit_new_task
+               and getattr(llm, "supports_guide_context", False) is True else {})
+    raw = llm.understand_task(message, copy.deepcopy(prior), previous_question, **options)
     update = SupportTaskUnderstanding.model_validate(raw)
     if explicit_new_task:
         update.new_task = True
+    elif continues_pending_goal(message, prior, previous_question, update):
+        update.new_task = False
     if update.unknown_answer_evidence and (
         not _evidenced(update.unknown_answer_evidence, [message])
         or not isinstance(previous_question, str) or not previous_question.strip() or update.new_task
@@ -181,7 +208,7 @@ def update_task_state(message, previous, previous_question, llm):
         if goal_id is None:
             goal_id = f"g{next_id}"
             next_id += 1
-        goals[goal_id] = {"text": goal.text, "evidence": goal.evidence}
+        goals[goal_id] = _goal_record(goal, existing.get(goal_id))
         updated_goal_ids.append(goal_id)
     if existing.keys() <= set(updated_goal_ids):
         goals = {goal_id: goals[goal_id] for goal_id in updated_goal_ids}
@@ -210,6 +237,8 @@ def update_task_state(message, previous, previous_question, llm):
     state.update({"goals": goals, "messages": _history(state["messages"], message),
                   "question": question, "question_field": question_field,
                   "new_task": update.new_task})
+    if update.replace_goals:
+        state["goal_replacement_evidence"] = update.replacement_evidence
     return state
 
 

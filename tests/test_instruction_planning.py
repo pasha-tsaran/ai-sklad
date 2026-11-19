@@ -9,7 +9,7 @@ import httpx
 import pytest
 
 from app.services.rag.catalog import build_catalog_entry, instruction_sections
-from app.services.rag.talk import KnowledgeUnavailable
+from app.services.rag.talk import MAX_SELECTION_CONTEXT_CHARS, KnowledgeUnavailable, TalkKnowledge
 from tests.test_openwebui_instruction_images import instruction, office
 from tests.test_scanner_original_retrieval import scanner_provider
 from tests.test_talk_knowledge import DOC, OTHER
@@ -19,6 +19,28 @@ def context(*goals):
     return {"instruction_planning": True, "requested_goals": {
         f"g{index}": goal for index, goal in enumerate(goals, 1)
     }}
+
+
+def test_selection_context_retains_current_multi_object_conditions_without_repeated_evidence():
+    message = "Уточняю: у меня два устройства, оба по Wi-Fi. Bluetooth не используется."
+    facts = [{"key": key, "value": value, "entity": entity, "attribute": key,
+              "evidence": message * 3, "negated": negated}
+             for entity in ("device_1", "device_2")
+             for key, value, negated in (("equipment_type", "принтер", False),
+                                         ("connection", "Wi-Fi", False),
+                                         ("connection", "Bluetooth", True))]
+    state = {"facts": facts, "goals": {"g1": {"text": "Подключить устройства", "evidence": message * 3}},
+             "messages": [message * 4], "question": "", "question_field": None}
+    original = copy.deepcopy(state)
+    bounded = TalkKnowledge._instruction_context({"current_message": message, "task_state": state})
+
+    assert bounded["current_message"] == message
+    assert {fact["entity"] for fact in bounded["task_state"]["facts"]} == {"device_1", "device_2"}
+    assert len(bounded["task_state"]["facts"]) == 6
+    assert all("evidence" not in fact for fact in bounded["task_state"]["facts"])
+    assert bounded["task_state"]["goals"] == {"g1": {"text": "Подключить устройства"}}
+    assert len(json.dumps(bounded, ensure_ascii=False)) <= MAX_SELECTION_CONTEXT_CHARS
+    assert state == original
 
 
 def selected_part(payload, file_id, goal_id, text):
@@ -43,6 +65,114 @@ def test_new_unstructured_instruction_keeps_complete_procedure_and_original_phot
     assert list(result.plan[0].sections) == instruction_sections(result.approved.document)
     assert result.plan[0].approved.illustrations[1].data
     assert len([request for request in state["calls"] if "/api/v1/files/" in request.url.path]) == 2
+
+
+def test_informational_excerpt_keeps_selected_facts_and_mandatory_conditions_without_actions_or_photos():
+    width = "Label width: 101,5 мм."
+    height = "Label height: 101,5 мм."
+    warning = "Не отключайте устройство до завершения текущей печати."
+    prerequisite = "Перед настройкой сохраните параметры."
+    unrelated = "Переведите выключатель питания в положение OFF для сброса."
+    caption = "Удерживая кнопку, включите питание для заводского сброса принтера."
+    body = "".join(f"<w:p><w:r><w:t>{text}</w:t></w:r></w:p>"
+                   for text in [warning, prerequisite, width, height, unrelated])
+    knowledge, _ = scanner_provider([(DOC, "Справочник принтера.docx",
+                                     instruction([caption], extra_paragraph=body))])
+
+    def select(payload):
+        part = selected_part(payload, DOC, "g1", width)
+        part["section_ids"] += selected_part(payload, DOC, "g1", height)["section_ids"]
+        return {"result": "MATCH", **part, "delivery_mode": "EXCERPT"}
+
+    knowledge.selector = select
+    result = knowledge.search_with_llm("Какие ширина и высота этикетки по умолчанию?",
+                                       context("Узнать стандартные ширину и высоту"))
+    sections = result.plan[0].sections
+    texts = [section["text"] for section in sections]
+    assert width in texts and height in texts and warning in texts and prerequisite in texts
+    assert unrelated not in texts and caption not in texts
+    assert not any(section["image_numbers"] for section in sections)
+
+
+def test_workbook_excerpt_keeps_exact_value_with_original_headers_without_foreign_rows():
+    original = office({
+        "xl/workbook.xml": '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+                           'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+                           '<sheets><sheet name="Телефоны" r:id="s1"/></sheets></workbook>',
+        "xl/_rels/workbook.xml.rels": '<Relationships><Relationship Id="s1" '
+                                    'Target="/xl/worksheets/sheet1.xml"/></Relationships>',
+        "xl/worksheets/sheet1.xml": '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+            '<sheetData><row><c r="A1" t="inlineStr"><is><t>Рабочие телефоны</t></is></c></row>'
+            '<row><c r="A3" t="inlineStr"><is><t>Сотрудник</t></is></c>'
+            '<c r="B3" t="inlineStr"><is><t>Добавочный номер</t></is></c></row>'
+            '<row><c r="A4" t="inlineStr"><is><t>Руководство</t></is></c><c r="B4"><v>126</v></c></row>'
+            '<row><c r="A5" t="inlineStr"><is><t>Отдел кадров</t></is></c><c r="B5"><v>134</v></c></row>'
+            '</sheetData></worksheet>',
+    })
+    knowledge, _ = scanner_provider([(DOC, "Добавочные телефоны.xlsx", original)])
+    knowledge.selector = lambda payload: {
+        "result": "MATCH", **selected_part(payload, DOC, "g1", "Руководство"), "delivery_mode": "EXCERPT",
+    }
+    result = knowledge.search_with_llm("Как позвонить руководству?", context("Узнать добавочный руководства"))
+    texts = [section["text"] for section in result.plan[0].sections]
+    assert texts == ["Лист: Телефоны", "A1: Рабочие телефоны", "A3: Сотрудник | B3: Добавочный номер",
+                     "A4: Руководство | B4: 126"]
+
+
+def test_excerpt_proof_must_belong_to_explicitly_selected_section():
+    warning = "Не отключайте питание во время выполнения операции."
+    fact = "Стандартная высота этикетки равна 101,5 мм."
+    knowledge, _ = scanner_provider([(DOC, "Параметры.md", (warning + "\n" + fact).encode())])
+
+    def select(payload):
+        part = selected_part(payload, DOC, "g1", warning)
+        part["section_ids"] = selected_part(payload, DOC, "g1", fact)["section_ids"]
+        return {"result": "MATCH", **part, "delivery_mode": "EXCERPT"}
+
+    knowledge.selector = select
+    with pytest.raises(KnowledgeUnavailable, match="InstructionSectionEvidenceMismatch"):
+        knowledge.search_with_llm("Какая стандартная высота этикетки?", context("Узнать высоту"))
+
+
+def test_interleaved_excerpts_in_one_procedure_group_keep_their_own_facts():
+    first = "Стандартная ширина этикетки равна 101,5 мм."
+    middle = "Рабочий телефон поддержки указан в карточке подразделения."
+    last = "Стандартная высота этикетки равна 50 мм."
+    knowledge, _ = scanner_provider([(DOC, "Параметры.md", (first + "\n" + last).encode()),
+                                     (OTHER, "Телефон.md", middle.encode())])
+
+    def select(payload):
+        part = selected_part(payload, DOC, "g1", first)
+        final = selected_part(payload, DOC, "g3", last)
+        part["delivery_mode"] = "EXCERPT"
+        final["delivery_mode"] = "EXCERPT"
+        other = {**selected_part(payload, OTHER, "g2", middle), "delivery_mode": "EXCERPT"}
+        return {"result": "PLAN", "parts": [part, final, other], "missing_goal_ids": []}
+
+    knowledge.selector = select
+    result = knowledge.search_with_llm("Ширина, затем телефон поддержки, затем высота",
+                                       context("Узнать ширину", "Узнать телефон", "Узнать высоту"))
+    assert result.result == "MATCH"
+    assert [part.goal_ids for part in result.plan] == [("g1",), ("g2",), ("g3",)]
+    assert [section["text"] for section in result.plan[0].sections] == [first]
+    assert [section["text"] for section in result.plan[2].sections] == [last]
+
+
+def test_excerpt_part_cannot_share_sections_between_independent_goals():
+    first = "Стандартная ширина этикетки равна 101,5 мм."
+    last = "Стандартная высота этикетки равна 50 мм."
+    knowledge, _ = scanner_provider([(DOC, "Параметры.md", (first + "\n" + last).encode())])
+
+    def select(payload):
+        part = selected_part(payload, DOC, "g1", first)
+        final = selected_part(payload, DOC, "g2", last)
+        part["section_ids"] += final["section_ids"]
+        part["covered_goals"] += final["covered_goals"]
+        return {"result": "MATCH", **part, "delivery_mode": "EXCERPT"}
+
+    knowledge.selector = select
+    with pytest.raises(KnowledgeUnavailable, match="InvalidInstructionExcerpt"):
+        knowledge.search_with_llm("Узнать ширину и высоту", context("Узнать ширину", "Узнать высоту"))
 
 
 def test_short_new_instruction_is_selectable_by_exact_backend_reference_only():
@@ -70,6 +200,34 @@ def test_short_new_instruction_is_selectable_by_exact_backend_reference_only():
     result = knowledge.search_with_llm("Открыть окно", context("Открыть окно"))
     assert result.plan[0].sections[0]["text"] == text
     assert result.approved.document["content"] == text
+
+
+def test_reference_adapter_requires_explicit_delivery_mode_and_restores_an_exact_excerpt():
+    fact = "Стандартная ширина этикетки равна 101,5 мм."
+    action = "Для сброса параметров включите питание, удерживая кнопку."
+    knowledge, _ = scanner_provider([(DOC, "Параметры.md", (fact + "\n" + action).encode())])
+    original_transport = knowledge.transport
+
+    def handler(request):
+        if request.url.path != "/api/chat/completions":
+            return original_transport.handle_request(request)
+        body = json.loads(request.content)
+        wire = json.loads(body["messages"][-1]["content"])
+        reference = next(key for key, value in wire["candidates"]["s1"].items() if fact in value["text"])
+        section = next(key for key, value in wire["candidate_sections"]["s1"].items()
+                       if reference in value["evidence_ids"])
+        schema = body["response_format"]["json_schema"]["schema"]
+        match = next(row for row in schema["anyOf"] if row["properties"]["result"]["const"] == "MATCH")
+        assert "delivery_mode" in match["required"]
+        assert match["properties"]["delivery_mode"]["enum"] == ["PROCEDURE", "EXCERPT"]
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps({
+            "result": "MATCH", "file_id": "s1", "delivery_mode": "EXCERPT", "section_ids": [section],
+            "covered_goals": [{"goal_id": "g1", "evidence_id": reference}],
+        })}}]})
+
+    knowledge.transport = httpx.MockTransport(handler)
+    result = knowledge.search_with_llm("Какая ширина этикетки по умолчанию?", context("Узнать ширину этикетки"))
+    assert [section["text"] for section in result.plan[0].sections] == [fact]
 
 
 def test_document_headings_remain_searchable_without_proving_a_procedure():
@@ -247,14 +405,16 @@ def test_indivisible_procedure_interleaving_requires_grounded_confirmation_befor
     assert "отдельно" in declined.question
 
 
+@pytest.mark.parametrize("delivery_mode", ["PROCEDURE", "EXCERPT"])
 @pytest.mark.parametrize("invalid", ["unknown_section", "other_section", "duplicate_goal", "changed_original"])
-def test_plans_preserve_source_section_goal_and_freshness_proofs(invalid):
+def test_plans_preserve_source_section_goal_and_freshness_proofs(invalid, delivery_mode):
     text = "Откройте настройки рабочего приложения и измените размер шрифта."
     knowledge, state = scanner_provider([(DOC, "Размер шрифта.md", ("# Действия\n" + text +
                                                                "\n# Другое\nОтдельная независимая процедура.").encode())])
 
     def select(payload):
         part = selected_part(payload, DOC, "g1", text)
+        part["delivery_mode"] = delivery_mode
         if invalid == "unknown_section":
             part["section_ids"] = ["section-invented"]
         elif invalid == "other_section":
@@ -289,7 +449,7 @@ def test_absence_requires_expanded_candidates_and_can_find_an_unseen_source():
     knowledge.selector = select
     result = knowledge.search_with_llm("Новое приложение", context("Открыть приложение"))
     assert len(calls) == 2 and calls[1]["expanded_search"] is True
-    assert len(calls[0]["candidates"]) == 3 and len(calls[1]["candidates"]) == 6
+    assert len(calls[0]["candidates"]) == 4 and len(calls[1]["candidates"]) == 6
     assert result.approved.document["source"]["file_id"] == ids[-1]
 
 
@@ -310,6 +470,27 @@ class MemoryCatalog:
         self.values[approved.document["source"]["file_id"]] = build_catalog_entry(approved)
 
 
+def test_strong_original_content_hit_survives_unrelated_vector_and_filename_votes():
+    ids = [f"00000000-0000-4000-8000-{number:012}" for number in range(1, 7)]
+    action = "Чтобы уменьшить громкость устройства, выберите тихий режим по исходной инструкции."
+    rows = [(file_id, f"Настройка устройства {number}.md", "Настройка устройства для подключения к программе.".encode())
+            for number, file_id in enumerate(ids[:-1], 1)]
+    rows.append((ids[-1], "Памятка.md", action.encode()))
+    knowledge, _ = scanner_provider(rows, chunks=[(key, "Настройка устройства") for key in ids[:3]])
+    knowledge.set_catalog(MemoryCatalog([knowledge.read(file_id) for file_id in ids]))
+    calls = []
+
+    def select(payload):
+        calls.append(payload)
+        assert ids[-1] in payload["candidates"]
+        assert len(payload["candidates"]) == 4
+        return {"result": "MATCH", **selected_part(payload, ids[-1], "g1", action)}
+
+    knowledge.selector = select
+    result = knowledge.search_with_llm("Настройка устройства. Уменьшить громкость.", context("Уменьшить громкость"))
+    assert result.approved.document["source"]["file_id"] == ids[-1] and len(calls) == 1
+
+
 def test_full_content_catalogue_retrieves_new_subject_without_filename_rules_or_all_downloads():
     ids = [f"00000000-0000-4000-8000-{number:012}" for number in range(1, 11)]
     rows = [(file_id, f"Материал {number}.md", ("Обычная справка рабочего места." if number < 9 else
@@ -327,7 +508,7 @@ def test_full_content_catalogue_retrieves_new_subject_without_filename_rules_or_
     knowledge.selector = select
     result = knowledge.search_with_llm("Экспорт отчёта в CSV", context("Экспортировать отчёт"))
     assert result.approved.document["source"]["file_id"] == ids[-1] and len(calls) == 1
-    assert len([request for request in state["calls"] if "/api/v1/files/" in request.url.path]) == 4
+    assert len([request for request in state["calls"] if "/api/v1/files/" in request.url.path]) == 5
 
 
 def test_per_user_exclusion_does_not_remove_source_from_shared_catalogue():
@@ -375,7 +556,7 @@ def test_two_hundred_sources_keep_a_bounded_prompt_and_find_new_upload_at_end():
     result = knowledge.search_with_llm("Экспортировать отчёт CSV", context("Экспорт отчёта CSV"))
     assert result.approved.document["source"]["file_id"] == ids[-1] and len(calls) == 1
     assert len(catalog.values) == 200
-    assert len([request for request in state["calls"] if "/api/v1/files/" in request.url.path]) == 4
+    assert len([request for request in state["calls"] if "/api/v1/files/" in request.url.path]) == 5
 
 
 def test_incomplete_cold_catalogue_reports_indexing_instead_of_false_absence():
@@ -462,6 +643,10 @@ def test_real_reference_adapter_binds_multi_source_parts_to_source_sections():
         branch = next(row for row in schema["anyOf"] if row["properties"]["result"]["const"] == "PLAN")
         assert branch["properties"]["parts"]["maxItems"] == 2
         assert schema["$defs"]["PartReference_s1"]["properties"]["file_id"]["const"] == "s1"
+        assert "delivery_mode" in schema["$defs"]["PartReference_s1"]["required"]
+        excerpt = schema["$defs"]["ExcerptPartReference_s1"]
+        assert excerpt["properties"]["covered_goals"]["maxItems"] == 1
+        assert excerpt["properties"]["delivery_mode"]["const"] == "EXCERPT"
         return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps({
             "result": "PLAN", "parts": parts, "missing_goal_ids": [],
         })}}]})

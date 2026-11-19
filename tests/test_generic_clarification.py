@@ -432,7 +432,8 @@ def test_real_adapter_reference_selection_reaches_durable_original_photo_without
                           {"key": "scope", "value": "application", "evidence": "в программе ПотокДело"}],
                 "goals": [{"text": "Первое подключение рабочей папки в ПотокДело",
                            "evidence": "впервые подключить рабочую папку в программе ПотокДело",
-                           "goal_id": "g1" if resume_previous_task else None}],
+                           "goal_id": "g1" if resume_previous_task else None,
+                           "kind": "ACTION", "search_queries": []}],
                 "question": "Какой протокол доступа использует эта папка — SMB или WebDAV?",
                 "question_field": "connection",
             }
@@ -449,6 +450,10 @@ def test_real_adapter_reference_selection_reaches_durable_original_photo_without
             goal_id = next(iter(payload["requested_goals"]))
             response = {"result": "MATCH", "file_id": file_id,
                         "covered_goals": [{"goal_id": goal_id, "evidence_id": evidence_id}]}
+            if payload.get("instruction_planning") is True:
+                section_id = next(key for key, section in payload["candidate_sections"][file_id].items()
+                                  if evidence_id in section["evidence_ids"])
+                response.update(section_ids=[section_id], delivery_mode="PROCEDURE")
             assert set(response["covered_goals"][0]) == {"goal_id", "evidence_id"}
             assert caption not in json.dumps(response, ensure_ascii=False)
         return httpx.Response(200, json={"choices": [{"message": {
@@ -471,6 +476,10 @@ def test_real_adapter_reference_selection_reaches_durable_original_photo_without
     assert selected["text"] in attempt.evidence["content"]
     assert attempt.evidence["talk_source"]["file_id"] == DOC
     assert attempt.evidence["talk_source"]["sha256"] == hashlib.sha256(data).hexdigest()
-    assert attempt.evidence["source"]["file_id"] == DOC
+    if calls[-1].get("instruction_planning") is True:
+        assert attempt.evidence["source"]["sources"] == [attempt.evidence["talk_source"]]
+        assert attempt.evidence["source"]["plan_digest"] == accepted["flow"]["instruction_plan"]["digest"]
+    else:
+        assert attempt.evidence["source"]["file_id"] == DOC
     photos = [photo for _, photo in replies_since(pending, accepted) if photo]
     assert [photo.data for photo in photos] == [read_docx_images(data)[0].data]

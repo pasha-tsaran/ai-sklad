@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt
 
@@ -74,6 +74,10 @@ class SupportTaskGoal(StrictModel):
     text: str = Field(min_length=1, max_length=250)
     evidence: str = Field(min_length=1, max_length=300)
     goal_id: str | None = Field(default=None, pattern=r"^g[1-9][0-9]*$")
+    kind: Literal["ACTION", "LOOKUP"] = "ACTION"
+    search_queries: list[Annotated[str, Field(min_length=1, max_length=160, pattern=r"^[^\r\n]+$")]] = Field(
+        default_factory=list, max_length=3,
+    )
 
 
 class SupportUnknownAnswer(StrictModel):

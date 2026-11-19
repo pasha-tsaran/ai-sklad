@@ -72,13 +72,28 @@ _UI_FOLLOWUP = re.compile(
     re.I,
 )
 
+_PASSWORD_GUIDANCE = re.compile(
+    r"\b(?:как\s+(?:мне\s+)?|инструкци\w*\s+(?:по\s+)?|порядок\s+)"
+    r"(?:смен\w*|измен\w*|сброс\w*|восстанов\w*)\s+"
+    r"(?:(?:сво\w*|мой|рабоч\w*|локальн\w*|уч[её]тн\w*|корпоративн\w*)\s+){0,3}"
+    r"(?:парол\w*|password)\b",
+    re.I,
+)
+_PASSWORD_WORKFLOW = re.compile(
+    r"\b(?:смен\w*|измен\w*|сброс\w*|восстанов\w*)\b.{0,70}\bпарол\w*\b|"
+    r"\bпарол\w*\b.{0,70}\b(?:смен\w*|измен\w*|сброс\w*|восстанов\w*)\b",
+    re.I,
+)
+
 def refusal_reply(message):
     normalized = str(message).casefold().replace("ё", "е")
-    return REFUSAL if _SECRET_REQUEST.search(normalized) or _INTERNAL_CHANGE.search(normalized) else None
+    disclosure_request = _PASSWORD_GUIDANCE.sub("порядок действий", normalized)
+    return REFUSAL if _SECRET_REQUEST.search(disclosure_request) or _INTERNAL_CHANGE.search(normalized) else None
 
 
 def requires_support(message):
-    return bool(_TECHNICAL.search(str(message)) or _UI_FOLLOWUP.search(str(message)))
+    return bool(_TECHNICAL.search(str(message)) or _UI_FOLLOWUP.search(str(message))
+                or _PASSWORD_WORKFLOW.search(str(message)))
 
 
 def safe_social_reply(reply):

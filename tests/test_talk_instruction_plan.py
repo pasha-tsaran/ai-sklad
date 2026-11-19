@@ -285,8 +285,10 @@ def test_real_reference_adapter_selects_multisource_plan_with_negative_condition
                 {"key": "connection", "value": "кабель", "entity": "терминал", "negated": True,
                  "evidence": "Кабель не используется"},
             ], "goals": [
-                {"text": "изменить яркость терминала", "evidence": "изменить яркость терминала", "goal_id": None},
-                {"text": "размер шрифта в АльфаРегистр", "evidence": "размер шрифта в АльфаРегистр", "goal_id": None},
+                {"text": "изменить яркость терминала", "evidence": "изменить яркость терминала", "goal_id": None,
+                 "kind": "ACTION", "search_queries": []},
+                {"text": "размер шрифта в АльфаРегистр", "evidence": "размер шрифта в АльфаРегистр", "goal_id": None,
+                 "kind": "ACTION", "search_queries": []},
             ], "question": "Какой протокол использует приложение?", "question_field": "connection"}
         else:
             assert payload["instruction_planning"] is True and payload["evidence_references"] is True

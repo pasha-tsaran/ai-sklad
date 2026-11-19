@@ -163,6 +163,31 @@ def test_social_and_protected_replies_keep_pending_understanding(model_chat, mes
     assert any(photo for _, photo in following_replies(result, accepted))
 
 
+def test_rejected_identical_scope_is_not_presented_for_confirmation_again(model_chat):
+    chat = enabled_chat(model_chat, [match(), match()])
+    first = chat.send(QUESTION)
+    rejected = chat.send("Нет", 2)
+    assert rejected["flow"]["rejected_scope_ids"]
+    correction = chat.send("Мне надо уменьшить громкость сканера", 3)
+    assert "understanding_confirmation" not in correction["flow"]
+    assert correction["incident"].result == "NO_KNOWLEDGE"
+    assert correction["incident"].escalation_reason == "NO_KNOWLEDGE"
+    assert len(chat.model.calls) == 2
+    assert "Что должно быть иначе" not in "\n".join(
+        text for text, _ in following_replies(rejected, correction))
+    assert not correction["attempts"] and not any(photo for _, photo in following_replies(first, correction))
+
+
+def test_confirmation_keeps_canonical_summary_and_escapes_parentheses_once(model_chat):
+    summary = "Настроить громкость сканера (само устройство)"
+    chat = enabled_chat(model_chat, [match(summary=summary)])
+    first = chat.send(QUESTION)
+    assert first["flow"]["understanding_confirmation"]["summary"] == summary
+    text = "\n".join(content for content, _ in assistants(first))
+    assert "\\(само устройство\\)" in text and "\\\\(" not in text
+    no_ticket_or_feedback(chat)
+
+
 def test_unclear_reply_repeats_one_confirmation_without_retrieving_again(model_chat):
     chat = enabled_chat(model_chat, [match()])
     first = chat.send(QUESTION)

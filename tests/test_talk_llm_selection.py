@@ -1284,6 +1284,27 @@ def test_missing_or_duplicate_question_grounds_stop_after_one_repair(update):
     assert len(calls) == 2 and calls[-1]["source_question_retry"] is True
 
 
+@pytest.mark.parametrize("invalid_second", [False, True])
+def test_one_original_can_ground_a_question_with_two_distinct_verified_fragments(invalid_second):
+    first = "Для печати PDF откройте документ в программе на рабочем компьютере."
+    second = "Для обычного текстового документа проверьте окно используемой программы."
+    knowledge, _ = scanner_provider([(DOC, "Печать документов.docx", instruction([first, second]))])
+    knowledge.selector = lambda payload: sourced_question(
+        "Документ открыт в программе для PDF или в текстовом редакторе?",
+        sources=[{"file_id": DOC, "evidence": first},
+                 {"file_id": DOC, "evidence": "Придуманное основание отсутствует в оригинале."
+                  if invalid_second else second}],
+    )
+    context = {"source_clarification_required": True}
+    if invalid_second:
+        with pytest.raises(KnowledgeUnavailable, match="InstructionEvidenceMismatch"):
+            knowledge.search_with_llm("При печати запрашивает другую бумагу", context)
+    else:
+        result = knowledge.search_with_llm("При печати запрашивает другую бумагу", context)
+        assert result.result == "CLARIFY"
+        assert [item.document["source"]["file_id"] for item in result.clarification_sources] == [DOC]
+
+
 @pytest.mark.parametrize("failure", ["quote", "source", "stale"])
 def test_source_question_never_bypasses_original_evidence_scope_or_freshness(failure):
     knowledge, state, _ = selection_store()

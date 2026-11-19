@@ -5,10 +5,11 @@ import pytest
 from pydantic import ValidationError
 
 from app.core.config import Settings
+from app.schemas.contracts import FollowupResult
 from app.services.llm.openwebui import OpenWebUILLM
 
 
-def model_with_response(content, inspect_request=None):
+def model_with_response(content, inspect_request=None, *, structured_schema=None):
     def handler(request):
         assert request.url == "https://webui.example.invalid/api/chat/completions"
         payload = json.loads(request.content)
@@ -17,7 +18,15 @@ def model_with_response(content, inspect_request=None):
         assert payload["tool_ids"] == []
         assert payload["tools"] == []
         assert payload["features"] == {"web_search": False}
-        assert payload["response_format"] == {"type": "json_object"}
+        if structured_schema is None:
+            assert payload["response_format"] == {"type": "json_object"}
+        else:
+            assert payload["response_format"] == {"type": "json_schema", "json_schema": {
+                "name": "instruction_selection", "schema": structured_schema.model_json_schema(),
+            }}
+            assert payload["params"]["think"] is False
+            assert payload["params"]["temperature"] == 0
+            assert payload["params"]["max_tokens"] == payload["max_tokens"] == 512
         assert [message["role"] for message in payload["messages"]] == ["system", "user"]
         if inspect_request:
             inspect_request(payload)
@@ -93,11 +102,11 @@ def test_followup_chain_returns_only_typed_source_selection():
             "context": CONTEXT,
             "approved_source": APPROVED_SOURCE,
         }
-        schema = json.loads(payload["messages"][0]["content"].split("JSON Schema:", 1)[1])
+        schema = payload["response_format"]["json_schema"]["schema"]
         assert schema["additionalProperties"] is False
         assert set(schema["properties"]) == set(answer)
 
-    model = model_with_response(json.dumps(answer), inspect_request)
+    model = model_with_response(json.dumps(answer), inspect_request, structured_schema=FollowupResult)
     assert model.followup("Где эта кнопка?", CONTEXT, APPROVED_SOURCE).model_dump() == answer
 
 
@@ -114,13 +123,13 @@ def test_followup_chain_returns_only_typed_source_selection():
     ],
 )
 def test_followup_chain_rejects_prose_generated_actions_and_invalid_indices(content):
-    model = model_with_response(content)
+    model = model_with_response(content, structured_schema=FollowupResult)
     with pytest.raises(ValidationError):
         model.followup("Где эта кнопка?", CONTEXT, APPROVED_SOURCE)
 
 
 def test_followup_can_report_absent_answer_without_generated_advice():
-    model = model_with_response('{"result":"NO_KNOWLEDGE"}')
+    model = model_with_response('{"result":"NO_KNOWLEDGE"}', structured_schema=FollowupResult)
     assert model.followup("Какое напряжение выставить?", CONTEXT, APPROVED_SOURCE).model_dump() == {
         "result": "NO_KNOWLEDGE",
         "source_chunk_ids": [],
@@ -141,6 +150,6 @@ def test_chain_never_enables_remote_tracing_from_environment(monkeypatch):
     monkeypatch.setenv("LANGSMITH_TRACING", "true")
     monkeypatch.setenv("LANGCHAIN_TRACING_V2", "true")
     monkeypatch.setattr(LangChainTracer, "__init__", unexpected_tracer)
-    model = model_with_response('{"result":"NO_KNOWLEDGE"}')
+    model = model_with_response('{"result":"NO_KNOWLEDGE"}', structured_schema=FollowupResult)
     model.followup("Где эта кнопка?", CONTEXT, APPROVED_SOURCE)
     assert tracer_calls == []

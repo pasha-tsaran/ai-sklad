@@ -477,7 +477,8 @@ def main(argv=None):
         report = run_cases(runner, cases, progress=lambda row: print(json.dumps(row, ensure_ascii=False), flush=True))
         from app.main import app
 
-        report.update(app_version=app.version, model=settings.openwebui_model)
+        report.update(app_version=app.version, model=settings.openwebui_model,
+                      verification_thinking=settings.openwebui_verification_think)
         if args.all_instructions:
             report["catalogue"] = check_catalogue(
                 settings, progress=lambda row: print(json.dumps(row, ensure_ascii=False), flush=True),

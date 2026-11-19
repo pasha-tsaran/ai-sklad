@@ -53,10 +53,19 @@ def cache_key(settings, query, context):
                  "unknown_answers": sorted((normalized_query(item.get("question", "")),
                                             normalized_query(item.get("answer", "")))
                                            for item in state.get("unknown_answers", context.get("unknown_answers", [])))}
+        kinds = [goal.get("kind") if isinstance(goal, dict) else None for goal in state["goals"].values()]
+        if any(kind is not None and kind not in {"ACTION", "LOOKUP"} for kind in kinds):
+            return None
+        if any(kind is not None for kind in kinds):
+            facts.update(version=3, goal_kinds=kinds)
     else:
         incident = context.get("incident", {}) if isinstance(context, dict) else {}
         facts = {key: normalized_query(incident.get(key)) for key in ("equipment_model", "problem_type")}
-    query_identity = {"purpose": "typed_task_v2", "goals": facts["goals"]} if "version" in facts else text
+    query_identity = text
+    if "version" in facts:
+        query_identity = {"purpose": f"typed_task_v{facts['version']}", "goals": facts["goals"]}
+        if "goal_kinds" in facts:
+            query_identity["goal_kinds"] = facts["goal_kinds"]
     return {"scope_hash": scope, "query_hash": _digest(query_identity), "context_hash": _digest(facts)}
 
 
@@ -102,7 +111,7 @@ def _hint_key(settings, query, incident_id):
     if not normalized:
         return None
     return {"scope_hash": scope, "query_hash": _digest(normalized),
-            "context_hash": _digest({"purpose": "clarification_hint_v1", "incident_id": incident_id})}
+            "context_hash": _digest({"purpose": "clarification_hint_v2", "incident_id": incident_id})}
 
 
 def _opening_was_reported(session, incident_id, opening_query, source):
@@ -323,6 +332,9 @@ class SuccessfulTalkKnowledge:
         problem = fallback_query if isinstance(fallback_query, str) and fallback_query.strip() else query
         selection_context = dict(context or self.context)
         self.last_cache_key = cache_key(self.settings, problem, selection_context)
+        if selection_context.get("rejected_scope_ids"):
+            self.last_cache_key = None
+            selection_context.pop("verified_previous_source", None)
         self.cache_hit = False
         if self.last_cache_key and selection_context.get("instruction_planning"):
             previous_plan = self._lookup_plan(self.last_cache_key, selection_context, excluded)
@@ -391,7 +403,7 @@ class SuccessfulTalkKnowledge:
                 continue
             remapped = tuple(InstructionPlanPart(part.approved,
                 tuple(labels[normalized_query(goal)] for goal in part.goals), part.goals,
-                part.section_ids, part.sections) for part in parts)
+                part.section_ids, part.sections, delivery_mode=part.delivery_mode) for part in parts)
             verified[plan["digest"]] = InstructionDecision("MATCH", approved=parts[0].approved,
                 covered_goals=tuple(goal for part in parts for goal in part.goals), plan=remapped)
         return next(iter(verified.values())) if len(verified) == 1 else None

@@ -10,6 +10,7 @@ from app.db import session_factory
 from app.models import Base, Conversation, Feedback, Incident, Message, SolutionAttempt, SuccessfulRetrieval, User, now
 from app.services.rag.openwebui import save_snapshot
 from app.services.rag.success import SuccessfulTalkKnowledge, cache_key, remember_success
+from app.services.rag.talk import InstructionDecision
 from tests.test_openwebui_instruction_images import instruction
 from tests.test_talk_knowledge import DOC, KB, QUERY, provider
 
@@ -173,6 +174,38 @@ def test_excluded_source_is_not_retried_even_when_previously_successful(cached):
     assert wrapper.search(QUERY, excluded=[DOC]) is None
     assert not wrapper.cache_hit
     assert not any("/files/" in request.url.path for request in cached.state["calls"])
+
+
+@pytest.mark.parametrize("instruction_planning", [False, True])
+def test_rejected_scope_bypasses_success_cache_and_removes_previous_source_hint(cached, monkeypatch,
+                                                                             instruction_planning):
+    cached.remember()
+    wrapper = cached.wrapper()
+    context = {**cached.context, "instruction_planning": instruction_planning,
+               "requested_goals": {"g1": QUERY}, "rejected_scope_ids": ["scope-rejected-by-user"],
+               "verified_previous_source": {"file_id": DOC, "sha256": cached.approved.document["source"]["sha256"]}}
+    calls = []
+    fresh = InstructionDecision("NO_KNOWLEDGE")
+
+    def forbidden_lookup(*args, **kwargs):
+        raise AssertionError("A rejected interpretation must not return through a successful cache pointer")
+
+    def fresh_search(query, **options):
+        calls.append((query, options))
+        return fresh
+
+    monkeypatch.setattr(wrapper, "_lookup", forbidden_lookup)
+    monkeypatch.setattr(wrapper, "_lookup_plan", forbidden_lookup)
+    monkeypatch.setattr(cached.knowledge, "search_with_llm", fresh_search)
+    assert wrapper.search_with_llm(QUERY, context=context) is fresh
+    assert wrapper.cache_hit is False and wrapper.last_cache_key is None
+    assert calls[0][0] == QUERY and len(calls) == 1
+    forwarded = calls[0][1]["context"]
+    assert forwarded["rejected_scope_ids"] == ["scope-rejected-by-user"]
+    assert forwarded["requested_goals"] == {"g1": QUERY}
+    assert "verified_previous_source" not in forwarded
+    assert context["verified_previous_source"]["file_id"] == DOC
+    assert count(cached) == 1
 
 
 @pytest.mark.parametrize("change", ["changed-original", "revoked-membership", "expired", "deleted-feedback"])
