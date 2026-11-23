@@ -172,6 +172,36 @@ def test_failed_knowledge_search_cannot_be_reported_as_missing_instruction():
     assert turn.blocks == [(UNAVAILABLE, None)]
 
 
+def test_initial_search_runs_before_model_and_supplies_candidates_for_reading():
+    doc = approved()
+    knowledge = Sources([doc])
+    knowledge.prefetch_candidates = knowledge.search_candidates
+    question = "Как настроить печать?"
+    agent = Agent(read(doc), answer(doc))
+    turn = run_agent(question, {}, {}, agent, knowledge, settings())
+    assert turn.action == "AGENT_REPLY"
+    first = agent.payloads[0]["tool_results"][0]
+    assert first["initial"] and first["query"] == question
+    assert knowledge.searches == [question]
+
+
+def test_empty_initial_search_requires_reformulating_before_admitting_no_instruction():
+    class EmptySources(Sources):
+        def search_candidates(self, query):
+            self.searches.append(query)
+            return {"candidates": [], "search_degraded": False}
+
+        prefetch_candidates = search_candidates
+
+    knowledge = EmptySources()
+    missing = {"action": "reply", "kind": "no_knowledge", "blocks": [{"text": "Инструкция не найдена."}]}
+    agent = Agent(missing, search(), missing)
+    result = run_agent("Как отправить этикетку на печать?", {}, {}, agent, knowledge, settings())
+    assert result.blocks == [("Инструкция не найдена.", None)]
+    assert len(knowledge.searches) == 2
+    assert agent.payloads[1]["tool_results"][-1]["error"] == "TrySearchByDifferentWordsOrActionsBeforeNoKnowledge"
+
+
 @pytest.mark.parametrize("invalid,error", [
     ({"action": "read_instruction", "file_id": "outside"}, "SearchBeforeReadingUnknownSource"),
     ({"action": "reply", "kind": "instruction", "blocks": [{"text": "Нажмите кнопку"}]}, "ReadFullInstructionBeforeReply"),

@@ -141,7 +141,7 @@ class _TimedProxy:
     def __getattr__(self, name):
         value = getattr(self.target, name)
         stage = self.stages.get(name)
-        if stage is None:
+        if stage is None or not callable(value):
             return value
 
         def invoke(*args, **kwargs):
@@ -2751,6 +2751,7 @@ def process_one(factory, settings, llm, knowledge=None, *, account_id=None):
         )
         timed_knowledge = _TimedProxy(cached_knowledge, metadata,
                                       {"search": "search", "search_with_llm": "search", "search_candidates": "search",
+                                       "prefetch_candidates": "search",
                                        "read": "read", "is_current": "verify"})
         with _measure(metadata, "route"):
             paused = None

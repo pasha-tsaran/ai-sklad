@@ -54,7 +54,7 @@ def _approved_outlook_reply(message, knowledge, start_sequence):
 
 
 def run_agent(message, flow, context, llm, knowledge, settings):
-    from app.services.chat.talk_dialogue import Turn, UNAVAILABLE
+    from app.services.chat.talk_dialogue import Turn, UNAVAILABLE, _simple_social, _step_confirmed
 
     saved = copy.deepcopy(flow.get("agent", {}))
     legacy_memory = {"goal": str(flow.get("query", ""))[:1000],
@@ -72,6 +72,21 @@ def run_agent(message, flow, context, llm, knowledge, settings):
         if direct_reply is not None:
             event("talk.agent_direct_instruction", scenario="outlook_large_mail")
             return direct_reply
+    feedback = context.get("agent_feedback", {})
+    prefetch = getattr(knowledge, "prefetch_candidates", None)
+    initial_result = None
+    searches = {}
+    if (callable(prefetch) and normalized_query(message) and not _simple_social(message)
+            and not _step_confirmed(message) and not requests_support_form(message)):
+        query = " ".join(message.split())[:1000]
+        try:
+            result = reorder_candidates(prefetch(query), feedback)
+            searches[normalized_query(query)] = result
+            initial_result = {"tool": "search_knowledge", "query": query, "result": result, "initial": True}
+        except KnowledgeUnavailable as error:
+            initial_result = {"tool": "search_knowledge", "error": error.code, "initial": True}
+        event("talk.agent_initial_search", candidates=len(initial_result.get("result", {}).get("candidates", [])),
+              error_code=initial_result.get("error"))
     boundary = saved.get("start_sequence")
     if type(boundary) is int:
         recent = [row for row in recent if row.get("sequence", 0) >= boundary]
@@ -84,7 +99,7 @@ def run_agent(message, flow, context, llm, knowledge, settings):
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as error:
             event("talk.agent_task_relation_failed", error_code=type(error).__name__)
             return Turn("REPLY", [(MODEL_UNAVAILABLE, None)], flow=copy.deepcopy(flow))
-    if relation == "unclear":
+    if relation == "unclear" and initial_result is None:
         return Turn("REPLY", [("Это продолжение предыдущего вопроса или новая задача? Уточните, пожалуйста.", None)],
                     flow=copy.deepcopy(flow))
     if relation == "new":
@@ -97,11 +112,11 @@ def run_agent(message, flow, context, llm, knowledge, settings):
     legacy = {key: copy.deepcopy(flow[key]) for key in (
         "query", "source", "shown", "next_offset", "has_more", "instruction_plan",
     ) if key in flow} if not saved else {}
-    feedback = context.get("agent_feedback", {})
     agent_context = ({"short_term": {"messages": recent}} if type(boundary) is int else
                      {key: value for key, value in context.items() if key != "agent_feedback"})
     payload = {"message": message, "context": agent_context, "memory": memory,
-               "active_sources": saved.get("sources", []), "previous_progress": legacy, "tool_results": []}
+               "active_sources": saved.get("sources", []), "previous_progress": legacy,
+               "tool_results": [initial_result] if initial_result else []}
     loaded, ranges = {}, {}
     allowed = {source["file_id"] for source in saved.get("sources", []) if isinstance(source, dict)
                and isinstance(source.get("file_id"), str)}
@@ -110,7 +125,13 @@ def run_agent(message, flow, context, llm, knowledge, settings):
     for part in flow.get("instruction_plan", {}).get("parts", []):
         allowed.add(part["source"]["file_id"])
     limit = settings.talk_agent_context_chars
-    failure, knowledge_failed, verified_search = "CallLimit", False, False
+    first = (initial_result or {}).get("result")
+    if first is not None:
+        allowed.update(item["file_id"] for item in first["candidates"])
+    failure = "CallLimit"
+    knowledge_failed = bool(initial_result and (first is None or first.get("search_degraded")))
+    verified_search = first is not None and not first.get("search_degraded", False)
+    tried_reformulation = False
     for index in range(settings.talk_agent_max_calls):
         if len(json.dumps(payload, ensure_ascii=False)) > limit:
             failure = "ContextBudget"
@@ -129,7 +150,14 @@ def run_agent(message, flow, context, llm, knowledge, settings):
             if action.action == "search_knowledge":
                 if not action.query.strip():
                     raise ValueError("EmptySearchQuery")
-                result = reorder_candidates(knowledge.search_candidates(action.query), feedback)
+                key = normalized_query(action.query)
+                result = searches.get(key)
+                if result is None:
+                    result = reorder_candidates(knowledge.search_candidates(action.query), feedback)
+                    searches[key] = result
+                    tried_reformulation |= not result.get("search_degraded", False) or bool(result["candidates"])
+                else:
+                    raise ValueError("SearchAlreadyReturnedUseCandidatesOrRephrase")
                 verified_search |= not result.get("search_degraded", False)
                 knowledge_failed |= bool(result.get("search_degraded", False))
                 allowed.update(item["file_id"] for item in result["candidates"])
@@ -171,6 +199,8 @@ def run_agent(message, flow, context, llm, knowledge, settings):
                 return _profile_form_request(flow, context)
             else:
                 complete = {key: doc for key, doc in loaded.items() if ranges.get(key) == len(doc.document["content"])}
+                if action.kind == "no_knowledge" and first is not None and not tried_reformulation:
+                    raise ValueError("TrySearchByDifferentWordsOrActionsBeforeNoKnowledge")
                 if action.kind == "no_knowledge" and knowledge_failed and not verified_search:
                     raise KnowledgeUnavailable("SearchCouldNotBeVerified")
                 turn = _reply(action, message, flow, memory, complete, knowledge)

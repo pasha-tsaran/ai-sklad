@@ -226,6 +226,10 @@ class SuccessfulTalkKnowledge:
     def search_candidates(self, query):
         return self.delegate.search_candidates(query)
 
+    @property
+    def prefetch_candidates(self):
+        return getattr(self.delegate, "prefetch_candidates", None)
+
     def _forget(self, key):
         with self.factory() as session, session.begin():
             row = session.scalar(select(SuccessfulRetrieval).filter_by(user_id=self.principal, **key))

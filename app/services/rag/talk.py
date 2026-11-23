@@ -571,6 +571,9 @@ class TalkKnowledge:
             report_failure(failure)
             raise failure from None
 
+    def prefetch_candidates(self, query):
+        return self.search_candidates(query)
+
     def search_candidates(self, query):
         """Discovery only: the dialogue agent, not a second model, chooses what to read."""
         from types import SimpleNamespace
