@@ -8,7 +8,8 @@ from sqlalchemy import select
 from app.core.config import Settings
 from app.models import Delivery, Feedback, ResolutionMemory
 from app.services.chat.agent_dialogue import (
-    MODEL_UNAVAILABLE, OUTLOOK_LARGE_MAIL_FILE, OUTLOOK_LARGE_MAIL_SHA256, PAGE_CHARS, run_agent,
+    MODEL_UNAVAILABLE, OUTLOOK_LARGE_MAIL_FILE, OUTLOOK_LARGE_MAIL_SHA256, PAGE_CHARS, WINDOWS_SCREEN_FILE,
+    WINDOWS_SCREEN_SHA256, run_agent,
 )
 from app.services.chat.talk_dialogue import UNAVAILABLE, _resume_turn, _text_turn
 from app.services.chat.talk_feedback import learned_feedback, reorder_candidates, source_key
@@ -142,10 +143,11 @@ def test_large_outlook_mail_uses_current_approved_original_without_model():
     knowledge = Sources([doc])
     old = {"agent": {"memory": {"goal": "Настроить печать"}}}
     result = run_agent(question, old, {}, Agent(), knowledge, settings())
-    assert result.action == "AGENT_REPLY" and len(result.blocks) == 4
+    assert result.action == "AGENT_REPLY" and len(result.blocks) == 8
     assert result.agent_documents[0].document["source"] == doc.document["source"]
     assert "1024 КБ" in result.blocks[0][0]
-    assert [picture for _, picture in result.blocks[1:]] == [doc.illustrations[n] for n in (2, 3, 4)]
+    assert [picture for _, picture in result.blocks[1::2]] == [doc.illustrations[n] for n in (2, 3, 4, 5)]
+    assert [text.split(". Настройка")[0][-1] for text, _ in result.blocks[2::2]] == ["3", "4", "5"]
     assert len(knowledge.checks) == 1
 
     no_source = {"action": "reply", "kind": "clarification", "blocks": [{"text": "Уточните программу."}]}
@@ -367,6 +369,38 @@ def test_agent_wire_is_text_only_and_disables_provider_tools():
     assert seen[0]["tools"] == [] and seen[0]["tool_ids"] == []
     assert all(isinstance(message["content"], str) for message in seen[0]["messages"])
     assert seen[0]["response_format"]["json_schema"]["schema"] == AgentAction.model_json_schema()
+
+
+def test_combined_success_and_screen_question_rates_previous_answer_and_asks_only_device(talk):
+    doc = approved()
+    knowledge = Sources([doc])
+    talk.incoming("Как настроить печать?")
+    assert talk.process(knowledge, Agent(search(), read(doc), answer(doc)))
+    knowledge.prefetch_candidates = knowledge.search_candidates
+    talk.incoming("Спасибо, помогло.\nТеперь смотри у меня гаснет экран через какое-то время, что делать?", 2)
+    agent = Agent()
+    assert talk.process(knowledge, agent)
+    result = talk.snapshot()
+    assert not agent.payloads
+    assert result["attempts"][0].status == "SUCCEEDED"
+    assert knowledge.searches[-1].startswith("у меня гаснет экран")
+    assert result["flow"]["agent"]["memory"]["expected_reply"] == "Тип устройства"
+    assert result["flow"]["agent"]["sources"] == []
+    assert "На каком устройстве" in assistants(result)[-1][0]
+    with talk.env.factory() as session:
+        assert session.scalar(select(Feedback)).helped is True
+
+    windows = approved(file_id=WINDOWS_SCREEN_FILE)
+    windows.document["source"]["sha256"] = WINDOWS_SCREEN_SHA256
+    windows.document["content"] = ("\n".join(f"{number}. Диагностический шаг" for number in range(1, 5)) +
+                                   "\nТолько для ИТ\n5. Не выдавать администратора")
+    talk.incoming("Windows", 3)
+    assert talk.process(Sources([windows]), Agent())
+    blocks = assistants(talk.snapshot())[-4:]
+    assert "1. Диагностический шаг\n2. Диагностический шаг" in blocks[0][0] and blocks[0][1] is None
+    assert "3. Диагностический шаг" in blocks[1][0]
+    assert blocks[2][1].data == windows.illustrations[1].data
+    assert blocks[3][0] == "4. Диагностический шаг"
 
 
 def test_talk_persists_agent_progress_photos_and_explicit_resolution(talk):

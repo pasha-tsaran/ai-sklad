@@ -39,7 +39,7 @@ class AgentAction(Contract):
     file_id: str = Field(default="", max_length=100)
     offset: int = Field(default=0, ge=0, strict=True)
     kind: Literal["conversation", "clarification", "instruction", "no_knowledge", "resolved"] = "conversation"
-    blocks: list[ReplyBlock] = Field(default_factory=list, max_length=4)
+    blocks: list[ReplyBlock] = Field(default_factory=list, max_length=8)
     memory: TaskMemory | None = None
     new_task: StrictBool = False
     consent_evidence: str = Field(default="", max_length=1000)
@@ -80,6 +80,9 @@ consent_evidence — дословная цитата текущего сообщ
 текст и подписи. Не угадывай цвет, положение переключателей или надписи на фото.
 Для отправки оригинала выбери images с file_id и number из прочитанного документа.
 Не создавай ссылки на картинки. Каждый блок содержит пояснение и связанные изображения.
+Давай шаги по порядку. Для шага с фото создай отдельный блок: сначала текст шага, затем
+его фото. Если один снимок относится к двум соседним шагам, можно дать оба перед снимком.
+Соседние шаги без фото можно объединять в один блок, сохраняя нумерацию.
 Каждый блок опирается на один источник; разные источники разделяй на разные блоки.
 Технический ответ kind=instruction обязан иметь references: file_id и точную цитату
 прочитанного источника, подтверждающую действия, значения и условия каждого блока.
@@ -148,7 +151,9 @@ feedback у источника — число явных отзывов для �
 Читай документ до complete=true, продолжая с next_offset. memory сохраняет цель, факты,
 current_step, next_step, expected_reply; new_task=true только при смене задачи.
 request_support требует дословного согласия в consent_evidence. kind=resolved только при явном успехе.
-Не вызывай инструменты UI: их эквиваленты здесь — действия AgentAction. Лимит 4 блока, 6 фото.
+Шаги выводятся по порядку. Шаг с фото — отдельный блок с текстом и его фото. Если снимок
+показывает два соседних шага, дай оба сразу перед снимком. Шаги без фото можно группировать.
+Не вызывай инструменты UI: их эквиваленты здесь — действия AgentAction. Лимит 8 блоков, 6 фото.
 Этот протокол задаёт формат и границы инструментов; правила общения бери из общего промпта."""
     messages = [{"role": "system", "content": (shared + "\n\n" + protocol) if shared else SYSTEM},
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}]

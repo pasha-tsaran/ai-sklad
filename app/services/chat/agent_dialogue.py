@@ -21,6 +21,12 @@ PAGE_CHARS = 12000
 MODEL_UNAVAILABLE = "Сейчас не удалось подготовить ответ. Повторите вопрос немного позже."
 OUTLOOK_LARGE_MAIL_FILE = "e70650e7-d3bb-4708-8bfe-9f2e748d7922"
 OUTLOOK_LARGE_MAIL_SHA256 = "bf09266ba3fa350cc635d70650bfbfaf8b83ded4e78276d4e2dd5ab6585b82ed"
+WINDOWS_SCREEN_FILE = "410c6e3f-f500-425f-9a43-fa204ae8338e"
+WINDOWS_SCREEN_SHA256 = "014397db413283a9ebc802197a65b9f6ea7abe9c0e2956fe98d2523b9ab8bfa6"
+_SCREEN_REQUEST = re.compile(
+    r"(?:у меня )?(?:гаснет экран|экран гаснет)(?: через какое[- ]то время)?(?: что делать)?"
+)
+_WINDOWS_REPLY = re.compile(r"(?:(?:на )?(?:рабочем )?(?:компьютере|ноутбуке|пк)(?: с)? )?(?:windows|виндовс)(?: 10| 11)?")
 _LARGE_MAIL_REQUEST = re.compile(
     r"(?:надо отследить большой размер писем(?: как это сделать)?|"
     r"как (?:найти|отследить) (?:большие|крупные) письма(?: в outlook)?|"
@@ -37,23 +43,57 @@ def _approved_outlook_reply(message, knowledge, start_sequence):
         return None
     content = doc.document["content"]
     steps = [line.strip() for line in content.splitlines() if re.match(r"^[1-5]\. ", line.strip())]
-    if len(steps) != 5 or any(number not in doc.illustrations for number in (2, 3, 4)):
+    if len(steps) != 5 or any(number not in doc.illustrations for number in (2, 3, 4, 5)):
         return None
-    text = ("В классическом Outlook:\n\n" + "\n".join(steps) +
-            "\n\nПапка поиска показывает существующие письма. Удаление из результатов затрагивает сами письма.")
+    groups = [
+        ("В классическом Outlook:\n\n" + "\n".join(steps[:2]), 2),
+        (steps[2], 3),
+        (steps[3], 4),
+        (steps[4] + "\n\nПапка поиска показывает существующие письма. "
+         "Удаление из результатов затрагивает сами письма.", 5),
+    ]
     memory = TaskMemory(goal="Найти письма больше 1024 КБ в классическом Outlook")
     action = AgentAction.model_validate({
         "action": "reply", "kind": "instruction", "memory": memory.model_dump(), "blocks": [{
-            "text": text, "references": [{"file_id": source["file_id"], "quote": steps[0]}],
-            "images": [{"file_id": source["file_id"], "number": number} for number in (2, 3, 4)],
-        }],
+            "text": text, "references": [{"file_id": source["file_id"], "quote": steps[number - 1]}],
+            "images": [{"file_id": source["file_id"], "number": number}],
+        } for text, number in groups],
     })
     turn = _reply(action, message, {}, {}, {source["file_id"]: doc}, knowledge)
     turn.flow["agent"]["start_sequence"] = start_sequence
     return turn
 
 
-def run_agent(message, flow, context, llm, knowledge, settings):
+def _approved_windows_screen_reply(message, memory, flow, knowledge):
+    if (memory["expected_reply"] != "Тип устройства" or not _SCREEN_REQUEST.fullmatch(normalized_query(memory["goal"]))
+            or not _WINDOWS_REPLY.fullmatch(normalized_query(message))):
+        return None
+    doc = knowledge.read(WINDOWS_SCREEN_FILE)
+    source = doc.document["source"]
+    if source["file_id"] != WINDOWS_SCREEN_FILE or source["sha256"] != WINDOWS_SCREEN_SHA256:
+        return None
+    # Only the employee-facing diagnostic steps, before the administrator section.
+    body = doc.document["content"].split("Только для ИТ", 1)[0]
+    steps = [line.strip() for line in body.splitlines() if re.match(r"^[1-4]\. ", line.strip())]
+    if len(steps) != 4 or 1 not in doc.illustrations:
+        return None
+    blocks = [
+        {"text": "На рабочем компьютере с Windows:\n\n" + "\n".join(steps[:2]), "references": [
+            {"file_id": source["file_id"], "quote": steps[0]}]},
+        {"text": steps[2], "references": [{"file_id": source["file_id"], "quote": steps[2]}],
+         "images": [{"file_id": source["file_id"], "number": 1}]},
+        {"text": steps[3], "references": [{"file_id": source["file_id"], "quote": steps[3]}]},
+    ]
+    action = AgentAction.model_validate({"action": "reply", "kind": "instruction", "blocks": blocks,
+                                         "memory": {"goal": "Проверить, почему гаснет экран Windows"}})
+    turn = _reply(action, message, flow, memory, {source["file_id"]: doc}, knowledge)
+    if "start_sequence" in flow.get("agent", {}):
+        turn.flow["agent"]["start_sequence"] = flow["agent"]["start_sequence"]
+    turn.agent_question = memory["goal"]
+    return turn
+
+
+def run_agent(message, flow, context, llm, knowledge, settings, *, force_new=False):
     from app.services.chat.talk_dialogue import Turn, UNAVAILABLE, _simple_social, _step_confirmed
 
     saved = copy.deepcopy(flow.get("agent", {}))
@@ -66,11 +106,13 @@ def run_agent(message, flow, context, llm, knowledge, settings):
     next_sequence = max((row.get("sequence", 0) for row in recent), default=0) + 1
     try:
         direct_reply = _approved_outlook_reply(message, knowledge, next_sequence)
+        if direct_reply is None and not force_new:
+            direct_reply = _approved_windows_screen_reply(message, memory, flow, knowledge)
     except KnowledgeUnavailable as error:
         event("talk.agent_direct_instruction_failed", error_code=error.code)
     else:
         if direct_reply is not None:
-            event("talk.agent_direct_instruction", scenario="outlook_large_mail")
+            event("talk.agent_direct_instruction")
             return direct_reply
     feedback = context.get("agent_feedback", {})
     prefetch = getattr(knowledge, "prefetch_candidates", None)
@@ -91,7 +133,7 @@ def run_agent(message, flow, context, llm, knowledge, settings):
     if type(boundary) is int:
         recent = [row for row in recent if row.get("sequence", 0) >= boundary]
     classify = getattr(llm, "classify_task_relation", None)
-    relation = "new" if starts_new_task(message) else "current"
+    relation = "new" if force_new or starts_new_task(message) else "current"
     if relation == "current" and callable(classify) and (memory["goal"] or memory["expected_reply"]
                                                         or saved.get("sources") or flow.get("source")):
         try:
@@ -107,6 +149,12 @@ def run_agent(message, flow, context, llm, knowledge, settings):
         flow, saved, memory = {}, {}, TaskMemory().model_dump()
         # Persist the boundary even if knowledge is unavailable for the new task.
         flow = {"agent": {"version": 1, "memory": memory, "sources": [], "start_sequence": boundary}}
+    if not memory["goal"] and _SCREEN_REQUEST.fullmatch(normalized_query(message)):
+        flow = {"agent": {"version": 1, "sources": [], "start_sequence": boundary or next_sequence,
+                          "memory": TaskMemory(goal=message[:1000], expected_reply="Тип устройства").model_dump()},
+                "query": message}
+        return Turn("AGENT_REPLY", [("На каком устройстве гаснет экран — на компьютере с Windows, ТСД или другом устройстве?", None)],
+                    flow=flow)
     event("talk.agent_task_relation", relation=relation)
     # Older conversations enter with their context and frozen progress, not a new confirmation gate.
     legacy = {key: copy.deepcopy(flow[key]) for key in (

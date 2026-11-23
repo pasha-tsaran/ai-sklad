@@ -132,6 +132,8 @@ class Turn:
     block_sources: list | None = None
     failed_previous: bool = False
     agent_documents: list = field(default_factory=list)
+    agent_previous_helped_source: dict | None = None
+    agent_question: str | None = None
 
 
 class _TimedProxy:
@@ -251,6 +253,19 @@ def _intake_prompt(flow):
 
 def _normalized(message):
     return " ".join(re.sub(r"[^\w\s]", " ", message.casefold(), flags=re.UNICODE).split())
+
+
+_FEEDBACK_THEN_QUESTION = re.compile(
+    r"^\s*(?:спасибо[,!]?[ \t]*)?(?:помогло|сработало|вс[её] работает|проблема решена)"
+    r"(?:[.!]+\s*|\s*\n\s*)(?:теперь(?:\s+смотри(?:те)?\b)?|другой вопрос|новый вопрос)"
+    r"[,:]?\s+(?P<question>.+\?)\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _question_after_success(message):
+    matched = _FEEDBACK_THEN_QUESTION.fullmatch(message)
+    return matched["question"].strip() if matched else None
 
 
 def _simple_social(message):
@@ -2054,6 +2069,11 @@ def _text_turn(message, flow, context, previous_pending, llm, knowledge, setting
                 return Turn("AGENT_NEGATIVE", [("Спасибо, учту. Что именно не получилось или не подошло?", None)])
         from app.services.chat.agent_dialogue import run_agent
 
+        if flow.get("agent") and (question := _question_after_success(message)):
+            turn = run_agent(question, flow, context, llm, knowledge, settings, force_new=True)
+            turn.agent_previous_helped_source = flow.get("source")
+            turn.agent_question = question
+            return turn
         return run_agent(message, flow, context, llm, knowledge, settings)
     if flow.get("understanding_confirmation"):
         if intent == "HUMAN":
@@ -2254,7 +2274,8 @@ def _claim(factory, settings, account_id):
         incident.pending_action, incident.version = "PROCESSING", incident.version + 1
         context = load_context(session, incident, settings)
         if settings.talk_dialogue_mode == "agent":
-            context["agent_feedback"] = learned_feedback(session, account.id, inbox.content)
+            context["agent_feedback"] = learned_feedback(
+                session, account.id, _question_after_success(inbox.content) or inbox.content)
         context["channel_profile"] = channel_profile(room, incident.id)
         offer = (room.profile or {}).get(SUPPORT_OFFER_KEY, {})
         if offered_message := offer.get("message_id"):
@@ -2397,7 +2418,7 @@ def _finish_agent(session, room, incident, turn, pending, claimed, llm, settings
                 evidence={"title": primary.title, "version": primary.version, "chunk_id": primary.chunk_id,
                           "content": primary.content, "steps": primary.steps, "source": primary.source,
                           "talk_source": turn.agent_documents[0].document["source"],
-                          "feedback_question": question_key(claimed["message"]),
+                          "feedback_question": question_key(turn.agent_question or claimed["message"]),
                           "agent_sources": [doc.document["source"] for doc in turn.agent_documents]},
             )
             session.add(pending)
@@ -2452,6 +2473,13 @@ def _finish(factory, turn, claimed, llm, settings):
         if turn.media_notice:
             _deliver(session, incident, [(turn.media_notice, None)])
         pending = _attempt(session, incident)
+        if (turn.agent_previous_helped_source is not None and pending is not None
+                and pending.evidence.get("talk_source") == turn.agent_previous_helped_source):
+            _record_feedback(session, pending, True)
+            pending.status = "SUCCEEDED"
+            incident.state, incident.result = "DIAGNOSING", None
+            session.flush()
+            pending = None
         if pending and (turn.action == "RETRY_GUIDE" or turn.failed_previous):
             pending.status = "FAILED"
             _record_feedback(session, pending, False)
