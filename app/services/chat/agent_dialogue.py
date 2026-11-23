@@ -13,6 +13,7 @@ from app.services.chat.policies import direct_intent, requests_support_form, res
 from app.services.chat.talk_feedback import reorder_candidates, source_key
 from app.services.chat.task_state import starts_new_task
 from app.services.llm.support_agent import AgentAction, TaskMemory
+from app.services.nextcloud.interruption import is_resume_request
 from app.services.rag.query import normalized_query, source_compatible
 from app.services.rag.talk import KnowledgeUnavailable
 
@@ -36,6 +37,70 @@ _LARGE_MAIL_REQUEST = re.compile(
     r"как (?:найти|отследить) (?:большие|крупные) письма(?: в outlook)?|"
     r"(?:как )?создать папку(?: поиска)? для писем (?:больше|более) 1024(?: кб)?(?: в outlook)?)"
 )
+
+# Reviewed, short 1C/LabelPrint procedures. A different original must go
+# through ordinary selection and reading before it can be used.
+_PRINT_SCHEMES = {
+    "urovo": ("fc96a77c-3fc2-42fb-8f0e-ff16f6408f58", "fa8061251ef5848d4f5387ca6d191225114ce3e097c8ec5f1e91770edbecd8d9",
+              "ТСД и один принтер Urovo по Bluetooth"),
+    "tsc": ("767b0f6a-67c5-4cdc-8934-d094991258fc", "9744a1421ded70c63f54b032c75f1b4d51cf141f6e13da1aa81b7ad2f70f574f",
+            "ТСД и один принтер TSC по Wi-Fi"),
+    "mixed": ("0b642b7b-7eee-4426-b7a6-e9ad868ae229", "97250b7185820992b212761912fe6004a84e5ce1fb89b058dc149f6744872957",
+              "ТСД, принтер Urovo по Bluetooth и TSC по Wi-Fi"),
+    "two": ("fe606332-21ee-445c-9593-19e48eefb8ed", "1127aaf2071536a771815aff5fe2db431b32039b7525f32dae20d86da3dd43c4",
+            "ТСД и два принтера TSC по Wi-Fi"),
+}
+_PRINT_SETUPS = {
+    "urovo": r"(?:один )?(?:принтер )?urovo по bluetooth",
+    "tsc": r"(?:один )?(?:принтер )?tsc по wifi",
+    "mixed": r"(?:(?:принтер )?urovo по bluetooth (?:и|а) (?:принтер )?tsc по wifi|"
+             r"(?:принтер )?tsc по wifi (?:и|а) (?:принтер )?urovo по bluetooth)",
+    "two": r"(?:два|2) (?:принтера )?tsc по wifi",
+}
+
+
+def _print_scheme(message, previous_sources):
+    query = normalized_query(message)
+    for name, devices in _PRINT_SETUPS.items():
+        if re.fullmatch(r"(?:(?:как )?настроить печать с тсд на |(?:как )?подключить к тсд |тсд )" + devices, query):
+            return name, False
+    # With unnamed printers this is only a conditional suggestion within an
+    # existing verified printing task. Show which models the procedure fits.
+    reviewed = {(file_id, digest) for file_id, digest, _ in _PRINT_SCHEMES.values()}
+    if not any((src.get("file_id"), src.get("sha256")) in reviewed for src in previous_sources):
+        return None, False
+    setup = re.sub(r"^(?:а )?теперь (?:смотри )?(?:мне )?(?:нужно |надо )?(?:подключить )?", "", query)
+    if re.fullmatch(r"один (?:принтер )?по bluetooth (?:а |и )?другой (?:принтер )?по wifi", setup):
+        return "mixed", True
+    if re.fullmatch(r"(?:два|2) принтера по wifi(?: к тсд)?", setup):
+        return "two", True
+    return None, False
+
+
+def _approved_print_reply(message, scheme, conditional, search_result, knowledge, start_sequence):
+    file_id, digest, scenario = _PRINT_SCHEMES[scheme]
+    if not any(row["file_id"] == file_id for row in search_result.get("candidates", [])):
+        return None
+    doc = knowledge.read(file_id)
+    source = doc.document["source"]
+    if source["file_id"] != file_id or source["sha256"] != digest or 1 not in doc.illustrations:
+        return None
+    steps = re.findall(r"^[1-4]\. [^\r\n]+", doc.document["content"], flags=re.MULTILINE)
+    if len(steps) != 4:
+        return None
+    introduction = f"Эта схема подходит для такого подключения — {scenario}." if conditional else scenario + "."
+    action = AgentAction.model_validate({
+        "action": "reply", "kind": "instruction", "memory": {"goal": scenario},
+        "blocks": [
+            {"text": introduction + "\n\n" + "\n".join(steps[:3]),
+             "references": [{"file_id": file_id, "quote": step} for step in steps[:3]],
+             "images": [{"file_id": file_id, "number": 1}]},
+            {"text": steps[3], "references": [{"file_id": file_id, "quote": steps[3]}]},
+        ],
+    })
+    turn = _reply(action, message, {}, {}, {file_id: doc}, knowledge)
+    turn.flow["agent"]["start_sequence"] = start_sequence
+    return turn
 
 
 def _approved_outlook_reply(message, knowledge, start_sequence):
@@ -108,6 +173,7 @@ def run_agent(message, flow, context, llm, knowledge, settings, *, force_new=Fal
                      "next_step": str(flow.get("instruction_plan", {}).get("cursor", flow.get("next_offset", ""))),
                      "expected_reply": "Продолжение или вопрос по текущему шагу" if flow.get("source") else ""}
     memory = TaskMemory.model_validate(saved.get("memory", legacy_memory)).model_dump()
+    continuing_steps = bool(not force_new and saved.get("sources") and memory["next_step"] and is_resume_request(message))
     recent = context.get("short_term", {}).get("messages", [])
     next_sequence = max((row.get("sequence", 0) for row in recent), default=0) + 1
     try:
@@ -125,11 +191,13 @@ def run_agent(message, flow, context, llm, knowledge, settings, *, force_new=Fal
     clarification = {} if force_new else flow
     pending_device = bool(clarification.get("clarification_keys"))
     search_message = _problem_query(message, clarification) if pending_device else message
+    relation = "new" if force_new or starts_new_task(message) else "current"
+    scheme, conditional = _print_scheme(message, [] if relation == "new" else saved.get("sources", []))
     initial_result = None
     searches = {}
-    if (callable(prefetch) and normalized_query(message) and not _simple_social(message)
+    if (callable(prefetch) and not continuing_steps and normalized_query(message) and not _simple_social(message)
             and not _step_confirmed(message) and not requests_support_form(message)):
-        query = " ".join(search_message.split())[:1000]
+        query = _PRINT_SCHEMES[scheme][2] if conditional else " ".join(search_message.split())[:1000]
         try:
             result = reorder_candidates(prefetch(query), feedback)
             searches[normalized_query(query)] = result
@@ -142,7 +210,16 @@ def run_agent(message, flow, context, llm, knowledge, settings, *, force_new=Fal
     if type(boundary) is int:
         recent = [row for row in recent if row.get("sequence", 0) >= boundary]
     classify = getattr(llm, "classify_task_relation", None)
-    relation = "new" if force_new or starts_new_task(message) else "current"
+    if scheme and initial_result:
+        try:
+            direct_reply = _approved_print_reply(message, scheme, conditional,
+                                                 initial_result.get("result", {}), knowledge, next_sequence)
+        except KnowledgeUnavailable as error:
+            event("talk.agent_direct_instruction_failed", error_code=error.code)
+        else:
+            if direct_reply is not None:
+                event("talk.agent_direct_instruction")
+                return direct_reply
     if initial_result:
         # A general request like "configure a scanner" does not authorize a
         # procedure specific to one kind of scanner or work application.
@@ -161,16 +238,16 @@ def run_agent(message, flow, context, llm, knowledge, settings, *, force_new=Fal
             clarify.action = "AGENT_REPLY"
             return clarify
     has_active_task = memory["goal"] or memory["expected_reply"] or saved.get("sources") or flow.get("source")
-    route_unavailable = False
     if (relation == "current" and not (pending_device and search_message != message)
-            and callable(classify) and has_active_task):
+            and not continuing_steps and callable(classify) and has_active_task):
         try:
             relation = classify(message, memory, recent[-4:])
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as error:
             event("talk.agent_task_relation_failed", error_code=type(error).__name__)
             if initial_result and initial_result.get("result", {}).get("candidates"):
-                relation = "unclear"
-                route_unavailable = True
+                # Answer from the current search. Carrying the old memory or history
+                # here can resurrect the previous solution even after a clarification.
+                relation = "new"
             else:
                 return Turn("REPLY", [(MODEL_UNAVAILABLE, None)], flow=copy.deepcopy(flow))
     if relation == "unclear" and initial_result is None:
@@ -204,11 +281,6 @@ def run_agent(message, flow, context, llm, knowledge, settings, *, force_new=Fal
         allowed.add(flow["source"]["file_id"])
     for part in flow.get("instruction_plan", {}).get("parts", []):
         allowed.add(part["source"]["file_id"])
-    if route_unavailable:
-        # Current-search candidates remain allowed. Previous sources require
-        # rediscovery when we could not establish that the topic continued.
-        allowed.clear()
-        payload.update(active_sources=[], previous_progress={})
     limit = settings.talk_agent_context_chars
     first = (initial_result or {}).get("result")
     if first is not None:
@@ -286,6 +358,8 @@ def run_agent(message, flow, context, llm, knowledge, settings, *, force_new=Fal
                 return _profile_form_request(flow, context)
             else:
                 complete = {key: doc for key, doc in loaded.items() if ranges.get(key) == len(doc.document["content"])}
+                if action.kind == "conversation" and (continuing_steps or (first and first["candidates"])):
+                    raise ValueError("UseInstructionWithReferencesOrAskClarification")
                 if action.kind == "no_knowledge" and first is not None and not tried_reformulation:
                     raise ValueError("TrySearchByDifferentWordsOrActionsBeforeNoKnowledge")
                 if action.kind == "no_knowledge" and knowledge_failed and not verified_search:

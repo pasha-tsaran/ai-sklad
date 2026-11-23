@@ -5,14 +5,18 @@ from app.services.rag.success import expire_retrievals
 from app.services.rag.talk import TalkKnowledge
 
 
-def synchronize_knowledge(factory, settings, *, refresh=False):
+def maintain_knowledge(factory, settings):
     expired = expire_retrievals(factory)
+    return {**synchronize_knowledge(factory, settings, refresh=True), "expired_retrievals": expired}
+
+
+def synchronize_knowledge(factory, settings, *, refresh=False):
     if getattr(settings, "openwebui_sync_profile", False):
         from app.services.llm.profile import profile_settings
 
         settings = profile_settings(settings)
     if settings.knowledge_backend != "openwebui" or not settings.openwebui_knowledge_ids:
-        return {"status": "disabled", "ready": 0, "complete": False, "expired_retrievals": expired}
+        return {"status": "disabled", "ready": 0, "complete": False}
     catalog = KnowledgeCatalog(settings, factory)
     knowledge = TalkKnowledge(settings, catalog=catalog)
-    return {**catalog.sync(knowledge, refresh=refresh), "expired_retrievals": expired}
+    return catalog.sync(knowledge, refresh=refresh)

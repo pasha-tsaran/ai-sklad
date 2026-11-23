@@ -9,7 +9,7 @@ from app.core.config import Settings
 from app.models import Delivery, Feedback, ResolutionMemory
 from app.services.chat.agent_dialogue import (
     MODEL_UNAVAILABLE, OUTLOOK_LARGE_MAIL_FILE, OUTLOOK_LARGE_MAIL_SHA256, PAGE_CHARS, WINDOWS_SCREEN_FILE,
-    WINDOWS_SCREEN_SHA256, run_agent,
+    WINDOWS_SCREEN_SHA256, _PRINT_SCHEMES, run_agent,
 )
 from app.services.chat.talk_dialogue import AGENT_OUTCOME_QUESTION, UNAVAILABLE, _resume_turn, _text_turn
 from app.services.chat.talk_feedback import learned_feedback, reorder_candidates, source_key, split_agent_feedback
@@ -134,6 +134,40 @@ def test_model_timeout_is_not_reported_as_knowledge_outage():
     assert run_agent("печать", {}, {}, TimedOutAgent(), Sources(), settings()).blocks == [(MODEL_UNAVAILABLE, None)]
 
 
+def test_routing_timeout_cannot_retain_previous_answer_as_source_of_new_clarification():
+    old_doc = approved()
+    new_doc = approved(file_id="00000000-0000-4000-8000-000000000032")
+    knowledge = Sources([new_doc])
+    knowledge.prefetch_candidates = knowledge.search_candidates
+    saved = {"source": old_doc.document["source"], "agent": {
+        "memory": {"goal": "Печать", "facts": ["предыдущий принтер"]}, "sources": [old_doc.document["source"]]}}
+    agent = Agent({"action": "reply", "kind": "clarification", "blocks": [{"text": "Что видно при входе?"}]})
+
+    def timeout(*args):
+        raise httpx.ReadTimeout("timed out")
+
+    agent.classify_task_relation = timeout
+    turn = run_agent("Почта перестала открываться", saved, {"short_term": {"messages": [
+        {"sequence": 7, "role": "assistant", "content": "Настройте принтер."}]}}, agent, knowledge, settings())
+    payload = agent.payloads[0]
+    assert payload["active_sources"] == [] and payload["context"]["short_term"]["messages"] == []
+    assert not payload["memory"]["goal"] and not payload["memory"]["facts"]
+    assert turn.flow["agent"]["sources"] == [] and "source" not in turn.flow
+    assert turn.flow["agent"]["start_sequence"] == 8
+
+
+def test_explicit_continuation_uses_verified_progress_without_requesting_topic_classification():
+    doc = approved()
+    knowledge = Sources([doc])
+    knowledge.prefetch_candidates = knowledge.search_candidates
+    flow = {"agent": {"memory": {"goal": "Настроить печать", "next_step": "2"},
+                     "sources": [doc.document["source"]]}}
+    agent = Agent(read(doc), answer(doc, 2))
+    agent.classify_task_relation = lambda *_: pytest.fail("Explicit continuation was routed again")
+    result = run_agent("Продолжить", flow, {}, agent, knowledge, settings())
+    assert result.blocks[1][1] == doc.illustrations[2] and not knowledge.searches
+
+
 def test_large_outlook_mail_uses_current_approved_original_without_model():
     doc = approved(file_id=OUTLOOK_LARGE_MAIL_FILE)
     doc.document["source"]["sha256"] = OUTLOOK_LARGE_MAIL_SHA256
@@ -187,6 +221,17 @@ def test_initial_search_runs_before_model_and_supplies_candidates_for_reading():
     assert knowledge.searches == [question]
 
 
+def test_found_document_requires_evidence_even_if_model_labels_technical_reply_as_conversation():
+    doc = approved()
+    knowledge = Sources([doc])
+    knowledge.prefetch_candidates = knowledge.search_candidates
+    agent = Agent({"action": "reply", "blocks": [{"text": "Используйте прежний добавочный номер."}]},
+                  read(doc), answer(doc))
+    turn = run_agent("Какой добавочный у администрации?", {}, {}, agent, knowledge, settings())
+    assert agent.payloads[1]["tool_results"][-1]["error"] == "UseInstructionWithReferencesOrAskClarification"
+    assert turn.agent_documents == [doc] and all("прежний" not in text for text, _ in turn.blocks)
+
+
 def test_empty_initial_search_requires_reformulating_before_admitting_no_instruction():
     class EmptySources(Sources):
         def search_candidates(self, query):
@@ -214,6 +259,48 @@ def test_scanner_requires_one_simple_clarification_even_if_model_is_down():
     assert result.blocks == [("Какой у вас сканер — ручной для штрихкодов или для бумажных документов?", None)]
     assert run_agent("для штрихкодов", result.flow, {}, agent, knowledge, settings()).flow[
         "clarification_keys"][-1] == "SCANNER_GOAL"
+
+
+def test_verified_printer_procedures_follow_setup_changes_without_model():
+    docs = {}
+    for name, (file_id, digest, _) in _PRINT_SCHEMES.items():
+        doc = approved(1, file_id=file_id)
+        doc.document["source"]["sha256"] = digest
+        doc.document["content"] = "\n\n".join(f"{i}. Настройка номер {i} для {name}." for i in range(1, 5))
+        docs[name] = doc
+    knowledge = Sources(list(docs.values()))
+    knowledge.prefetch_candidates = knowledge.search_candidates
+    flow = {}
+    for name, question in [
+        ("urovo", "Как настроить печать с ТСД на один принтер Urovo по Bluetooth?"),
+        ("mixed", "А теперь мне нужно подключить один принтер по блютуз, а другой по Wi-Fi"),
+        ("two", "А теперь надо подключить 2 принтера по Wi-Fi к ТСД"),
+        ("tsc", "Как подключить к ТСД TSC по Wi-Fi?"),
+    ]:
+        turn = run_agent(question, flow, {}, Agent(), knowledge, settings())
+        flow = turn.flow
+        assert knowledge.searches[-1] == (_PRINT_SCHEMES[name][2] if name in {"mixed", "two"} else question)
+        assert turn.agent_documents == [docs[name]] and flow["source"] == docs[name].document["source"]
+        before, photo, after = turn.blocks
+        assert all(step in before[0] for step in docs[name].document["content"].split("\n\n")[:3])
+        assert photo[1] == docs[name].illustrations[1]
+        assert after[0] == docs[name].document["content"].split("\n\n")[3]
+
+
+@pytest.mark.parametrize("question,digest,expect_read", [
+    ("Как настроить печать с ТСД на один принтер Urovo по Bluetooth?", "changed", True),
+    ("Как настроить печать с ТСД на один принтер Urovo по Bluetooth, если печатает три этикетки?", None, False),
+    ("А теперь один принтер по Bluetooth, другой по Wi-Fi", None, False),
+])
+def test_fast_printer_path_requires_reviewed_revision_and_exact_setup(question, digest, expect_read):
+    file_id, current, _ = _PRINT_SCHEMES["urovo"]
+    doc = approved(1, file_id=file_id)
+    doc.document["source"]["sha256"] = digest or current
+    knowledge = Sources([doc])
+    knowledge.prefetch_candidates = knowledge.search_candidates
+    agent = Agent({"action": "reply", "kind": "clarification", "blocks": [{"text": "Какая у вас модель?"}]})
+    turn = run_agent(question, {}, {}, agent, knowledge, settings())
+    assert not turn.agent_documents and bool(knowledge.reads) is expect_read
 
 
 def test_agent_rejects_real_quote_from_source_with_wrong_connection():

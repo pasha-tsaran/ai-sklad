@@ -1,6 +1,8 @@
 """A stale database must be visible before enabling the indexed dialogue system."""
 
+import tomllib
 from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -25,5 +27,7 @@ def test_ready_response_identifies_the_actual_app_and_schema(monkeypatch):
     monkeypatch.setattr(main, "get_engine", lambda: SimpleNamespace(connect=lambda: nullcontext(connection)))
     monkeypatch.setattr(main, "get_settings", lambda: Settings(_env_file=None, knowledge_backend="demo"))
     result = main.ready()
-    assert result["status"] == "ok" and result["app_version"] == "0.4.4"
+    with (Path(__file__).resolve().parents[1] / "pyproject.toml").open("rb") as project:
+        version = tomllib.load(project)["project"]["version"]
+    assert result["status"] == "ok" and result["app_version"] == version
     assert result["database_revision"] == "0011"

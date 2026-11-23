@@ -18,7 +18,7 @@ from app.services.llm.openwebui import OpenWebUILLM
 from app.services.nextcloud.account import AccountClient, AccountError
 from app.services.nextcloud.delivery import deliver_one
 from app.services.nextcloud.poller import poll_once
-from app.services.rag.catalog_worker import synchronize_knowledge
+from app.services.rag.catalog_worker import maintain_knowledge
 from app.services.nextcloud.progress import recover_progress, tick_progress
 from app.services.nextcloud.typing import NativeTyping
 
@@ -147,7 +147,7 @@ def run(settings, *, once=False):
                 if progressing is None:
                     progressing = pool.submit(tick_progress, factory, settings, progress_client)
                 if indexing is None and time.monotonic() >= next_index:
-                    indexing = pool.submit(synchronize_knowledge, factory, settings, refresh=True)
+                    indexing = pool.submit(maintain_knowledge, factory, settings)
                 deliver_one(factory, settings, delivery_client)
                 time.sleep(0.5)
 
