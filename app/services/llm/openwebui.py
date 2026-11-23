@@ -251,7 +251,8 @@ class OpenWebUILLM:
         with tracing_context(enabled=False, parent=False):
             return chain.invoke(payload, config={"callbacks": []})
 
-    def _request(self, messages, *, selection_schema=None, max_output_tokens=None, thinking=False, timeout_cap=None):
+    def _request(self, messages, *, selection_schema=None, max_output_tokens=None, thinking=False, timeout_cap=None,
+                 talk_agent=False):
         if (type(thinking) is not bool or thinking and (
                 selection_schema is None or type(max_output_tokens) is not int or max_output_tokens != 8192)):
             raise ValueError("InvalidInstructionThinkingOptions")
@@ -291,6 +292,8 @@ class OpenWebUILLM:
         timeout = max(self.settings.llm_timeout_seconds, 120) if thinking else self.settings.llm_timeout_seconds
         if timeout_cap is not None:
             timeout = min(timeout, timeout_cap)
+        if talk_agent:
+            timeout = httpx.Timeout(timeout, read=max(timeout, 180))
         with httpx.Client(
             timeout=timeout,
             transport=self.transport, follow_redirects=False

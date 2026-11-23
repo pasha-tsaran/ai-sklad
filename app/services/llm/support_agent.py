@@ -63,7 +63,7 @@ unclear: по сообщению и контексту нельзя понять
         {"role": "system", "content": policy},
         {"role": "user", "content": json.dumps(
             {"message": message, "memory": memory, "recent": recent}, ensure_ascii=False)},
-    ], selection_schema=TaskRelation.model_json_schema(), max_output_tokens=64, timeout_cap=15)).relation
+    ], selection_schema=TaskRelation.model_json_schema(), max_output_tokens=64, talk_agent=True)).relation
 
 
 SYSTEM = """Ты — помощник первой линии технической поддержки сотрудников склада.
@@ -138,7 +138,11 @@ request_support(consent_evidence). Результаты инструментов
 Задавай один конкретный вопрос только если недостающее условие меняет нужные шаги
 или пользователь ещё не описал задачу. Не спрашивай известные из сообщения и истории данные.
 Если применимая инструкция даёт однозначные шаги, сразу выдай их, без просьбы подтвердить
-понимание и без добавленного вопроса в конце. Предложить продолжение можно, если остались шаги.
+понимание. Проверку «Получилось решить проблему?» после последнего шага добавляет обработчик,
+не дублируй её. В memory.next_step укажи следующий шаг только если его ещё нужно показать.
+Говори простыми словами. Спрашивай, например, «На компьютере, сканере или телефоне?»,
+если для выбора инструкции достаточно типа устройства. Не требуй названий и версий программ,
+которые сотрудник может не знать. Если версия нужна, предложи узнать её по знакомому признаку.
 Для технического ответа используй kind=instruction, каждый блок с references(file_id, quote):
 точная цитата прочитанного источника. Один источник на блок. Изображения: images(file_id, number).
 Текущее message определяет задачу; не отвечай на предыдущий вопрос вместо него.
@@ -158,5 +162,5 @@ request_support требует дословного согласия в consent_
     messages = [{"role": "system", "content": (shared + "\n\n" + protocol) if shared else SYSTEM},
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}]
     return AgentAction.model_validate_json(llm._request(
-        messages, selection_schema=AgentAction.model_json_schema(), max_output_tokens=4096,
+        messages, selection_schema=AgentAction.model_json_schema(), max_output_tokens=4096, talk_agent=True,
     ))

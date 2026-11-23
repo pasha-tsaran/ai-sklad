@@ -43,7 +43,7 @@ from app.services.chat.support_followup import (
 from app.services.chat.task_state import (
     is_unknown_answer, remember_task_message, starts_new_task, task_evidence_authority, task_query, update_task_state,
 )
-from app.services.chat.talk_feedback import learned_feedback, question_key
+from app.services.chat.talk_feedback import learned_feedback, question_key, split_agent_feedback
 from app.services.rag.openwebui import save_snapshot
 from app.services.rag.query import _terms, normalized_query, printer_kinds, scanner_kinds
 from app.services.rag.talk import (
@@ -61,6 +61,7 @@ from integrations.openwebui.automatic_instruction_images import (
 )
 
 UNAVAILABLE = "Сейчас не удалось проверить базу знаний. Повторите вопрос немного позже."
+AGENT_OUTCOME_QUESTION = "Получилось решить проблему?"
 SELECTION_UNCLEAR = ("Пока не удалось выбрать подтверждённый следующий шаг. "
                      "Можно описать, что сейчас видно на экране.")
 INDEX_UPDATING = ("База знаний ещё обрабатывает новые материалы. Ваш вопрос сохранён. "
@@ -132,7 +133,7 @@ class Turn:
     block_sources: list | None = None
     failed_previous: bool = False
     agent_documents: list = field(default_factory=list)
-    agent_previous_helped_source: dict | None = None
+    agent_previous_feedback: tuple[dict, str] | None = None
     agent_question: str | None = None
 
 
@@ -253,19 +254,6 @@ def _intake_prompt(flow):
 
 def _normalized(message):
     return " ".join(re.sub(r"[^\w\s]", " ", message.casefold(), flags=re.UNICODE).split())
-
-
-_FEEDBACK_THEN_QUESTION = re.compile(
-    r"^\s*(?:спасибо[,!]?[ \t]*)?(?:помогло|сработало|вс[её] работает|проблема решена)"
-    r"(?:[.!]+\s*|\s*\n\s*)(?:теперь(?:\s+смотри(?:те)?\b)?|другой вопрос|новый вопрос)"
-    r"[,:]?\s+(?P<question>.+\?)\s*$",
-    re.IGNORECASE | re.DOTALL,
-)
-
-
-def _question_after_success(message):
-    matched = _FEEDBACK_THEN_QUESTION.fullmatch(message)
-    return matched["question"].strip() if matched else None
 
 
 def _simple_social(message):
@@ -2056,24 +2044,20 @@ def _text_turn(message, flow, context, previous_pending, llm, knowledge, setting
     if getattr(settings, "talk_dialogue_mode", "legacy") == "agent" and callable(getattr(llm, "agent_action", None)):
         if intent == "HUMAN":
             return Turn("HUMAN")
-        if flow.get("agent") and flow.get("source") and not explicit_new_task:
-            response = _normalized(message)
-            if response in {"помогло", "сработало", "все работает", "все работает спасибо", "помогло спасибо",
-                            "проблема решена", "вопрос решен"}:
-                return Turn("AGENT_RESOLVED", [("Спасибо за обратную связь. Рад, что помогло.", None)], flow=flow)
-            if response in {"ответ подошел", "ответ понравился", "понравилось", "ответ полезен"} or message.strip() == "👍":
-                return Turn("AGENT_RATED", [("Спасибо, учту эту оценку.", None)])
-            if response in {"не помогло", "не сработало", "не помогло спасибо", "ответ не подходит",
-                            "ответ не подошел", "ответ не понравился", "не понравилось", "проблема осталась",
-                            "не работает", "инструкция не подходит"} or message.strip() == "👎":
-                return Turn("AGENT_NEGATIVE", [("Спасибо, учту. Что именно не получилось или не подошло?", None)])
         from app.services.chat.agent_dialogue import run_agent
 
-        if flow.get("agent") and (question := _question_after_success(message)):
-            turn = run_agent(question, flow, context, llm, knowledge, settings, force_new=True)
-            turn.agent_previous_helped_source = flow.get("source")
-            turn.agent_question = question
-            return turn
+        if flow.get("agent") and flow.get("source") and not explicit_new_task:
+            rating, question = split_agent_feedback(message, awaiting=context.get("agent_awaiting_outcome", False))
+            if rating and question:
+                turn = run_agent(question, flow, context, llm, knowledge, settings, force_new=True)
+                turn.agent_previous_feedback = flow["source"], rating
+                turn.agent_question = question
+                return turn
+            if rating:
+                responses = {"AGENT_RESOLVED": "Хорошо, что получилось!",
+                             "AGENT_RATED": "Спасибо, учту.",
+                             "AGENT_NEGATIVE": "Понял. Что именно не получилось?"}
+                return Turn(rating, [(responses[rating], None)], flow=flow if rating == "AGENT_RESOLVED" else None)
         return run_agent(message, flow, context, llm, knowledge, settings)
     if flow.get("understanding_confirmation"):
         if intent == "HUMAN":
@@ -2274,8 +2258,19 @@ def _claim(factory, settings, account_id):
         incident.pending_action, incident.version = "PROCESSING", incident.version + 1
         context = load_context(session, incident, settings)
         if settings.talk_dialogue_mode == "agent":
-            context["agent_feedback"] = learned_feedback(
-                session, account.id, _question_after_success(inbox.content) or inbox.content)
+            flow = room.flow or {}
+            awaiting = False
+            if prompt_id := flow.get("agent_outcome_message"):
+                latest_bot = session.execute(select(Message.id, Delivery.status).join(
+                    Delivery, Delivery.message_id == Message.id
+                ).where(Message.incident_id == incident.id, Message.role == "assistant",
+                        Delivery.account_id == account.id, Delivery.room_token == room.room_token,
+                        Delivery.status.not_in(("CANCELLED", "PAUSED"))
+                ).order_by(Message.sequence.desc()).limit(1)).first()
+                awaiting = latest_bot == (prompt_id, "SENT")
+            context["agent_awaiting_outcome"] = awaiting
+            _, question = split_agent_feedback(inbox.content, awaiting=awaiting) if flow.get("source") else (None, None)
+            context["agent_feedback"] = learned_feedback(session, account.id, question or inbox.content)
         context["channel_profile"] = channel_profile(room, incident.id)
         offer = (room.profile or {}).get(SUPPORT_OFFER_KEY, {})
         if offered_message := offer.get("message_id"):
@@ -2430,6 +2425,9 @@ def _finish_agent(session, room, incident, turn, pending, claimed, llm, settings
         if not incident.problem_type:
             goal = turn.flow["agent"]["memory"]["goal"]
             incident.problem_type = (goal if goal and goal in incident.description else incident.description)[:100]
+        if pending is not None and not turn.flow["agent"]["memory"]["next_step"].strip():
+            prompt = _deliver(session, incident, [(AGENT_OUTCOME_QUESTION, None)])
+            room.flow = {**room.flow, "agent_outcome_message": prompt.id}
     if turn.action == "AGENT_RESOLVED" and pending is not None:
         pending.status = "SUCCEEDED"
         _record_feedback(session, pending, True)
@@ -2473,10 +2471,12 @@ def _finish(factory, turn, claimed, llm, settings):
         if turn.media_notice:
             _deliver(session, incident, [(turn.media_notice, None)])
         pending = _attempt(session, incident)
-        if (turn.agent_previous_helped_source is not None and pending is not None
-                and pending.evidence.get("talk_source") == turn.agent_previous_helped_source):
-            _record_feedback(session, pending, True)
-            pending.status = "SUCCEEDED"
+        if (turn.agent_previous_feedback is not None and pending is not None
+                and pending.evidence.get("talk_source") == turn.agent_previous_feedback[0]):
+            rating = turn.agent_previous_feedback[1]
+            _record_feedback(session, pending, rating != "AGENT_NEGATIVE")
+            pending.status = {"AGENT_RESOLVED": "SUCCEEDED", "AGENT_NEGATIVE": "FAILED",
+                              "AGENT_RATED": "UNASSESSED"}[rating]
             incident.state, incident.result = "DIAGNOSING", None
             session.flush()
             pending = None

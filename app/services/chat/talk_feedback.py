@@ -1,6 +1,7 @@
 """Aggregate explicit Talk feedback for the same question and document version."""
 
 import hashlib
+import re
 from datetime import timedelta
 
 from sqlalchemy import select
@@ -8,6 +9,65 @@ from sqlalchemy import select
 from app.models import Conversation, Delivery, Feedback, Incident, SolutionAttempt, now
 from app.services.chat.memory import _redact
 from app.services.rag.query import normalized_query
+
+
+_OUTCOME_PREFIX = re.compile(r"^(?:(?:да|нет|спасибо|благодарю|отлично|ура) )+")
+_NEXT_QUESTION = re.compile(
+    r"(?:[.!\n]+\s*|[,;]\s*(?=(?:(?:а\s+)?теперь|как|где|почему|что|когда)\b)|\s+(?=(?:а\s+)?теперь\b))"
+    r"(?:(?:а\s+)?теперь(?:\s+смотри(?:те)?)?|другой вопрос|новый вопрос|еще вопрос)?[,:]?\s*",
+    re.IGNORECASE,
+)
+_HELPED = {
+    "помогло", "помог", "помогла", "это помогло", "очень помогло", "совет помог", "инструкция помогла",
+    "помогла инструкция", "решилось",
+    "сработало", "получилось", "все получилось", "все работает", "работает", "заработало",
+    "все заработало", "проблема решена", "вопрос решен", "удалось", "удалось решить проблему",
+}
+_UNHELPFUL = {
+    "не помогло", "не помог", "не помогла", "это не помогло", "не сработало", "не получилось",
+    "не удалось", "не работает", "все еще не работает", "проблема осталась", "ничего не изменилось",
+    "ответ не подходит", "ответ не подошел", "ответ не понравился", "не понравилось", "инструкция не подходит",
+}
+_LIKED = {"ответ подошел", "ответ понравился", "понравилось", "ответ полезен", "инструкция подошла"}
+
+
+def _rating(message, awaiting):
+    if "?" in message:
+        return None
+    text = normalized_query(message)
+    if awaiting and text in {"да", "ага", "угу", "верно", "точно", "конечно", "да спасибо"}:
+        return "AGENT_RESOLVED"
+    if awaiting and text in {"нет", "неа", "нет спасибо", "еще нет", "пока нет"}:
+        return "AGENT_NEGATIVE"
+    text = re.sub(r" (?:спасибо|спасибо большое|благодарю)$", "", _OUTCOME_PREFIX.sub("", text))
+    text = re.sub(r"^(?:теперь|сейчас|уже) ", "", text)
+    if not awaiting and text in {"получилось", "удалось", "работает"}:
+        return None
+    if text in _HELPED:
+        return "AGENT_RESOLVED"
+    if text in _UNHELPFUL or message.strip() == "👎":
+        return "AGENT_NEGATIVE"
+    if text in _LIKED or message.strip() == "👍":
+        return "AGENT_RATED"
+    return None
+
+
+def split_agent_feedback(message, *, awaiting=False):
+    """Return a clear rating and any separate request that follows it."""
+    rating = _rating(message, awaiting)
+    if rating:
+        return rating, None
+    for boundary in _NEXT_QUESTION.finditer(message):
+        rating = _rating(message[:boundary.start()], awaiting)
+        question = message[boundary.end():].strip()
+        normalized = normalized_query(question)
+        if rating == "AGENT_NEGATIVE" and normalized in {
+            "что делать", "что дальше", "что теперь делать", "как быть", "что еще попробовать",
+        }:
+            return rating, None
+        if rating and normalized and not normalized.startswith(("но ", "однако ", "частично ")):
+            return rating, question
+    return None, None
 
 
 def question_key(message):

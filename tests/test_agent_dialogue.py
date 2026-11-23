@@ -11,8 +11,8 @@ from app.services.chat.agent_dialogue import (
     MODEL_UNAVAILABLE, OUTLOOK_LARGE_MAIL_FILE, OUTLOOK_LARGE_MAIL_SHA256, PAGE_CHARS, WINDOWS_SCREEN_FILE,
     WINDOWS_SCREEN_SHA256, run_agent,
 )
-from app.services.chat.talk_dialogue import UNAVAILABLE, _resume_turn, _text_turn
-from app.services.chat.talk_feedback import learned_feedback, reorder_candidates, source_key
+from app.services.chat.talk_dialogue import AGENT_OUTCOME_QUESTION, UNAVAILABLE, _resume_turn, _text_turn
+from app.services.chat.talk_feedback import learned_feedback, reorder_candidates, source_key, split_agent_feedback
 from app.services.llm.openwebui import OpenWebUILLM
 from app.services.llm.support_agent import AgentAction
 from app.services.rag.talk import KnowledgeUnavailable
@@ -362,6 +362,7 @@ def test_agent_wire_is_text_only_and_disables_provider_tools():
     def handler(request):
         body = json.loads(request.content)
         seen.append(body)
+        assert request.extensions["timeout"]["read"] == 180
         return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(search())}}]})
 
     model = OpenWebUILLM(settings(openwebui_api_key="test-key"), httpx.MockTransport(handler))
@@ -386,7 +387,7 @@ def test_combined_success_and_screen_question_rates_previous_answer_and_asks_onl
     assert knowledge.searches[-1].startswith("у меня гаснет экран")
     assert result["flow"]["agent"]["memory"]["expected_reply"] == "Тип устройства"
     assert result["flow"]["agent"]["sources"] == []
-    assert "На каком устройстве" in assistants(result)[-1][0]
+    assert "на компьютере, на сканере или на телефоне" in assistants(result)[-1][0]
     with talk.env.factory() as session:
         assert session.scalar(select(Feedback)).helped is True
 
@@ -394,13 +395,43 @@ def test_combined_success_and_screen_question_rates_previous_answer_and_asks_onl
     windows.document["source"]["sha256"] = WINDOWS_SCREEN_SHA256
     windows.document["content"] = ("\n".join(f"{number}. Диагностический шаг" for number in range(1, 5)) +
                                    "\nТолько для ИТ\n5. Не выдавать администратора")
-    talk.incoming("Windows", 3)
+    talk.incoming("На компьютере", 3)
     assert talk.process(Sources([windows]), Agent())
-    blocks = assistants(talk.snapshot())[-4:]
+    blocks = assistants(talk.snapshot())[-5:]
     assert "1. Диагностический шаг\n2. Диагностический шаг" in blocks[0][0] and blocks[0][1] is None
     assert "3. Диагностический шаг" in blocks[1][0]
     assert blocks[2][1].data == windows.illustrations[1].data
     assert blocks[3][0] == "4. Диагностический шаг"
+    assert blocks[4][0] == AGENT_OUTCOME_QUESTION
+
+
+@pytest.mark.parametrize("message,helped", [("Ага", True), ("Неа", False),
+                                            ("Да, помог. Теперь гаснет экран, что делать?", True),
+                                            ("Нет, не получилось. Теперь гаснет экран, что делать?", False)])
+def test_feedback_after_delivered_question_and_optional_new_task(talk, message, helped):
+    doc = approved()
+    first = answer(doc)
+    first["memory"]["next_step"] = ""
+    talk.incoming("Как настроить печать?")
+    assert talk.process(Sources([doc]), Agent(search(), read(doc), first))
+    assert assistants(talk.snapshot())[-1][0] == AGENT_OUTCOME_QUESTION
+    with talk.env.factory() as session, session.begin():
+        for delivery in session.scalars(select(Delivery)):
+            delivery.status = "SENT"
+    talk.incoming(message, 2)
+    assert talk.process(Sources([doc]), Agent())
+    with talk.env.factory() as session:
+        assert session.scalar(select(Feedback)).helped is helped
+    if "экран" in message:
+        assert "на сканере или на телефоне" in assistants(talk.snapshot())[-1][0]
+
+
+def test_feedback_does_not_treat_unsolicited_confirmation_or_symptom_as_rating():
+    assert split_agent_feedback("Да") == (None, None)
+    assert split_agent_feedback("Нет") == (None, None)
+    assert split_agent_feedback("Не работает почта") == (None, None)
+    assert split_agent_feedback("Спасибо, помогла инструкция.") == ("AGENT_RESOLVED", None)
+    assert split_agent_feedback("Нет, не получилось. Что теперь делать?") == ("AGENT_NEGATIVE", None)
 
 
 def test_talk_persists_agent_progress_photos_and_explicit_resolution(talk):

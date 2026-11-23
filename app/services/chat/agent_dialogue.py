@@ -26,7 +26,10 @@ WINDOWS_SCREEN_SHA256 = "014397db413283a9ebc802197a65b9f6ea7abe9c0e2956fe98d2523
 _SCREEN_REQUEST = re.compile(
     r"(?:у меня )?(?:гаснет экран|экран гаснет)(?: через какое[- ]то время)?(?: что делать)?"
 )
-_WINDOWS_REPLY = re.compile(r"(?:(?:на )?(?:рабочем )?(?:компьютере|ноутбуке|пк)(?: с)? )?(?:windows|виндовс)(?: 10| 11)?")
+_WINDOWS_REPLY = re.compile(
+    r"(?:windows|виндовс)(?: 10| 11)?|"
+    r"(?:на )?(?:рабочем )?(?:компьютере|компьютер|ноутбуке|ноутбук|пк)(?: (?:с )?(?:windows|виндовс)(?: 10| 11)?)?"
+)
 _LARGE_MAIL_REQUEST = re.compile(
     r"(?:надо отследить большой размер писем(?: как это сделать)?|"
     r"как (?:найти|отследить) (?:большие|крупные) письма(?: в outlook)?|"
@@ -153,7 +156,7 @@ def run_agent(message, flow, context, llm, knowledge, settings, *, force_new=Fal
         flow = {"agent": {"version": 1, "sources": [], "start_sequence": boundary or next_sequence,
                           "memory": TaskMemory(goal=message[:1000], expected_reply="Тип устройства").model_dump()},
                 "query": message}
-        return Turn("AGENT_REPLY", [("На каком устройстве гаснет экран — на компьютере с Windows, ТСД или другом устройстве?", None)],
+        return Turn("AGENT_REPLY", [("Где гаснет экран — на компьютере, на сканере или на телефоне?", None)],
                     flow=flow)
     event("talk.agent_task_relation", relation=relation)
     # Older conversations enter with their context and frozen progress, not a new confirmation gate.
