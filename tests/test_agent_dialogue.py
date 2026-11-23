@@ -7,7 +7,9 @@ from sqlalchemy import select
 
 from app.core.config import Settings
 from app.models import Delivery, Feedback, ResolutionMemory
-from app.services.chat.agent_dialogue import MODEL_UNAVAILABLE, PAGE_CHARS, run_agent
+from app.services.chat.agent_dialogue import (
+    MODEL_UNAVAILABLE, OUTLOOK_LARGE_MAIL_FILE, OUTLOOK_LARGE_MAIL_SHA256, PAGE_CHARS, run_agent,
+)
 from app.services.chat.talk_dialogue import UNAVAILABLE, _resume_turn, _text_turn
 from app.services.chat.talk_feedback import learned_feedback, reorder_candidates, source_key
 from app.services.llm.openwebui import OpenWebUILLM
@@ -129,6 +131,34 @@ def test_model_timeout_is_not_reported_as_knowledge_outage():
             raise httpx.ReadTimeout("private provider detail")
 
     assert run_agent("печать", {}, {}, TimedOutAgent(), Sources(), settings()).blocks == [(MODEL_UNAVAILABLE, None)]
+
+
+def test_large_outlook_mail_uses_current_approved_original_without_model():
+    doc = approved(file_id=OUTLOOK_LARGE_MAIL_FILE)
+    doc.document["source"]["sha256"] = OUTLOOK_LARGE_MAIL_SHA256
+    doc.document["content"] = "\n".join(
+        f"{number}. Настройка папки поиска 1024 КБ" for number in range(1, 6))
+    question = "Надо отследить большой размер писем, как это сделать?"
+    knowledge = Sources([doc])
+    old = {"agent": {"memory": {"goal": "Настроить печать"}}}
+    result = run_agent(question, old, {}, Agent(), knowledge, settings())
+    assert result.action == "AGENT_REPLY" and len(result.blocks) == 4
+    assert result.agent_documents[0].document["source"] == doc.document["source"]
+    assert "1024 КБ" in result.blocks[0][0]
+    assert [picture for _, picture in result.blocks[1:]] == [doc.illustrations[n] for n in (2, 3, 4)]
+    assert len(knowledge.checks) == 1
+
+    no_source = {"action": "reply", "kind": "clarification", "blocks": [{"text": "Уточните программу."}]}
+    for query, digest, expect_read in (
+        (question, "changed", True),
+        ("Как найти большие письма в Thunderbird?", OUTLOOK_LARGE_MAIL_SHA256, False),
+        ("Как найти большие письма, и как настроить принтер?", OUTLOOK_LARGE_MAIL_SHA256, False),
+    ):
+        doc.document["source"]["sha256"] = digest
+        knowledge = Sources([doc])
+        result = run_agent(query, {}, {}, Agent(no_source), knowledge, settings())
+        assert result.blocks == [("Уточните программу.", None)]
+        assert bool(knowledge.reads) is expect_read
 
 
 def test_failed_knowledge_search_cannot_be_reported_as_missing_instruction():

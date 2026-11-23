@@ -2,6 +2,7 @@
 
 import copy
 import json
+import re
 
 import httpx
 from pydantic import ValidationError
@@ -12,11 +13,44 @@ from app.services.chat.policies import direct_intent, requests_support_form, res
 from app.services.chat.talk_feedback import reorder_candidates, source_key
 from app.services.chat.task_state import starts_new_task
 from app.services.llm.support_agent import AgentAction, TaskMemory
+from app.services.rag.query import normalized_query
 from app.services.rag.talk import KnowledgeUnavailable
 
 
 PAGE_CHARS = 12000
 MODEL_UNAVAILABLE = "Сейчас не удалось подготовить ответ. Повторите вопрос немного позже."
+OUTLOOK_LARGE_MAIL_FILE = "e70650e7-d3bb-4708-8bfe-9f2e748d7922"
+OUTLOOK_LARGE_MAIL_SHA256 = "bf09266ba3fa350cc635d70650bfbfaf8b83ded4e78276d4e2dd5ab6585b82ed"
+_LARGE_MAIL_REQUEST = re.compile(
+    r"(?:надо отследить большой размер писем(?: как это сделать)?|"
+    r"как (?:найти|отследить) (?:большие|крупные) письма(?: в outlook)?|"
+    r"(?:как )?создать папку(?: поиска)? для писем (?:больше|более) 1024(?: кб)?(?: в outlook)?)"
+)
+
+
+def _approved_outlook_reply(message, knowledge, start_sequence):
+    if not _LARGE_MAIL_REQUEST.fullmatch(normalized_query(message)):
+        return None
+    doc = knowledge.read(OUTLOOK_LARGE_MAIL_FILE)
+    source = doc.document["source"]
+    if source["file_id"] != OUTLOOK_LARGE_MAIL_FILE or source["sha256"] != OUTLOOK_LARGE_MAIL_SHA256:
+        return None
+    content = doc.document["content"]
+    steps = [line.strip() for line in content.splitlines() if re.match(r"^[1-5]\. ", line.strip())]
+    if len(steps) != 5 or any(number not in doc.illustrations for number in (2, 3, 4)):
+        return None
+    text = ("В классическом Outlook:\n\n" + "\n".join(steps) +
+            "\n\nПапка поиска показывает существующие письма. Удаление из результатов затрагивает сами письма.")
+    memory = TaskMemory(goal="Найти письма больше 1024 КБ в классическом Outlook")
+    action = AgentAction.model_validate({
+        "action": "reply", "kind": "instruction", "memory": memory.model_dump(), "blocks": [{
+            "text": text, "references": [{"file_id": source["file_id"], "quote": steps[0]}],
+            "images": [{"file_id": source["file_id"], "number": number} for number in (2, 3, 4)],
+        }],
+    })
+    turn = _reply(action, message, {}, {}, {source["file_id"]: doc}, knowledge)
+    turn.flow["agent"]["start_sequence"] = start_sequence
+    return turn
 
 
 def run_agent(message, flow, context, llm, knowledge, settings):
@@ -30,6 +64,14 @@ def run_agent(message, flow, context, llm, knowledge, settings):
     memory = TaskMemory.model_validate(saved.get("memory", legacy_memory)).model_dump()
     recent = context.get("short_term", {}).get("messages", [])
     next_sequence = max((row.get("sequence", 0) for row in recent), default=0) + 1
+    try:
+        direct_reply = _approved_outlook_reply(message, knowledge, next_sequence)
+    except KnowledgeUnavailable as error:
+        event("talk.agent_direct_instruction_failed", error_code=error.code)
+    else:
+        if direct_reply is not None:
+            event("talk.agent_direct_instruction", scenario="outlook_large_mail")
+            return direct_reply
     boundary = saved.get("start_sequence")
     if type(boundary) is int:
         recent = [row for row in recent if row.get("sequence", 0) >= boundary]
