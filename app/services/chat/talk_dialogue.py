@@ -27,7 +27,7 @@ from app.services.chat.dialogue import _OPERATION_CLAIM, _TECHNICAL_OUTPUT
 from app.services.nextcloud.progress import start_progress
 from app.services.nextcloud.interruption import (
     TERMINAL_DELIVERIES, has_unfinished_guide, is_resume_request, latest_paused, pause_due_to_input,
-    record_response, resume_response,
+    discard_paused, record_response, resume_response,
 )
 from app.services.chat.memory import _redact, load_context, remember_resolution
 from app.services.chat.offer_adoption import adopt_instruction_offer
@@ -653,6 +653,8 @@ def _scanner_clarification(message, flow, knowledge):
     ):
         key = "SCANNER_GOAL"
     elif not barcode and not document and not program:
+        if re.search(r"\b(?:яркост\w*|луч(?:а|ом)?|подсвет\w*|громк\w*|суффикс\w*|префикс\w*)\b", latest):
+            return None
         key = "SCANNER_KIND"
     elif barcode and not program and not concrete:
         key = "SCANNER_GOAL" if re.search(r"\b(?:настро\w*|настрой\w*)\b", text) else "SCANNER_SYMPTOMS"
@@ -660,14 +662,16 @@ def _scanner_clarification(message, flow, knowledge):
         return None
     asked = list(flow.get("clarification_keys", []))
     if key in asked:
-        # Repeating an uninformative reply does not authorize an arbitrary
-        # source, and must not cause the same broad question to loop forever.
-        question = "Коротко опишите, что хотите изменить или что происходит при работе со сканером. Можно привести пример."
+        if flow.get("scanner_rephrased") == key:
+            return None
+        question = ("Что вы обычно сканируете — код на товаре или лист бумаги?" if key == "SCANNER_KIND" else
+                    "Что сейчас делает сканер и что вы хотите изменить?")
     else:
         question = CLARIFY_QUESTIONS[key]
         asked.append(key)
     return Turn("REPLY", [(question, None)], flow={
         "clarification_query": problem, "clarification_keys": asked,
+        "scanner_rephrased": key if key in flow.get("clarification_keys", []) else None,
         "excluded": flow.get("excluded", []),
     })
 
@@ -2007,6 +2011,9 @@ def _text_turn(message, flow, context, previous_pending, llm, knowledge, setting
                  or refusal_reply(message))
     if protected:
         return Turn("REPLY", [(protected, None)])
+    if (getattr(settings, "talk_dialogue_mode", "legacy") == "agent" and normalized_query(message) in {
+            "отмени все", "отменить все", "отмените все", "отмени текущий вопрос", "отмени текущую задачу"}):
+        return Turn("AGENT_CANCELLED", [("Хорошо, остановился. Если понадобится помощь, напишите новый вопрос.", None)])
     explicit_new_task = starts_new_task(message)
     if explicit_new_task and previous_pending == FORM_ACTION and not requests_support_form(message):
         return _continue_from_letter(message, {}, context, llm, knowledge, settings)
@@ -2049,18 +2056,23 @@ def _text_turn(message, flow, context, previous_pending, llm, knowledge, setting
             return Turn("HUMAN")
         from app.services.chat.agent_dialogue import run_agent
 
-        if flow.get("agent") and flow.get("source") and not explicit_new_task:
+        if not explicit_new_task:
             rating, question = split_agent_feedback(message, awaiting=context.get("agent_awaiting_outcome", False))
+            can_rate = flow.get("agent") and flow.get("source")
             if rating and question:
                 turn = run_agent(question, flow, context, llm, knowledge, settings, force_new=True)
-                turn.agent_previous_feedback = flow["source"], rating
+                if can_rate:
+                    turn.agent_previous_feedback = flow["source"], rating
                 turn.agent_question = question
                 return turn
-            if rating:
+            if rating and can_rate:
                 responses = {"AGENT_RESOLVED": "Хорошо, что получилось!",
                              "AGENT_RATED": "Спасибо, учту.",
                              "AGENT_NEGATIVE": "Понял. Что именно не получилось?"}
                 return Turn(rating, [(responses[rating], None)], flow=flow if rating == "AGENT_RESOLVED" else None)
+            if rating == "AGENT_NEGATIVE":
+                return Turn("REPLY", [("Понимаю. Если хотите передать вопрос сотруднику поддержки, "
+                                       "напишите «позвать специалиста».", None)])
         return run_agent(message, flow, context, llm, knowledge, settings)
     if flow.get("understanding_confirmation"):
         if intent == "HUMAN":
@@ -2491,7 +2503,15 @@ def _finish(factory, turn, claimed, llm, settings):
                 incident.state, incident.result = "DIAGNOSING", None
             session.flush()
             pending = None
-        if turn.action in {"AGENT_RATED", "AGENT_NEGATIVE"}:
+        if turn.action == "AGENT_CANCELLED":
+            discard_paused(session, room)
+            if pending:
+                pending.status = "UNASSESSED"
+            incident.pending_action, incident.escalation_reason = None, None
+            incident.state, incident.result = "DIAGNOSING", None
+            ack = _deliver(session, incident, turn.blocks)
+            room.flow = {"agent": {"version": 1, "sources": [], "memory": {}, "start_sequence": ack.sequence + 1}}
+        elif turn.action in {"AGENT_RATED", "AGENT_NEGATIVE"}:
             source = (room.flow or {}).get("source")
             if pending and pending.evidence.get("talk_source") == source:
                 _record_feedback(session, pending, turn.action == "AGENT_RATED")
@@ -2680,7 +2700,7 @@ def _finish(factory, turn, claimed, llm, settings):
         incident.version += 1
         inbox.status, inbox.error_code = "DONE", None
         if turn.action != "DELIVERY_RESUME":
-            record_response(session, room, incident, inbox, first_sequence)
+            record_response(session, room, incident, inbox, first_sequence, resumable=turn.action != "AGENT_CANCELLED")
         pause_due_to_input(session, room)
         # The public completion event is emitted by process_one after commit.
         # Recording it through audit() here previously logged a false success

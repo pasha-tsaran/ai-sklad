@@ -43,7 +43,7 @@ def _rows(session, room, snapshot, statuses):
     ).order_by(Message.sequence)).all()
 
 
-def record_response(session, room, incident, inbox, first_sequence):
+def record_response(session, room, incident, inbox, first_sequence, *, resumable=True):
     """Record this committed turn's exact output, without copying photo bytes."""
     ids = session.scalars(select(Delivery.id).join(Message).where(
         Delivery.account_id == room.account_id, Delivery.room_token == room.room_token,
@@ -62,7 +62,7 @@ def record_response(session, room, incident, inbox, first_sequence):
             "flow": {key: value for key, value in copy.deepcopy(room.flow or {}).items() if key != "_processing"},
             "state": incident.state, "pending": incident.pending_action, "result": incident.result,
             "attempt_id": attempt.id if attempt else None,
-            "resumable": not (room.flow or {}).get("escalation") and incident.state not in {"RESOLVED", "ESCALATED"},
+            "resumable": resumable and not (room.flow or {}).get("escalation") and incident.state not in {"RESOLVED", "ESCALATED"},
         }
     room.profile = profile
 
@@ -148,6 +148,19 @@ def latest_paused(session, room):
         if isinstance(snapshot, dict) and _rows(session, room, snapshot, ["PAUSED"]):
             return copy.deepcopy(snapshot)
     return None
+
+
+def discard_paused(session, room):
+    """Explicitly abandoned replies must not be restorable with 'continue'."""
+    profile = copy.deepcopy(room.profile or {})
+    saved = profile.get(PAUSED, [])
+    for snapshot in saved:
+        if isinstance(snapshot, dict) and snapshot.get("incident_id") == room.incident_id:
+            for row in _rows(session, room, snapshot, ["PAUSED"]):
+                row.status = "CANCELLED"
+                session.get(Message, row.message_id).delivery_status = "CANCELLED"
+    profile[PAUSED] = [item for item in saved if isinstance(item, dict) and item.get("incident_id") != room.incident_id]
+    room.profile = profile
 
 
 def has_unfinished_guide(session, room, attempt):

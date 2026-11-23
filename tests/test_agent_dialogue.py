@@ -9,7 +9,7 @@ from app.core.config import Settings
 from app.models import Delivery, Feedback, ResolutionMemory
 from app.services.chat.agent_dialogue import (
     MODEL_UNAVAILABLE, OUTLOOK_LARGE_MAIL_FILE, OUTLOOK_LARGE_MAIL_SHA256, PAGE_CHARS, WINDOWS_SCREEN_FILE,
-    WINDOWS_SCREEN_SHA256, _PRINT_SCHEMES, run_agent,
+    WINDOWS_SCREEN_SHA256, _LIGHT_SHEET_HASH, _LIGHT_SHEET_ID, _PRINT_SCHEMES, _print_scheme, run_agent,
 )
 from app.services.chat.talk_dialogue import AGENT_OUTCOME_QUESTION, UNAVAILABLE, _resume_turn, _text_turn
 from app.services.chat.talk_feedback import learned_feedback, reorder_candidates, source_key, split_agent_feedback
@@ -272,19 +272,84 @@ def test_verified_printer_procedures_follow_setup_changes_without_model():
     knowledge.prefetch_candidates = knowledge.search_candidates
     flow = {}
     for name, question in [
+        ("urovo", "«Как настроить печать с ТСД на один принтер Urovo по Bluetooth?» Ожидается схема с одним "
+                  "принтером, выключенной «Печать Wi-Fi» и пунктом о тестовой печати."),
         ("urovo", "Как настроить печать с ТСД на один принтер Urovo по Bluetooth?"),
         ("mixed", "А теперь мне нужно подключить один принтер по блютуз, а другой по Wi-Fi"),
+        ("mixed", "«А теперь мне нужно подключить один принтер по блютуз, а другой по Wi-Fi». "
+                  "Ожидается новая схема, с двумя принтерами. «Печать Wi-Fi» включена."),
         ("two", "А теперь надо подключить 2 принтера по Wi-Fi к ТСД"),
         ("tsc", "Как подключить к ТСД TSC по Wi-Fi?"),
     ]:
         turn = run_agent(question, flow, {}, Agent(), knowledge, settings())
         flow = turn.flow
-        assert knowledge.searches[-1] == (_PRINT_SCHEMES[name][2] if name in {"mixed", "two"} else question)
+        assert knowledge.searches[-1] == _PRINT_SCHEMES[name][2]
         assert turn.agent_documents == [docs[name]] and flow["source"] == docs[name].document["source"]
         before, photo, after = turn.blocks
         assert all(step in before[0] for step in docs[name].document["content"].split("\n\n")[:3])
         assert photo[1] == docs[name].illustrations[1]
         assert after[0] == docs[name].document["content"].split("\n\n")[3]
+
+
+@pytest.mark.parametrize("extra", [
+    "схема с одним принтером, включённой «Печать Wi-Fi» и пунктом о тестовой печати",
+    "схема с двумя принтерами",
+    "схема с одним принтером. Почему при печати пустые этикетки?",
+])
+def test_copied_expectations_must_agree_with_the_actual_setup(extra):
+    assert _print_scheme("«Как настроить печать с ТСД на один принтер Urovo по Bluetooth?» Ожидается " + extra, []) == (None, False)
+
+
+def test_brightness_after_generic_scanner_question_then_confirmed_model_gets_original_sheet(talk):
+    doc = approved(1, _LIGHT_SHEET_ID)
+    doc.document["source"]["sha256"] = _LIGHT_SHEET_HASH
+    doc.document["content"] = ("Нижний ряд: нижний — слабую, среднюю или сильную подсветку. "
+                               "Настраивают после определения нужного режима с ИТ.")
+    knowledge = Sources([doc])
+    knowledge.prefetch_candidates = knowledge.search_candidates
+    for n, message in enumerate(["Как настроить сканер?", "сильный луч сканирования на сканере, надо уменьшить его яркость",
+                                 "На наклейке Zebra DS2208"], start=1):
+        talk.incoming(message, n)
+        assert talk.process(knowledge, Agent())
+        snapshot = talk.snapshot()
+        if n == 2:
+            assert "наклейку" in assistants(snapshot)[-1][0] and not snapshot["attempts"]
+    assert snapshot["flow"]["source"] == doc.document["source"]
+    assert any(photo and photo.data == doc.illustrations[1].data for _, photo in assistants(snapshot))
+
+
+def test_cancel_pending_response_then_complaint_does_not_resume_or_rate_it(talk):
+    doc = approved()
+    knowledge = Sources([doc])
+    talk.incoming("Настроить печать")
+    assert talk.process(knowledge, Agent(search(), read(doc), answer(doc)))
+    talk.incoming("отмени все", 2, previous_delivered=False)
+    assert talk.process(knowledge, Agent())
+    assert talk.snapshot()["flow"]["agent"]["sources"] == []
+    assert talk.snapshot()["attempts"][0].status == "UNASSESSED"
+    talk.incoming("ты не помог мне", 3)
+    assert talk.process(knowledge, Agent())
+    assert "позвать специалиста" in assistants(talk.snapshot())[-1][0]
+    with talk.env.factory() as session:
+        assert session.scalar(select(Delivery.id).where(Delivery.status == "CANCELLED"))
+        assert not session.scalar(select(Delivery.id).where(Delivery.status == "PAUSED"))
+        assert session.scalar(select(Feedback)) is None
+
+
+def test_unreadable_scanner_label_and_different_device_never_release_zebra_sheet():
+    flow = {"scanner_light_goal": "Уменьшить яркость луча сканера", "agent": {
+        "sources": [], "memory": {"goal": "Уменьшить яркость", "expected_reply": "Модель"}}}
+    doc = approved()
+    knowledge = Sources([doc])
+    knowledge.prefetch_candidates = knowledge.search_candidates
+    turn = run_agent("Наклейки нет", flow, {}, Agent(), knowledge, settings())
+    assert "специалиста" in turn.blocks[0][0] and not knowledge.reads
+    clarify = {"action": "reply", "kind": "clarification", "blocks": [{"text": "Нужен лист для этого сканера."}]}
+    agent = Agent(read(doc), answer(doc), clarify)
+    turn = run_agent("Honeywell 1450g", flow, {}, agent, knowledge, settings())
+    assert knowledge.searches[-1] == "Уменьшить яркость луча сканера Honeywell 1450g"
+    assert agent.payloads[-1]["tool_results"][-1]["error"] == "SourceConflictsWithCurrentRequest"
+    assert not turn.agent_documents
 
 
 @pytest.mark.parametrize("question,digest,expect_read", [

@@ -58,9 +58,30 @@ _PRINT_SETUPS = {
     "two": r"(?:два|2) (?:принтера )?tsc по wifi",
 }
 
+# Optional descriptions often accompany a quoted test question. Accept only
+# presentation details consistent with the identified setup. Other text may
+# contain a new symptom or an operating constraint and must reach the agent.
+_EXPECTED_PRINT = re.compile(
+    r"ожидается (?:новая )?схема с (одним принтером|двумя принтерами)"
+    r"(?: (выключенной|включенной) печать wifi| печать wifi (выключена|включена))?"
+    r"(?: и пунктом о тестовой печати)?"
+)
+
 
 def _print_scheme(message, previous_sources):
     query = normalized_query(message)
+    question, separator, expectation = query.partition(" ожидается ")
+    if separator:
+        expected = _EXPECTED_PRINT.fullmatch("ожидается " + expectation)
+        if not expected:
+            return None, False
+        name, conditional = _print_scheme(question, previous_sources)
+        if not name or (expected[1] == "одним принтером") != (name in {"urovo", "tsc"}):
+            return None, False
+        wifi = expected[2] or expected[3]
+        if wifi and wifi.startswith("выключ") != (name == "urovo"):
+            return None, False
+        return name, conditional
     for name, devices in _PRINT_SETUPS.items():
         if re.fullmatch(r"(?:(?:как )?настроить печать с тсд на |(?:как )?подключить к тсд |тсд )" + devices, query):
             return name, False
@@ -162,6 +183,68 @@ def _approved_windows_screen_reply(message, memory, flow, knowledge):
     return turn
 
 
+_LIGHT_SHEET_ID = "1d78184d-c1ca-4e14-b5f0-6e2282d09aab"
+_LIGHT_SHEET_HASH = "8a4aca325b4a8894b37ef37f2ffcb3006a5ce65dec51735cb58a01d751809bbb"
+_LIGHT_SEARCH = "сканер яркость луча подсветка лист настроечных штрихкодов"
+_DS2208 = re.compile(r"(?:zebra |зебра )?ds[- ]?2208")
+_DIM_WORDS = re.compile(
+    r"(?:сильн\w*|ярк\w*|слабее|слишком|очень|свет\w*|луч\w*|подсвет\w*|сканирова\w*|"
+    r"сканер\w*|штрихкод\w*|штрих|кодов|ручн\w*|уменьш\w*|пониз\w*|сниз\w*|убав\w*|"
+    r"ослаб\w*|сделать|его|на|у|в|мне|меня|как|надо|нужно|хочу|пожалуйста|подскажите)"
+)
+
+
+def _scanner_light_request(message, flow):
+    """Resolve a requested reduction, never guess the hardware from a search hit."""
+    text = normalized_query(message)
+    goal = flow.get("scanner_light_goal")
+    if goal and re.fullmatch(r"(?:(?:на наклейке |написано |модель |это |у меня )+)?"
+                             + _DS2208.pattern, text):
+        return goal, True
+    named = re.search(r"\b" + _DS2208.pattern + r"\b", text)
+    terms = (text[:named.start()] + " " + text[named.end():] if named else text).split()
+    if not terms or not all(_DIM_WORDS.fullmatch(word) for word in terms):
+        return None, False
+    if not (named or "сканер" in text or any(k.startswith("SCANNER_") for k in flow.get("clarification_keys", []))):
+        return None, False
+    if (not re.search(r"\b(?:уменьш|пониз|сниз|убав|ослаб|слабее)", text)
+            or not re.search(r"\b(?:луч|яркост|подсвет)", text)):
+        return None, False
+    prior = normalized_query(flow.get("clarification_query", ""))
+    known_model = re.fullmatch(r"(?:(?:как )?настроить |настройка )?сканер(?: штрихкодов)? " + _DS2208.pattern, prior)
+    return message, bool(named or known_model)
+
+
+def _approved_scanner_light(message, goal, named, knowledge, candidates, boundary):
+    from app.services.chat.talk_dialogue import Turn
+
+    if not any(item["file_id"] == _LIGHT_SHEET_ID for item in candidates):
+        return None
+    doc = knowledge.read(_LIGHT_SHEET_ID)
+    source = doc.document["source"]
+    if (source["file_id"] != _LIGHT_SHEET_ID or source["sha256"] != _LIGHT_SHEET_HASH
+            or 1 not in doc.illustrations):
+        return None
+    if not named:
+        question = "Посмотрите на наклейку снизу сканера. Какая модель там указана?"
+        memory = TaskMemory(goal=goal[:1000], expected_reply=question)
+        return Turn("AGENT_REPLY", [(question, None)], flow={
+            "scanner_light_goal": goal[:1000], "query": goal[:1000],
+            "agent": {"version": 1, "start_sequence": boundary, "memory": memory.model_dump(), "sources": []},
+        })
+    block = {"text": "Для Zebra DS2208 слабая подсветка находится в нижнем ряду листа. "
+                     "Согласуйте нужный режим с ИТ, затем считайте только код слабой подсветки. "
+                     "Центральный код «Обязательные настройки» для этого не нужен.",
+             "references": [{"file_id": _LIGHT_SHEET_ID, "quote": "нижний — слабую, среднюю или сильную подсветку"},
+                            {"file_id": _LIGHT_SHEET_ID, "quote": "после определения нужного режима с ИТ"}],
+             "images": [{"file_id": _LIGHT_SHEET_ID, "number": 1}]}
+    action = AgentAction(action="reply", kind="instruction", memory=TaskMemory(goal=goal[:1000]), blocks=[block])
+    turn = _reply(action, message, {}, {}, {_LIGHT_SHEET_ID: doc}, knowledge)
+    turn.flow["agent"]["start_sequence"] = boundary
+    turn.agent_question = goal
+    return turn
+
+
 def run_agent(message, flow, context, llm, knowledge, settings, *, force_new=False):
     from app.services.chat.talk_dialogue import (
         Turn, UNAVAILABLE, _printer_clarification, _problem_query, _scanner_clarification, _simple_social, _step_confirmed,
@@ -191,13 +274,26 @@ def run_agent(message, flow, context, llm, knowledge, settings, *, force_new=Fal
     clarification = {} if force_new else flow
     pending_device = bool(clarification.get("clarification_keys"))
     search_message = _problem_query(message, clarification) if pending_device else message
+    if clarification.get("scanner_light_goal") and normalized_query(message) in {
+            "не знаю", "не вижу", "не видно", "наклейки нет", "не могу найти"}:
+        return Turn("REPLY", [("Название модели обычно рядом со штрихкодом на корпусе. "
+                               "Если его не видно, напишите «позвать специалиста».", None)], flow=copy.deepcopy(flow))
+    label_reply = (clarification.get("scanner_light_goal") and re.fullmatch(
+        r"(?:[a-zа-я]+ ){0,3}(?P<code>[a-zа-я]*-?\d+[a-zа-я\d-]*)", normalized_query(message)))
+    if label_reply:
+        search_message = clarification["scanner_light_goal"] + "\n" + message
     relation = "new" if force_new or starts_new_task(message) else "current"
     scheme, conditional = _print_scheme(message, [] if relation == "new" else saved.get("sources", []))
+    light_goal, light_model = _scanner_light_request(message, {} if relation == "new" else flow)
     initial_result = None
     searches = {}
     if (callable(prefetch) and not continuing_steps and normalized_query(message) and not _simple_social(message)
             and not _step_confirmed(message) and not requests_support_form(message)):
-        query = _PRINT_SCHEMES[scheme][2] if conditional else " ".join(search_message.split())[:1000]
+        query = " ".join(search_message.split())[:1000]
+        if scheme:
+            query = _PRINT_SCHEMES[scheme][2]
+        elif light_goal:
+            query = _LIGHT_SEARCH
         try:
             result = reorder_candidates(prefetch(query), feedback)
             searches[normalized_query(query)] = result
@@ -205,11 +301,25 @@ def run_agent(message, flow, context, llm, knowledge, settings, *, force_new=Fal
         except KnowledgeUnavailable as error:
             initial_result = {"tool": "search_knowledge", "error": error.code, "initial": True}
         event("talk.agent_initial_search", candidates=len(initial_result.get("result", {}).get("candidates", [])),
+              search_degraded=initial_result.get("result", {}).get("search_degraded"),
               error_code=initial_result.get("error"))
     boundary = saved.get("start_sequence")
     if type(boundary) is int:
         recent = [row for row in recent if row.get("sequence", 0) >= boundary]
     classify = getattr(llm, "classify_task_relation", None)
+    if light_goal and initial_result:
+        try:
+            light_turn = _approved_scanner_light(
+                message, light_goal, light_model, knowledge, initial_result.get("result", {}).get("candidates", []),
+                (boundary or next_sequence) if flow.get("scanner_light_goal") else next_sequence,
+            )
+        except KnowledgeUnavailable as error:
+            event("talk.agent_direct_instruction_failed", error_code=error.code)
+        else:
+            if light_turn:
+                if light_turn.agent_documents:
+                    event("talk.agent_direct_instruction")
+                return light_turn
     if scheme and initial_result:
         try:
             direct_reply = _approved_print_reply(message, scheme, conditional,
@@ -238,7 +348,7 @@ def run_agent(message, flow, context, llm, knowledge, settings, *, force_new=Fal
             clarify.action = "AGENT_REPLY"
             return clarify
     has_active_task = memory["goal"] or memory["expected_reply"] or saved.get("sources") or flow.get("source")
-    if (relation == "current" and not (pending_device and search_message != message)
+    if (relation == "current" and not label_reply and not (pending_device and search_message != message)
             and not continuing_steps and callable(classify) and has_active_task):
         try:
             relation = classify(message, memory, recent[-4:])
@@ -371,6 +481,10 @@ def run_agent(message, flow, context, llm, knowledge, settings, *, force_new=Fal
                         if approved is not None and not source_compatible(
                                 search_message, approved.candidate.title + "\n" + approved.document["content"]):
                             raise ValueError("SourceConflictsWithCurrentRequest")
+                        if label_reply and approved is not None:
+                            words = normalized_query(approved.candidate.title + " " + approved.document["content"]).split()
+                            if label_reply["code"].replace("-", "") not in {w.replace("-", "") for w in words}:
+                                raise ValueError("SourceConflictsWithCurrentRequest")
                 turn = _reply(action, message, flow, memory, complete, knowledge)
                 if action.new_task or type(boundary) is int:
                     turn.flow["agent"]["start_sequence"] = max(next_sequence, boundary or 0) if action.new_task else boundary
@@ -384,7 +498,8 @@ def run_agent(message, flow, context, llm, knowledge, settings, *, force_new=Fal
                 loaded.clear()
                 ranges.clear()
             payload["tool_results"].append({"tool": action.action, "error": code[:100]})
-    event("talk.agent_exhausted", calls=index + 1, error_code=failure, knowledge_failed=knowledge_failed)
+    event("talk.agent_exhausted", calls=index + 1, error_code=failure, knowledge_failed=knowledge_failed,
+          model_failed=model_failed)
     return Turn("REPLY", [(UNAVAILABLE if knowledge_failed and not model_failed else MODEL_UNAVAILABLE, None)],
                 flow=copy.deepcopy(flow))
 
