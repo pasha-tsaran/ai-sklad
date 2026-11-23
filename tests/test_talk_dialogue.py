@@ -3,7 +3,7 @@
 import copy
 import hashlib
 from datetime import timedelta
-from uuid import NAMESPACE_URL, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 import pytest
 from sqlalchemy import func, select, update
@@ -598,7 +598,9 @@ def test_per_turn_timing_reports_stages_without_query_or_identity(talk, monkeypa
     assert name == "talk.turn_completed" and timing["total_ms"] >= 0
     assert timing["stage_calls"].get("model_api", 0) == 0
     assert all(timing["timings_ms"][stage] >= 0 for stage in ("search", "verify", "route", "persist"))
-    assert set(timing) == {"total_ms", "route", "timings_ms", "stage_calls", "block_count", "error_code", "cache_hit"}
+    assert set(timing) == {"total_ms", "route", "timings_ms", "stage_calls", "block_count", "error_code",
+                           "cache_hit", "turn_id"}
+    assert str(UUID(timing["turn_id"])) == timing["turn_id"]
     assert timing["cache_hit"] is False
     assert QUESTION not in str(timing) and "employee" not in str(timing) and DOC not in str(timing)
 

@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     talk_dialogue_mode: Literal["agent", "legacy"] = "agent"
     talk_agent_max_calls: int = Field(default=12, ge=2, le=24)
     talk_agent_context_chars: int = Field(default=100000, ge=16000, le=240000)
+    talk_turn_budget_seconds: float = Field(default=150, ge=15, le=600)
     device_collection_base_url: str = ""
     nextcloud_bot_secret: SecretStr = SecretStr("")
     nextcloud_allowed_rooms: list[str] = Field(default_factory=list)
@@ -55,6 +56,7 @@ class Settings(BaseSettings):
     memory_max_messages: int = Field(default=12, ge=2, le=40)
     memory_max_chars: int = Field(default=12000, ge=2000, le=24000)
     memory_retention_days: int = Field(default=90, ge=1, le=365)
+    successful_retrieval_ttl_days: int = Field(default=30, ge=1, le=90)
 
     @field_validator("openwebui_num_ctx", mode="before")
     @classmethod

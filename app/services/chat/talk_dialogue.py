@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import re
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import timezone
 from uuid import NAMESPACE_URL, uuid5
@@ -44,6 +45,7 @@ from app.services.chat.task_state import (
     is_unknown_answer, remember_task_message, starts_new_task, task_evidence_authority, task_query, update_task_state,
 )
 from app.services.chat.talk_feedback import learned_feedback, question_key, split_agent_feedback
+from app.services.chat.turn_budget import turn_budget
 from app.services.rag.openwebui import save_snapshot
 from app.services.rag.query import _terms, normalized_query, printer_kinds, scanner_kinds
 from app.services.rag.talk import (
@@ -159,6 +161,7 @@ def _report_timing(metadata, started, route, block_count, error_code=None):
         total = _milliseconds((finished - started) * 1000) if finished is not None and started is not None else None
         state = metadata[TIMING_MARKER]
         event("talk.turn_failed" if error_code else "talk.turn_completed", total_ms=total, route=route,
+              turn_id=metadata.get("message_id"),
               timings_ms=dict(state.get("stages_ms", {})), stage_calls=dict(state.get("stage_calls", {})),
               block_count=block_count, error_code=error_code, cache_hit=bool(metadata.get("cache_hit")))
     except Exception:
@@ -2732,7 +2735,7 @@ def process_one(factory, settings, llm, knowledge=None, *, account_id=None):
                                                "extract_escalation": "model_api", "interpret_instruction_offer": "model_api",
                                                "adopt_instruction_offer": "model_api",
                                                "interpret_understanding_reply": "model_api",
-                                               "agent_action": "model_api"})
+                                               "agent_action": "model_api", "classify_task_relation": "model_route"})
         def select_source(payload):
             with _measure(metadata, "model_api"):
                 call = getattr(llm, "_call", None)
@@ -2781,7 +2784,9 @@ def process_one(factory, settings, llm, knowledge=None, *, account_id=None):
                                       {"search": "search", "search_with_llm": "search", "search_candidates": "search",
                                        "prefetch_candidates": "search",
                                        "read": "read", "is_current": "verify"})
-        with _measure(metadata, "route"):
+        budget = (turn_budget(settings.talk_turn_budget_seconds, turn_id=claimed["inbox_id"])
+                  if settings.talk_dialogue_mode == "agent" else nullcontext())
+        with _measure(metadata, "route"), budget:
             paused = None
             if is_resume_request(claimed["message"]) and not claimed["media"]:
                 with factory() as session:

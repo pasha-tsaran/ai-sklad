@@ -178,7 +178,7 @@ def test_initial_search_runs_before_model_and_supplies_candidates_for_reading():
     doc = approved()
     knowledge = Sources([doc])
     knowledge.prefetch_candidates = knowledge.search_candidates
-    question = "Как настроить печать?"
+    question = "Как настроить печать PDF в Acrobat?"
     agent = Agent(read(doc), answer(doc))
     turn = run_agent(question, {}, {}, agent, knowledge, settings())
     assert turn.action == "AGENT_REPLY"
@@ -198,10 +198,51 @@ def test_empty_initial_search_requires_reformulating_before_admitting_no_instruc
     knowledge = EmptySources()
     missing = {"action": "reply", "kind": "no_knowledge", "blocks": [{"text": "Инструкция не найдена."}]}
     agent = Agent(missing, search(), missing)
-    result = run_agent("Как отправить этикетку на печать?", {}, {}, agent, knowledge, settings())
+    result = run_agent("Как исправить печать PDF в Acrobat?", {}, {}, agent, knowledge, settings())
     assert result.blocks == [("Инструкция не найдена.", None)]
     assert len(knowledge.searches) == 2
     assert agent.payloads[1]["tool_results"][-1]["error"] == "TrySearchByDifferentWordsOrActionsBeforeNoKnowledge"
+
+
+def test_scanner_requires_one_simple_clarification_even_if_model_is_down():
+    knowledge = Sources([approved()])
+    knowledge.prefetch_candidates = knowledge.search_candidates
+    agent = Agent()
+    result = run_agent("Как настроить сканер?", {}, {}, agent, knowledge, settings())
+    assert knowledge.searches == ["Как настроить сканер?"]
+    assert not agent.payloads
+    assert result.blocks == [("Какой у вас сканер — ручной для штрихкодов или для бумажных документов?", None)]
+    assert run_agent("для штрихкодов", result.flow, {}, agent, knowledge, settings()).flow[
+        "clarification_keys"][-1] == "SCANNER_GOAL"
+
+
+def test_agent_rejects_real_quote_from_source_with_wrong_connection():
+    doc = approved()
+    doc.document["content"] += "\nПодключение по Wi-Fi."
+    knowledge = Sources([doc])
+    knowledge.prefetch_candidates = knowledge.search_candidates
+    clarify = {"action": "reply", "kind": "clarification", "blocks": [{"text": "Уточните модель принтера."}]}
+    agent = Agent(read(doc), answer(doc), clarify)
+    result = run_agent("Как подключить принтер по Bluetooth?", {}, {}, agent, knowledge, settings())
+    assert agent.payloads[-1]["tool_results"][-1]["error"] == "SourceConflictsWithCurrentRequest"
+    assert result.blocks == [("Уточните модель принтера.", None)]
+
+
+def test_model_retries_transient_gateway_error_and_respects_turn_budget():
+    from app.services.chat.turn_budget import turn_budget
+
+    attempts = []
+
+    def handler(request):
+        attempts.append(request.extensions["timeout"]["read"])
+        if len(attempts) == 1:
+            return httpx.Response(503)
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(search())}}]})
+
+    model = OpenWebUILLM(settings(openwebui_api_key="test-key"), httpx.MockTransport(handler))
+    with turn_budget(5):
+        assert model.agent_action({"message": "печать"}).action == "search_knowledge"
+    assert len(attempts) == 2 and 0 < attempts[1] < attempts[0] <= 5
 
 
 @pytest.mark.parametrize("invalid,error", [

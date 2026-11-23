@@ -63,7 +63,7 @@ unclear: по сообщению и контексту нельзя понять
         {"role": "system", "content": policy},
         {"role": "user", "content": json.dumps(
             {"message": message, "memory": memory, "recent": recent}, ensure_ascii=False)},
-    ], selection_schema=TaskRelation.model_json_schema(), max_output_tokens=64, talk_agent=True)).relation
+    ], selection_schema=TaskRelation.model_json_schema(), max_output_tokens=64, talk_agent=True, timeout_cap=35)).relation
 
 
 SYSTEM = """Ты — помощник первой линии технической поддержки сотрудников склада.

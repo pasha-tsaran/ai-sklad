@@ -7,7 +7,7 @@ import re
 from datetime import timedelta, timezone
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from app.models import Conversation, Feedback, Incident, Message, SolutionAttempt, SuccessfulRetrieval, now
 from app.services.chat.memory import _redact
@@ -19,6 +19,12 @@ from integrations.openwebui.approved_instruction_images import allowed_source_fi
 
 _HASH = re.compile(r"^[0-9a-f]{64}$")
 _KEY_FIELDS = {"scope_hash", "query_hash", "context_hash"}
+
+
+def expire_retrievals(factory):
+    with factory() as session, session.begin():
+        result = session.execute(delete(SuccessfulRetrieval).where(SuccessfulRetrieval.expires_at <= now()))
+        return result.rowcount
 
 
 def _digest(value):
@@ -179,7 +185,7 @@ def remember_success(session, settings, principal, incident_id, key, source, *, 
     resolved = incident.closed_at
     if resolved.tzinfo is None:
         resolved = resolved.replace(tzinfo=timezone.utc)
-    expires = resolved + timedelta(days=settings.memory_retention_days)
+    expires = resolved + timedelta(days=min(settings.memory_retention_days, settings.successful_retrieval_ttl_days))
     if expires <= now():
         return None
     stored_key = dict(key)

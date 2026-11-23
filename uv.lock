@@ -17,6 +17,7 @@ dependencies = [
     { name = "pydantic" },
     { name = "pydantic-settings" },
     { name = "sqlalchemy" },
+    { name = "tenacity" },
     { name = "uvicorn", extra = ["standard"] },
     { name = "websockets" },
 ]
@@ -41,6 +42,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8.3,<9" },
     { name = "ruff", marker = "extra == 'test'", specifier = ">=0.9,<1" },
     { name = "sqlalchemy", specifier = ">=2.0.36,<2.1" },
+    { name = "tenacity", specifier = ">=9,<10" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30,<1" },
     { name = "websockets", specifier = ">=16,<18" },
 ]

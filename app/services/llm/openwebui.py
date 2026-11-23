@@ -5,6 +5,7 @@ from time import perf_counter
 import httpx
 from langchain_core.runnables import RunnableLambda
 from langsmith import tracing_context
+from tenacity import Retrying, retry_if_exception, stop_after_attempt, wait_fixed
 
 from app.core.logging import event
 from app.schemas.contracts import (
@@ -13,6 +14,7 @@ from app.schemas.contracts import (
 )
 from app.services.chat.task_state import is_unknown_answer, task_evidence_authority
 from app.services.chat.task_evidence import build_user_evidence, constrain_user_evidence, resolve_user_evidence
+from app.services.chat.turn_budget import cap_request_timeout, remaining_seconds
 from app.services.llm.prompts import (
     ANALYZE_TASK, COMPOSE_TASK, DIALOGUE_TASK, ESCALATION_EXTRACTION_TASK, FOLLOWUP_TASK,
     INSTRUCTION_OFFER_TASK, SUMMARY_TASK, SUPPORT_TASK_TASK, UNDERSTANDING_REPLY_TASK, stage_messages,
@@ -23,6 +25,15 @@ from app.services.llm.instruction_selection import (
 
 
 _TASK_REQUIRED_FIELDS = ("new_task", "facts", "goals", "question", "question_field")
+
+
+def _retry_talk_model(error):
+    remaining = remaining_seconds()
+    if remaining is not None and remaining <= 2:
+        return False
+    return isinstance(error, (httpx.ConnectError, httpx.ConnectTimeout)) or (
+        isinstance(error, httpx.HTTPStatusError) and error.response.status_code in {502, 503, 504}
+    )
 
 
 def _instruction_contract_repair(error, stage):
@@ -293,17 +304,26 @@ class OpenWebUILLM:
         if timeout_cap is not None:
             timeout = min(timeout, timeout_cap)
         if talk_agent:
-            timeout = httpx.Timeout(timeout, read=max(timeout, 180))
+            timeout = httpx.Timeout(min(timeout, 8), read=max(timeout, 180) if timeout_cap is None else timeout_cap)
         with httpx.Client(
             timeout=timeout,
-            transport=self.transport, follow_redirects=False
+            transport=self.transport, follow_redirects=False,
+            event_hooks={"request": [cap_request_timeout]},
         ) as client:
-            response = client.post(
-                self.settings.openwebui_base_url.rstrip("/") + "/api/chat/completions",
-                headers={"Authorization": "Bearer " + self.settings.openwebui_api_key.get_secret_value()},
-                json=body,
-            )
-            response.raise_for_status()
+            def completion():
+                response = client.post(
+                    self.settings.openwebui_base_url.rstrip("/") + "/api/chat/completions",
+                    headers={"Authorization": "Bearer " + self.settings.openwebui_api_key.get_secret_value()},
+                    json=body,
+                )
+                response.raise_for_status()
+                return response
+
+            if talk_agent:
+                response = Retrying(retry=retry_if_exception(_retry_talk_model), wait=wait_fixed(0.3),
+                                    stop=stop_after_attempt(2), reraise=True)(completion)
+            else:
+                response = completion()
             result = response.json()
             choice = result["choices"][0]
             content = choice["message"]["content"]

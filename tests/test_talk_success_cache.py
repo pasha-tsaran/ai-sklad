@@ -9,7 +9,7 @@ from sqlalchemy import create_engine, event, func, select
 from app.db import session_factory
 from app.models import Base, Conversation, Feedback, Incident, Message, SolutionAttempt, SuccessfulRetrieval, User, now
 from app.services.rag.openwebui import save_snapshot
-from app.services.rag.success import SuccessfulTalkKnowledge, cache_key, remember_success
+from app.services.rag.success import SuccessfulTalkKnowledge, cache_key, expire_retrievals, remember_success
 from app.services.rag.talk import InstructionDecision
 from tests.test_openwebui_instruction_images import instruction
 from tests.test_talk_knowledge import DOC, KB, QUERY, provider
@@ -79,6 +79,19 @@ def cached(tmp_path):
 def count(cached):
     with cached.factory() as session:
         return session.scalar(select(func.count()).select_from(SuccessfulRetrieval))
+
+
+def test_periodic_cleanup_removes_only_expired_hints_and_preserves_feedback(cached):
+    assert cached.remember()
+    assert expire_retrievals(cached.factory) == 0
+    with cached.factory() as session, session.begin():
+        hint = session.scalar(select(SuccessfulRetrieval))
+        hint.expires_at = now() - timedelta(seconds=1)
+    assert expire_retrievals(cached.factory) == 1
+    assert count(cached) == 0
+    with cached.factory() as session:
+        assert session.get(Feedback, cached.ids["feedback"]).helped is True
+        assert session.get(Incident, cached.ids["incident"]).state == "RESOLVED"
 
 
 def test_explicit_success_survives_wrapper_restart_and_rechecks_original_without_vector_or_model(cached):

@@ -442,9 +442,12 @@ class TalkKnowledge:
         return self.settings.llm_backend == "openwebui"
 
     def _client(self):
+        from app.services.chat.turn_budget import cap_request_timeout
+
         return httpx.Client(
             headers={"Authorization": "Bearer " + self.settings.openwebui_api_key.get_secret_value()},
             timeout=self.settings.llm_timeout_seconds, transport=self.transport, follow_redirects=False,
+            event_hooks={"request": [cap_request_timeout]},
         )
 
     def _files(self, client):

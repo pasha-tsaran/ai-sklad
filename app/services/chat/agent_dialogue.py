@@ -13,12 +13,13 @@ from app.services.chat.policies import direct_intent, requests_support_form, res
 from app.services.chat.talk_feedback import reorder_candidates, source_key
 from app.services.chat.task_state import starts_new_task
 from app.services.llm.support_agent import AgentAction, TaskMemory
-from app.services.rag.query import normalized_query
+from app.services.rag.query import normalized_query, source_compatible
 from app.services.rag.talk import KnowledgeUnavailable
 
 
 PAGE_CHARS = 12000
-MODEL_UNAVAILABLE = "Сейчас не удалось подготовить ответ. Повторите вопрос немного позже."
+MODEL_UNAVAILABLE = ("Сейчас не удалось подготовить ответ. Ваш вопрос сохранён. "
+                     "Если ждать неудобно, напишите «позвать специалиста».")
 OUTLOOK_LARGE_MAIL_FILE = "e70650e7-d3bb-4708-8bfe-9f2e748d7922"
 OUTLOOK_LARGE_MAIL_SHA256 = "bf09266ba3fa350cc635d70650bfbfaf8b83ded4e78276d4e2dd5ab6585b82ed"
 WINDOWS_SCREEN_FILE = "410c6e3f-f500-425f-9a43-fa204ae8338e"
@@ -97,7 +98,9 @@ def _approved_windows_screen_reply(message, memory, flow, knowledge):
 
 
 def run_agent(message, flow, context, llm, knowledge, settings, *, force_new=False):
-    from app.services.chat.talk_dialogue import Turn, UNAVAILABLE, _simple_social, _step_confirmed
+    from app.services.chat.talk_dialogue import (
+        Turn, UNAVAILABLE, _printer_clarification, _problem_query, _scanner_clarification, _simple_social, _step_confirmed,
+    )
 
     saved = copy.deepcopy(flow.get("agent", {}))
     legacy_memory = {"goal": str(flow.get("query", ""))[:1000],
@@ -119,11 +122,14 @@ def run_agent(message, flow, context, llm, knowledge, settings, *, force_new=Fal
             return direct_reply
     feedback = context.get("agent_feedback", {})
     prefetch = getattr(knowledge, "prefetch_candidates", None)
+    clarification = {} if force_new else flow
+    pending_device = bool(clarification.get("clarification_keys"))
+    search_message = _problem_query(message, clarification) if pending_device else message
     initial_result = None
     searches = {}
     if (callable(prefetch) and normalized_query(message) and not _simple_social(message)
             and not _step_confirmed(message) and not requests_support_form(message)):
-        query = " ".join(message.split())[:1000]
+        query = " ".join(search_message.split())[:1000]
         try:
             result = reorder_candidates(prefetch(query), feedback)
             searches[normalized_query(query)] = result
@@ -137,13 +143,36 @@ def run_agent(message, flow, context, llm, knowledge, settings, *, force_new=Fal
         recent = [row for row in recent if row.get("sequence", 0) >= boundary]
     classify = getattr(llm, "classify_task_relation", None)
     relation = "new" if force_new or starts_new_task(message) else "current"
-    if relation == "current" and callable(classify) and (memory["goal"] or memory["expected_reply"]
-                                                        or saved.get("sources") or flow.get("source")):
+    if initial_result:
+        # A general request like "configure a scanner" does not authorize a
+        # procedure specific to one kind of scanner or work application.
+        clues = {} if relation == "new" else clarification
+        clarify = _scanner_clarification(message, clues, knowledge) or _printer_clarification(message, clues)
+        if clarify:
+            key = clarify.flow["clarification_keys"][-1]
+            if key == "SCANNER_KIND" and key not in clues.get("clarification_keys", []):
+                clarify.blocks = [("Какой у вас сканер — ручной для штрихкодов или для бумажных документов?", None)]
+            clarify.flow["agent"] = {
+                "version": 1, "sources": [],
+                "start_sequence": (boundary or next_sequence) if search_message != message else next_sequence,
+                "memory": TaskMemory(goal=clarify.flow["clarification_query"][:1000],
+                                     expected_reply=clarify.blocks[0][0]).model_dump(),
+            }
+            clarify.action = "AGENT_REPLY"
+            return clarify
+    has_active_task = memory["goal"] or memory["expected_reply"] or saved.get("sources") or flow.get("source")
+    route_unavailable = False
+    if (relation == "current" and not (pending_device and search_message != message)
+            and callable(classify) and has_active_task):
         try:
             relation = classify(message, memory, recent[-4:])
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as error:
             event("talk.agent_task_relation_failed", error_code=type(error).__name__)
-            return Turn("REPLY", [(MODEL_UNAVAILABLE, None)], flow=copy.deepcopy(flow))
+            if initial_result and initial_result.get("result", {}).get("candidates"):
+                relation = "unclear"
+                route_unavailable = True
+            else:
+                return Turn("REPLY", [(MODEL_UNAVAILABLE, None)], flow=copy.deepcopy(flow))
     if relation == "unclear" and initial_result is None:
         return Turn("REPLY", [("Это продолжение предыдущего вопроса или новая задача? Уточните, пожалуйста.", None)],
                     flow=copy.deepcopy(flow))
@@ -175,11 +204,17 @@ def run_agent(message, flow, context, llm, knowledge, settings, *, force_new=Fal
         allowed.add(flow["source"]["file_id"])
     for part in flow.get("instruction_plan", {}).get("parts", []):
         allowed.add(part["source"]["file_id"])
+    if route_unavailable:
+        # Current-search candidates remain allowed. Previous sources require
+        # rediscovery when we could not establish that the topic continued.
+        allowed.clear()
+        payload.update(active_sources=[], previous_progress={})
     limit = settings.talk_agent_context_chars
     first = (initial_result or {}).get("result")
     if first is not None:
         allowed.update(item["file_id"] for item in first["candidates"])
     failure = "CallLimit"
+    model_failed = False
     knowledge_failed = bool(initial_result and (first is None or first.get("search_degraded")))
     verified_search = first is not None and not first.get("search_degraded", False)
     tried_reformulation = False
@@ -195,6 +230,7 @@ def run_agent(message, flow, context, llm, knowledge, settings, *, force_new=Fal
             continue
         except (httpx.HTTPError, KeyError, IndexError, TypeError) as error:
             failure = type(error).__name__
+            model_failed = True
             break
         event("talk.agent_action", action=action.action, call=index + 1)
         try:
@@ -254,6 +290,13 @@ def run_agent(message, flow, context, llm, knowledge, settings, *, force_new=Fal
                     raise ValueError("TrySearchByDifferentWordsOrActionsBeforeNoKnowledge")
                 if action.kind == "no_knowledge" and knowledge_failed and not verified_search:
                     raise KnowledgeUnavailable("SearchCouldNotBeVerified")
+                if action.kind == "instruction" and callable(prefetch):
+                    used_ids = {ref.file_id for block in action.blocks for ref in block.references}
+                    if len(used_ids) == 1:
+                        approved = complete.get(next(iter(used_ids)))
+                        if approved is not None and not source_compatible(
+                                search_message, approved.candidate.title + "\n" + approved.document["content"]):
+                            raise ValueError("SourceConflictsWithCurrentRequest")
                 turn = _reply(action, message, flow, memory, complete, knowledge)
                 if action.new_task or type(boundary) is int:
                     turn.flow["agent"]["start_sequence"] = max(next_sequence, boundary or 0) if action.new_task else boundary
@@ -268,7 +311,8 @@ def run_agent(message, flow, context, llm, knowledge, settings, *, force_new=Fal
                 ranges.clear()
             payload["tool_results"].append({"tool": action.action, "error": code[:100]})
     event("talk.agent_exhausted", calls=index + 1, error_code=failure, knowledge_failed=knowledge_failed)
-    return Turn("REPLY", [(UNAVAILABLE if knowledge_failed else MODEL_UNAVAILABLE, None)], flow=copy.deepcopy(flow))
+    return Turn("REPLY", [(UNAVAILABLE if knowledge_failed and not model_failed else MODEL_UNAVAILABLE, None)],
+                flow=copy.deepcopy(flow))
 
 
 def _reply(action, message, flow, memory, complete, knowledge):

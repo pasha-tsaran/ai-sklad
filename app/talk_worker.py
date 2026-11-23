@@ -132,7 +132,8 @@ def run(settings, *, once=False):
                     try:
                         result = indexing.result()
                         event("talk.knowledge_index", complete=result.get("complete") is True,
-                              ready=result.get("indexed_count", result.get("ready")), status=result.get("status"))
+                              ready=result.get("indexed_count", result.get("ready")), status=result.get("status"),
+                              expired_retrievals=result.get("expired_retrievals"))
                     except Exception as exc:
                         event("talk.knowledge_index_error", error_code=error_code(exc))
                     indexing = None
@@ -156,12 +157,26 @@ def main(argv=None):
     parser.add_argument("--check", action="store_true", help="Check account and private rooms without sending")
     parser.add_argument("--check-knowledge", action="store_true", help="Read approved knowledge and photos without sending")
     parser.add_argument("--check-profile", action="store_true", help="Validate shared settings without sending or printing the prompt")
+    parser.add_argument("--check-model", action="store_true", help="Run a small read-only model completion")
     parser.add_argument("--check-typing", action="store_true", help="Read native typing prerequisites without joining or sending")
     parser.add_argument("--once", action="store_true", help="Run one real poll/process/delivery cycle")
     args = parser.parse_args(argv)
     configure_logging()
     try:
         settings = get_settings()
+        if args.check_model:
+            from app.services.chat.turn_budget import turn_budget
+            from app.services.llm.openwebui import OpenWebUILLM
+            from app.services.llm.profile import profile_settings
+
+            snapshot = profile_settings(settings)
+            started = time.monotonic()
+            with turn_budget(12):
+                relation = OpenWebUILLM(snapshot).classify_task_relation(
+                    "Где контакты техподдержки?", {"goal": "Настроить принтер"}, [])
+            print(json.dumps({"status": "ok", "model": snapshot.openwebui_model, "relation": relation,
+                              "seconds": round(time.monotonic() - started, 2)}))
+            return 0
         if args.check_profile:
             from app.services.llm.profile import profile_settings
 
