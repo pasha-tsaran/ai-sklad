@@ -311,12 +311,39 @@ class OpenWebUILLM:
             event_hooks={"request": [cap_request_timeout]},
         ) as client:
             def completion():
-                response = client.post(
-                    self.settings.openwebui_base_url.rstrip("/") + "/api/chat/completions",
+                request = client.build_request(
+                    "POST", self.settings.openwebui_base_url.rstrip("/") + "/api/chat/completions",
                     headers={"Authorization": "Bearer " + self.settings.openwebui_api_key.get_secret_value()},
                     json=body,
                 )
-                response.raise_for_status()
+                stage = "connect"
+
+                def trace(name, info):
+                    nonlocal stage
+                    if name.endswith("receive_response_headers.started"):
+                        stage = "waiting_for_headers"
+                    elif name.endswith("receive_response_body.started"):
+                        stage = "reading_body"
+
+                if talk_agent:
+                    request.extensions["trace"] = trace
+                try:
+                    response = client.send(request)
+                    response.raise_for_status()
+                except httpx.HTTPError as error:
+                    if talk_agent:
+                        remaining = remaining_seconds()
+                        if isinstance(error, httpx.ReadTimeout) and error.args == ("TalkTurnBudgetExceeded",):
+                            stage = "turn_budget_before_send"
+                        event("talk.model_request_failed", response_schema=(selection_schema or {}).get("title"),
+                              stage=stage, error_code=type(error).__name__,
+                              http_status=error.response.status_code if isinstance(error, httpx.HTTPStatusError) else None,
+                              elapsed_ms=round((perf_counter() - started) * 1000),
+                              read_limit_s=request.extensions.get("timeout", {}).get("read"),
+                              turn_remaining_s=round(remaining, 2) if remaining is not None else None,
+                              num_ctx=self.settings.openwebui_num_ctx,
+                              input_chars=sum(len(message["content"]) for message in messages))
+                    raise
                 return response
 
             if talk_agent:

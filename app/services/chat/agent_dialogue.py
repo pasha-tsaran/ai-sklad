@@ -245,6 +245,21 @@ def _approved_scanner_light(message, goal, named, knowledge, candidates, boundar
     return turn
 
 
+def _read_page(file_id, offset, approved, feedback):
+    content = approved.document["content"]
+    if offset >= len(content):
+        raise ValueError("ReadAtNextOffset")
+    end = min(len(content), offset + PAGE_CHARS)
+    source = approved.document["source"]
+    result = {"source": source, "content": content[offset:end], "offset": offset, "next_offset": end,
+              "complete": end == len(content), "images": [
+                  {"number": number, "description": image.caption} for number, image in approved.illustrations.items()
+              ] if offset == 0 else []}
+    if offset == 0 and (votes := feedback.get(source_key(source))):
+        result["feedback"] = votes
+    return {"tool": "read_instruction", "file_id": file_id, "result": result}
+
+
 def run_agent(message, flow, context, llm, knowledge, settings, *, force_new=False):
     from app.services.chat.talk_dialogue import (
         Turn, UNAVAILABLE, _printer_clarification, _problem_query, _scanner_clarification, _simple_social, _step_confirmed,
@@ -301,6 +316,8 @@ def run_agent(message, flow, context, llm, knowledge, settings, *, force_new=Fal
         except KnowledgeUnavailable as error:
             initial_result = {"tool": "search_knowledge", "error": error.code, "initial": True}
         event("talk.agent_initial_search", candidates=len(initial_result.get("result", {}).get("candidates", [])),
+              search_method=initial_result.get("result", {}).get("search_method"),
+              other_titles=len(initial_result.get("result", {}).get("other_titles", {})),
               search_degraded=initial_result.get("result", {}).get("search_degraded"),
               error_code=initial_result.get("error"))
     boundary = saved.get("start_sequence")
@@ -354,7 +371,8 @@ def run_agent(message, flow, context, llm, knowledge, settings, *, force_new=Fal
             relation = classify(message, memory, recent[-4:])
         except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as error:
             event("talk.agent_task_relation_failed", error_code=type(error).__name__)
-            if initial_result and initial_result.get("result", {}).get("candidates"):
+            current_search = (initial_result or {}).get("result", {})
+            if current_search.get("candidates") or current_search.get("other_titles"):
                 # Answer from the current search. Carrying the old memory or history
                 # here can resurrect the previous solution even after a clarification.
                 relation = "new"
@@ -395,6 +413,25 @@ def run_agent(message, flow, context, llm, knowledge, settings, *, force_new=Fal
     first = (initial_result or {}).get("result")
     if first is not None:
         allowed.update(item["file_id"] for item in first["candidates"])
+        allowed.update(first.get("other_titles", {}))
+    # Speculatively open one indexed candidate. Its rank alone never authorizes
+    # an answer. The model can still choose another original or refine its search.
+    candidates = (first or {}).get("candidates", [])
+    if candidates and candidates[0].get("sha256"):
+        lead = candidates[0]
+        file_id = lead["file_id"]
+        try:
+            document = knowledge.read(file_id)
+            source = document.document["source"]
+            if source["file_id"] == file_id and source["sha256"] == lead["sha256"] and document.document["content"]:
+                page = _read_page(file_id, 0, document, feedback)
+                size = len(json.dumps(page, ensure_ascii=False)) + len(json.dumps(payload, ensure_ascii=False)) + 2
+                if size <= limit:
+                    payload["tool_results"].append(page)
+                    loaded[file_id] = document
+                    ranges[file_id] = page["result"]["next_offset"]
+        except KnowledgeUnavailable as error:
+            event("talk.agent_prefetch_read_failed", error_code=error.code)
     failure = "CallLimit"
     model_failed = False
     knowledge_failed = bool(initial_result and (first is None or first.get("search_degraded")))
@@ -430,6 +467,7 @@ def run_agent(message, flow, context, llm, knowledge, settings, *, force_new=Fal
                 verified_search |= not result.get("search_degraded", False)
                 knowledge_failed |= bool(result.get("search_degraded", False))
                 allowed.update(item["file_id"] for item in result["candidates"])
+                allowed.update(result.get("other_titles", {}))
                 payload["tool_results"].append({"tool": action.action, "query": action.query, "result": result})
             elif action.action == "read_instruction":
                 if action.file_id not in allowed:
@@ -437,23 +475,15 @@ def run_agent(message, flow, context, llm, knowledge, settings, *, force_new=Fal
                 if action.file_id not in loaded:
                     loaded[action.file_id] = knowledge.read(action.file_id)
                 approved = loaded[action.file_id]
-                content = approved.document["content"]
                 expected = ranges.get(action.file_id, 0)
-                if action.offset != expected or action.offset >= len(content):
+                if expected == len(approved.document["content"]) and expected:
+                    raise ValueError("AlreadyReadUseCompleteOriginal")
+                if action.offset != expected:
                     raise ValueError("ReadAtNextOffset")
-                end = min(len(content), action.offset + PAGE_CHARS)
-                result = {"source": approved.document["source"], "content": content[action.offset:end],
-                          "offset": action.offset, "next_offset": end, "complete": end == len(content),
-                          "images": [{"number": number, "description": picture.caption}
-                                     for number, picture in approved.illustrations.items()] if action.offset == 0 else []}
-                source = result["source"]
-                votes = feedback.get(source_key(source))
-                if votes and action.offset == 0:
-                    result["feedback"] = votes
-                record = {"tool": action.action, "file_id": action.file_id, "result": result}
+                record = _read_page(action.file_id, action.offset, approved, feedback)
                 if len(json.dumps(payload, ensure_ascii=False)) + len(json.dumps(record, ensure_ascii=False)) > limit:
                     raise ValueError("DocumentExceedsContextBudget")
-                ranges[action.file_id] = end
+                ranges[action.file_id] = record["result"]["next_offset"]
                 payload["tool_results"].append(record)
             elif action.action == "request_support":
                 from app.services.chat.talk_dialogue import _profile_form_request
@@ -468,7 +498,8 @@ def run_agent(message, flow, context, llm, knowledge, settings, *, force_new=Fal
                 return _profile_form_request(flow, context)
             else:
                 complete = {key: doc for key, doc in loaded.items() if ranges.get(key) == len(doc.document["content"])}
-                if action.kind == "conversation" and (continuing_steps or (first and first["candidates"])):
+                has_sources = first and (first["candidates"] or first.get("other_titles"))
+                if action.kind == "conversation" and (continuing_steps or has_sources):
                     raise ValueError("UseInstructionWithReferencesOrAskClarification")
                 if action.kind == "no_knowledge" and first is not None and not tried_reformulation:
                     raise ValueError("TrySearchByDifferentWordsOrActionsBeforeNoKnowledge")
@@ -494,9 +525,12 @@ def run_agent(message, flow, context, llm, knowledge, settings, *, force_new=Fal
             code = error.code if isinstance(error, KnowledgeUnavailable) else str(error)
             knowledge_failed |= isinstance(error, KnowledgeUnavailable)
             failure = code if code.isascii() and code.isalnum() and len(code) <= 100 else type(error).__name__
+            event("talk.agent_action_rejected", action=action.action, call=index + 1, error_code=failure)
             if code == "InstructionChangedBeforeReply":
                 loaded.clear()
                 ranges.clear()
+                payload["tool_results"] = [item for item in payload["tool_results"]
+                                           if item.get("tool") != "read_instruction" or "result" not in item]
             payload["tool_results"].append({"tool": action.action, "error": code[:100]})
     event("talk.agent_exhausted", calls=index + 1, error_code=failure, knowledge_failed=knowledge_failed,
           model_failed=model_failed)

@@ -49,6 +49,50 @@ class TaskRelation(Contract):
     relation: Literal["current", "new", "unclear"]
 
 
+def _wire_results(payload):
+    """Short, request-local handles for scoped files and exact spans of pages already read."""
+    aliases, quotes, results = {}, {}, []
+
+    def alias(file_id):
+        return aliases.setdefault(file_id, f"doc{len(aliases) + 1}")
+
+    for item in payload.get("tool_results", []):
+        result = item.get("result")
+        if result is None:
+            guidance = {
+                "QuoteNotInOriginal": "Copy the evidence:NUMBER label of each supporting line into references.quote.",
+                "UnreadReference": "Use the doc ID on the complete read_instruction result for references and images.",
+                "AlreadyReadUseCompleteOriginal": "The whole document is already present. Use its evidence labels now.",
+                "ReadFullInstructionBeforeReply": "Read the chosen document through its next_offset until complete=true.",
+            }.get(item.get("error"))
+            results.append({**item, "retry": guidance} if guidance else item)
+        elif item["tool"] == "search_knowledge":
+            candidates = [{"file_id": alias(row["file_id"]), **{
+                k: row[k] for k in ("title", "description", "feedback") if k in row
+            }} for row in result["candidates"]]
+            search_result = {**result, "candidates": candidates}
+            if result.get("other_titles"):
+                search_result["other_titles"] = {alias(key): title for key, title in result["other_titles"].items()}
+            results.append({**item, "result": search_result})
+        else:
+            file_id = item["file_id"]
+            handle = alias(file_id)
+            offset, lines = result["offset"], []
+            for line in result["content"].splitlines(keepends=True):
+                exact = line.strip()
+                if 10 <= len(exact) <= 2000:
+                    ref = f"evidence:{offset}"
+                    quotes[file_id, ref] = exact
+                    lines.append(f"[{ref}] {line}")
+                else:
+                    lines.append(line)
+                offset += len(line)
+            results.append({**item, "file_id": handle, "result": {
+                **result, "source": {"file_id": handle, "filename": result["source"]["filename"]},
+                "content": "".join(lines)}})
+    return {**payload, "tool_results": results}, {v: k for k, v in aliases.items()}, quotes
+
+
 def classify_task_relation(llm, message, memory, recent):
     import json
 
@@ -132,8 +176,11 @@ def agent_action(llm, payload):
 Доступны search_knowledge(query), read_instruction(file_id, offset), reply(kind, blocks, memory),
 request_support(consent_evidence). Результаты инструментов приходят в tool_results.
 Если уже есть initial=true, сначала используй этот поиск и не повторяй тот же запрос.
+Если read_instruction уже содержит complete=true, оригинал прочитан. Проверь, подходит ли
+он под текущее сообщение. Если да, сразу ответь с опорой на него; если нет, выбери другой.
 Если кандидаты отсутствуют или не подходят, переформулируй поиск по цели, действию,
 синонимам или сообщению об ошибке. Сохраняй указанные модели, параметры и ограничения.
+В other_titles могут быть другие разрешённые документы. Выбери подходящий по смыслу и прочитай.
 Похожий документ — кандидат, а не доказательство применимости. Прочитай оригинал.
 Задавай один конкретный вопрос только если недостающее условие меняет нужные шаги
 или пользователь ещё не описал задачу. Не спрашивай известные из сообщения и истории данные.
@@ -159,8 +206,23 @@ request_support требует дословного согласия в consent_
 показывает два соседних шага, дай оба сразу перед снимком. Шаги без фото можно группировать.
 Не вызывай инструменты UI: их эквиваленты здесь — действия AgentAction. Лимит 8 блоков, 6 фото.
 Этот протокол задаёт формат и границы инструментов; правила общения бери из общего промпта."""
-    messages = [{"role": "system", "content": (shared + "\n\n" + protocol) if shared else SYSTEM},
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}]
-    return AgentAction.model_validate_json(llm._request(
+    wire, files, quotes = _wire_results(payload)
+    wire_rules = ("\nИспользуй короткие file_id вида doc1 из результатов. Для references.quote передай "
+                  "метку строки, например evidence:74, без скобок, или её точную цитату. "
+                  "Текст действий, предупреждения и фотографии выбирай из подходящего прочитанного оригинала.")
+    messages = [{"role": "system", "content": ((shared + "\n\n" + protocol) if shared else SYSTEM) + wire_rules},
+                {"role": "user", "content": json.dumps(wire, ensure_ascii=False)}]
+    action = AgentAction.model_validate_json(llm._request(
         messages, selection_schema=AgentAction.model_json_schema(), max_output_tokens=4096, talk_agent=True,
     ))
+    action.file_id = files.get(action.file_id, action.file_id)
+    for block in action.blocks:
+        for reference in block.references:
+            reference.file_id = files.get(reference.file_id, reference.file_id)
+            label = reference.quote.strip()
+            if label.startswith("[") and label.endswith("]"):
+                label = label[1:-1]
+            reference.quote = quotes.get((reference.file_id, label), reference.quote)
+        for image in block.images:
+            image.file_id = files.get(image.file_id, image.file_id)
+    return action

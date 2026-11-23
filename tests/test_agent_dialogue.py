@@ -232,6 +232,32 @@ def test_found_document_requires_evidence_even_if_model_labels_technical_reply_a
     assert turn.agent_documents == [doc] and all("прежний" not in text for text, _ in turn.blocks)
 
 
+def test_indexed_original_can_answer_on_first_call_and_lower_ranked_source_remains_readable():
+    a, b = approved(), approved(file_id="00000000-0000-4000-8000-000000000055")
+    for target in (a, b):
+        knowledge = Sources([a, b])
+        knowledge.prefetch_candidates = lambda _: {
+            "candidates": [doc.document["source"] for doc in (a, b)], "search_degraded": True}
+        agent = Agent(answer(a)) if target is a else Agent(read(b), answer(b))
+        turn = run_agent("В какой панели поменять параметр?", {}, {}, agent, knowledge, settings())
+        opened = agent.payloads[0]["tool_results"][-1]["result"]
+        assert opened["complete"] and opened["content"] == a.document["content"]
+        assert turn.agent_documents == [target] and turn.blocks[1][1] == target.illustrations[1]
+        assert knowledge.checks == [target.document["source"]]
+
+
+def test_prefetch_partial_page_cannot_support_an_answer_until_next_page():
+    doc = approved()
+    doc.document["content"] += "x" * PAGE_CHARS
+    knowledge = Sources([doc])
+    knowledge.prefetch_candidates = lambda _: {"candidates": [doc.document["source"]], "search_degraded": False}
+    agent = Agent(answer(doc), read(doc, PAGE_CHARS), answer(doc))
+    turn = run_agent("Покажите нужную панель", {}, {}, agent, knowledge, settings())
+    assert not agent.payloads[0]["tool_results"][-1]["result"]["complete"]
+    assert agent.payloads[1]["tool_results"][-1]["error"] == "ReadFullInstructionBeforeReply"
+    assert turn.agent_documents == [doc]
+
+
 def test_empty_initial_search_requires_reformulating_before_admitting_no_instruction():
     class EmptySources(Sources):
         def search_candidates(self, query):
@@ -397,6 +423,22 @@ def test_model_retries_transient_gateway_error_and_respects_turn_budget():
     assert len(attempts) == 2 and 0 < attempts[1] < attempts[0] <= 5
 
 
+def test_read_timeout_reports_http_stage_and_remaining_budget_without_private_inputs(caplog):
+    from app.services.chat.turn_budget import turn_budget
+
+    def timeout(request):
+        request.extensions["trace"]("http11.receive_response_headers.started", {})
+        raise httpx.ReadTimeout("private provider detail")
+
+    model = OpenWebUILLM(settings(openwebui_api_key="test-key"), httpx.MockTransport(timeout))
+    with caplog.at_level("INFO", logger="ai-support"), turn_budget(5), pytest.raises(httpx.ReadTimeout):
+        model.agent_action({"message": "private question"})
+    fields, = [r.fields for r in caplog.records if r.getMessage() == "talk.model_request_failed"]
+    assert fields["stage"] == "waiting_for_headers" and fields["error_code"] == "ReadTimeout"
+    assert 0 < fields["read_limit_s"] <= 5 and 0 < fields["turn_remaining_s"] <= 5
+    assert "private" not in str(fields)
+
+
 @pytest.mark.parametrize("invalid,error", [
     ({"action": "read_instruction", "file_id": "outside"}, "SearchBeforeReadingUnknownSource"),
     ({"action": "reply", "kind": "instruction", "blocks": [{"text": "Нажмите кнопку"}]}, "ReadFullInstructionBeforeReply"),
@@ -549,6 +591,35 @@ def test_candidate_search_reports_partial_failure_and_filters_foreign_ids():
     assert all(item["file_id"] != "outside" for item in knowledge.search_candidates("Acrobat")["candidates"])
 
 
+def test_initial_catalogue_search_skips_embeddings_only_with_complete_index():
+    from types import SimpleNamespace
+
+    knowledge, state = provider()
+    file_id = state["files"][0]["id"]
+    entries = {file_id: SimpleNamespace(card={"title": "original"}, content="содержимое руководства",
+                                        source={"sha256": "a" * 64})}
+    knowledge.catalog = SimpleNamespace(entries=lambda files: entries)
+    first = knowledge.prefetch_candidates("содержимое")
+    assert first["search_method"] == "catalog" and first["candidates"][0]["file_id"] == file_id
+    assert not any(request.method == "POST" for request in state["calls"])
+    assert knowledge.search_candidates("перефразированный запрос")["search_method"] == "hybrid"
+    entries.clear()
+    assert knowledge.prefetch_candidates("содержимое")["search_method"] == "hybrid"
+    assert sum(request.method == "POST" for request in state["calls"]) == 2
+
+
+def test_paraphrase_with_no_lexical_or_vector_hit_can_still_open_scoped_original():
+    knowledge, state = provider(retrieval_status=503, filename="Памятка дежурного.docx")
+    question = "Лист выходит пустым, хотя на экране рисунок."
+    found = knowledge.search_candidates(question)
+    file_id = state["files"][0]["id"]
+    assert not found["candidates"] and found["other_titles"] == {file_id: "Памятка дежурного.docx"}
+    doc = knowledge.read(file_id)
+    agent = Agent(read(doc), answer(doc))
+    turn = run_agent(question, {}, {}, agent, knowledge, settings())
+    assert turn.agent_documents[0].document["source"] == doc.document["source"]
+
+
 def test_agent_wire_is_text_only_and_disables_provider_tools():
     seen = []
 
@@ -563,6 +634,28 @@ def test_agent_wire_is_text_only_and_disables_provider_tools():
     assert seen[0]["tools"] == [] and seen[0]["tool_ids"] == []
     assert all(isinstance(message["content"], str) for message in seen[0]["messages"])
     assert seen[0]["response_format"]["json_schema"]["schema"] == AgentAction.model_json_schema()
+
+
+def test_wire_references_resolve_to_their_own_document_and_original_photo():
+    doc = approved()
+    knowledge = Sources([doc])
+    knowledge.prefetch_candidates = lambda _: {"candidates": [doc.document["source"]], "search_degraded": False}
+    text = doc.document["content"].splitlines()[0]
+
+    def handler(request):
+        data = json.loads(json.loads(request.content)["messages"][1]["content"])
+        search_result, page = data["tool_results"]
+        assert search_result["result"]["candidates"][0]["file_id"] == page["file_id"] == "doc1"
+        assert "[evidence:0] " + text in page["result"]["content"]
+        reply = {"action": "reply", "kind": "instruction", "blocks": [{"text": text,
+                 "references": [{"file_id": "doc1", "quote": "evidence:0"}],
+                 "images": [{"file_id": "doc1", "number": 1}]}]}
+        return httpx.Response(200, json={"choices": [{"message": {"content": json.dumps(reply)}}]})
+
+    model = OpenWebUILLM(settings(openwebui_api_key="test-key"), httpx.MockTransport(handler))
+    turn = run_agent("Какая нужна панель?", {}, {}, model, knowledge, settings())
+    assert turn.flow["source"] == doc.document["source"]
+    assert turn.blocks == [(text, None), ("", doc.illustrations[1])]
 
 
 def test_combined_success_and_screen_question_rates_previous_answer_and_asks_only_device(talk):

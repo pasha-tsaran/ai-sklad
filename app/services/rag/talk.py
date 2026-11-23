@@ -354,6 +354,16 @@ def _search_event(stage, **fields):
         pass
 
 
+def _discovery_excerpt(entry, terms):
+    # Ranking already used the whole text. Send just enough context to help
+    # distinguish the candidates; only a fresh read can support an answer.
+    card = entry.card
+    excerpts = dict.fromkeys(part["text"] for field in ("purpose", "conditions", "equipment", "applications")
+                             for part in card.get(field, []) if part.get("text"))
+    best = max(excerpts, key=lambda text: len(terms & _terms(text)), default="")
+    return {"excerpt": best[:320], "image_count": card.get("image_count", 0)}
+
+
 def _caption_proof_matches_image(text, caption):
     """Retain exact caption content when its source paragraph adds a figure label."""
     from app.services.rag.catalog import _CAPTION_LABEL
@@ -575,9 +585,12 @@ class TalkKnowledge:
             raise failure from None
 
     def prefetch_candidates(self, query):
-        return self.search_candidates(query)
+        return self._agent_candidates(query, initial=True)
 
     def search_candidates(self, query):
+        return self._agent_candidates(query, initial=False)
+
+    def _agent_candidates(self, query, *, initial):
         """Discovery only: the dialogue agent, not a second model, chooses what to read."""
         from types import SimpleNamespace
         from app.services.rag.catalog import bm25_rank, reciprocal_rank_fusion
@@ -592,18 +605,37 @@ class TalkKnowledge:
                     card={"title": item["filename"]}, content=item["filename"],
                 ) for key, item in files.items()}
                 lexical = bm25_rank(query, searchable)
-                degraded = False
-                try:
-                    semantic = self._instruction_vector_ids(client, query, files)
-                except (httpx.HTTPError, KnowledgeUnavailable, ValueError, KeyError):
-                    semantic, degraded = [], True
+                titles = {key: row["filename"] for key, row in files.items()}
+                compact = len(json.dumps(titles, ensure_ascii=False)) <= MAX_SELECTION_CATALOGUE_CHARS
+                # The initial turn can see every approved title and rank the
+                # full text locally. Reserve remote embeddings for an explicit
+                # agent search, or when the local catalogue cannot cover scope.
+                local_first = initial and bool(files) and entries.keys() == files.keys() and compact
+                semantic, degraded = [], False
+                if not local_first:
+                    try:
+                        semantic = self._instruction_vector_ids(client, query, files)
+                    except (httpx.HTTPError, KnowledgeUnavailable, ValueError, KeyError) as error:
+                        degraded = True
+                        _search_event("agent_vector_search", outcome="lexical_fallback",
+                                      error_code=error.code if isinstance(error, KnowledgeUnavailable) else type(error).__name__,
+                                      http_status=getattr(error, "http_status", None), indexed_files=len(entries),
+                                      approved_files=len(files), lexical_matches=len(lexical))
                 ranked = reciprocal_rank_fusion(lexical, semantic, limit=12)
-                return {"candidates": [{
+                terms = _terms(query)
+                result = {"candidates": [{
                     "file_id": key, "title": files[key]["filename"],
-                    "description": entries[key].card if key in entries else {},
+                    "description": _discovery_excerpt(entries[key], terms) if key in entries else {},
                     "knowledge_id": files[key]["knowledge_id"],
                     "sha256": entries[key].source["sha256"] if key in entries else None,
-                } for key in ranked], "search_degraded": degraded}
+                } for key in ranked], "search_degraded": degraded,
+                    "search_method": "catalog" if local_first else ("lexical_fallback" if degraded else "hybrid")}
+                if not semantic and compact:
+                    # The vector service may be offline or return zero hits for
+                    # a paraphrase. A bounded list lets the model discover a
+                    # differently named original outside the lexical top twelve.
+                    result["other_titles"] = {key: title for key, title in titles.items() if key not in ranked}
+                return result
         except KnowledgeUnavailable:
             raise
         except Exception as error:

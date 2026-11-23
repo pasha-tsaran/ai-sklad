@@ -44,6 +44,15 @@ def test_snapshot_changes_prompt_model_and_scope_without_mutating_previous_turn(
     assert first.openwebui_profile_revision != second.openwebui_profile_revision
 
 
+def test_profile_context_overrides_local_fallback_only_when_set():
+    config, data = settings(), profile()
+    config.openwebui_num_ctx = 16384
+    assert apply_profile(config, data).openwebui_num_ctx == 32768
+    del data['params']['num_ctx']
+    assert apply_profile(config, data).openwebui_num_ctx == 16384
+    assert apply_profile(settings(), data).openwebui_num_ctx is None
+
+
 @pytest.mark.parametrize('change', [
     {'is_active': False}, {'id': 'foreign'}, {'base_model_id': 'ai-support'},
     {'params': {}}, {'params': {'system': 'ok', 'temperature': float('nan')}},

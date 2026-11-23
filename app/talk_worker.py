@@ -158,25 +158,46 @@ def main(argv=None):
     parser.add_argument("--check-knowledge", action="store_true", help="Read approved knowledge and photos without sending")
     parser.add_argument("--check-profile", action="store_true", help="Validate shared settings without sending or printing the prompt")
     parser.add_argument("--check-model", action="store_true", help="Run a small read-only model completion")
+    parser.add_argument("--check-question", metavar="QUESTION", help="Try a fresh agent question without a Talk chat or delivery")
     parser.add_argument("--check-typing", action="store_true", help="Read native typing prerequisites without joining or sending")
     parser.add_argument("--once", action="store_true", help="Run one real poll/process/delivery cycle")
     args = parser.parse_args(argv)
     configure_logging()
     try:
         settings = get_settings()
-        if args.check_model:
+        if args.check_question is not None:
+            from app.services.chat.agent_dialogue import run_agent
             from app.services.chat.turn_budget import turn_budget
-            from app.services.llm.openwebui import OpenWebUILLM
+            from app.services.llm.profile import profile_settings
+            from app.services.rag.catalog import KnowledgeCatalog
+            from app.services.rag.talk import TalkKnowledge
+
+            if not args.check_question.strip() or len(args.check_question) > 6000:
+                parser.error("--check-question requires 1 to 6000 characters")
+            snapshot = profile_settings(settings)
+            knowledge = TalkKnowledge(snapshot, catalog=KnowledgeCatalog(snapshot, session_factory()))
+            started = time.monotonic()
+            with turn_budget(snapshot.talk_turn_budget_seconds):
+                turn = run_agent(args.check_question, {}, {}, OpenWebUILLM(snapshot), knowledge, snapshot)
+            sources = [doc.document["source"]["filename"] for doc in turn.agent_documents]
+            outcome = "reply_with_source" if sources else ("dialogue" if turn.action == "AGENT_REPLY" else "no_instruction")
+            print(json.dumps({"outcome": outcome, "sources": sources, "images": sum(img is not None for _, img in turn.blocks),
+                              "messages_sent": 0, "seconds": round(time.monotonic() - started, 2)}, ensure_ascii=False))
+            return 0 if outcome != "no_instruction" else 1
+        if args.check_model:
             from app.services.llm.profile import profile_settings
 
             snapshot = profile_settings(settings)
             started = time.monotonic()
-            with turn_budget(12):
+            probe = {"model": snapshot.openwebui_model, "num_ctx": snapshot.openwebui_num_ctx, "stage": "task_relation"}
+            try:
                 relation = OpenWebUILLM(snapshot).classify_task_relation(
                     "Где контакты техподдержки?", {"goal": "Настроить принтер"}, [])
-            print(json.dumps({"status": "ok", "model": snapshot.openwebui_model, "relation": relation,
-                              "seconds": round(time.monotonic() - started, 2)}))
-            return 0
+                probe.update(status="ok", relation=relation)
+            except Exception as exc:
+                probe.update(status="error", error_code=error_code(exc))
+            print(json.dumps({**probe, "seconds": round(time.monotonic() - started, 2)}))
+            return 0 if probe["status"] == "ok" else 1
         if args.check_profile:
             from app.services.llm.profile import profile_settings
 
@@ -184,6 +205,7 @@ def main(argv=None):
             result = {"status": "ok" if settings.openwebui_sync_profile else "disabled",
                       "profile": settings.openwebui_profile_id,
                       "model": snapshot.openwebui_model,
+                      "num_ctx": snapshot.openwebui_num_ctx,
                       "knowledge_ids": snapshot.openwebui_knowledge_ids,
                       "revision": snapshot.openwebui_profile_revision}
             print(json.dumps(result, ensure_ascii=False))

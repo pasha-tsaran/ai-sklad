@@ -71,5 +71,5 @@ def apply_profile(settings, profile):
         'openwebui_model': base, 'openwebui_knowledge_ids': list(dict.fromkeys(ids)),
         'openwebui_system_prompt': prompt, 'openwebui_generation_params': generation,
         'openwebui_profile_revision': digest,
-        'openwebui_num_ctx': generation.get('num_ctx'),
+        'openwebui_num_ctx': generation.get('num_ctx', settings.openwebui_num_ctx),
     })

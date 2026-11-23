@@ -120,6 +120,29 @@ def test_cli_check_error_never_serializes_http_body_or_credentials(monkeypatch, 
     assert "private-response-body" not in output.out + output.err
 
 
+def test_arbitrary_question_probe_uses_fresh_state_and_no_delivery(monkeypatch, capsys):
+    from app.core.config import Settings
+    from app.services.chat import agent_dialogue
+    from app.services.chat.talk_dialogue import Turn
+
+    monkeypatch.setattr(runner, "get_settings", lambda: Settings(_env_file=None))
+    monkeypatch.setattr(runner, "configure_logging", lambda: None)
+    monkeypatch.setattr(runner, "session_factory", lambda: None)
+    monkeypatch.setattr(runner, "run", lambda *a, **kw: pytest.fail("Unexpected worker or external delivery"))
+
+    def exercise(question, flow, context, llm, knowledge, settings):
+        assert question == "Проверка" and not flow and not context
+        return Turn("AGENT_REPLY", [("private reply", None), ("", object())],
+                    agent_documents=[SimpleNamespace(document={"source": {"filename": "document.md"}})])
+
+    monkeypatch.setattr(agent_dialogue, "run_agent", exercise)
+    assert runner.main(["--check-question", "Проверка"]) == 0
+    output = capsys.readouterr().out
+    result = json.loads(output)
+    assert (result["messages_sent"], result["images"], result["sources"]) == (0, 1, ["document.md"])
+    assert "private reply" not in output
+
+
 def test_native_typing_cli_reports_readonly_prerequisites_without_running_database_or_worker(monkeypatch, capsys):
     monkeypatch.setattr(runner, "configure_logging", lambda: None)
     monkeypatch.setattr(runner, "get_settings", settings)
