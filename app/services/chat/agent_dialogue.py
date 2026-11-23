@@ -3,16 +3,20 @@
 import copy
 import json
 
+import httpx
 from pydantic import ValidationError
 
 from app.core.logging import event
 from app.services.chat.memory import _redact
 from app.services.chat.policies import direct_intent, requests_support_form, resolution_feedback
+from app.services.chat.talk_feedback import reorder_candidates, source_key
+from app.services.chat.task_state import starts_new_task
 from app.services.llm.support_agent import AgentAction, TaskMemory
 from app.services.rag.talk import KnowledgeUnavailable
 
 
 PAGE_CHARS = 12000
+MODEL_UNAVAILABLE = "Сейчас не удалось подготовить ответ. Повторите вопрос немного позже."
 
 
 def run_agent(message, flow, context, llm, knowledge, settings):
@@ -24,11 +28,37 @@ def run_agent(message, flow, context, llm, knowledge, settings):
                      "next_step": str(flow.get("instruction_plan", {}).get("cursor", flow.get("next_offset", ""))),
                      "expected_reply": "Продолжение или вопрос по текущему шагу" if flow.get("source") else ""}
     memory = TaskMemory.model_validate(saved.get("memory", legacy_memory)).model_dump()
+    recent = context.get("short_term", {}).get("messages", [])
+    next_sequence = max((row.get("sequence", 0) for row in recent), default=0) + 1
+    boundary = saved.get("start_sequence")
+    if type(boundary) is int:
+        recent = [row for row in recent if row.get("sequence", 0) >= boundary]
+    classify = getattr(llm, "classify_task_relation", None)
+    relation = "new" if starts_new_task(message) else "current"
+    if relation == "current" and callable(classify) and (memory["goal"] or memory["expected_reply"]
+                                                        or saved.get("sources") or flow.get("source")):
+        try:
+            relation = classify(message, memory, recent[-4:])
+        except (httpx.HTTPError, ValueError, KeyError, IndexError, TypeError) as error:
+            event("talk.agent_task_relation_failed", error_code=type(error).__name__)
+            return Turn("REPLY", [(MODEL_UNAVAILABLE, None)], flow=copy.deepcopy(flow))
+    if relation == "unclear":
+        return Turn("REPLY", [("Это продолжение предыдущего вопроса или новая задача? Уточните, пожалуйста.", None)],
+                    flow=copy.deepcopy(flow))
+    if relation == "new":
+        boundary, recent = max(next_sequence, boundary or 0), []
+        flow, saved, memory = {}, {}, TaskMemory().model_dump()
+        # Persist the boundary even if knowledge is unavailable for the new task.
+        flow = {"agent": {"version": 1, "memory": memory, "sources": [], "start_sequence": boundary}}
+    event("talk.agent_task_relation", relation=relation)
     # Older conversations enter with their context and frozen progress, not a new confirmation gate.
     legacy = {key: copy.deepcopy(flow[key]) for key in (
         "query", "source", "shown", "next_offset", "has_more", "instruction_plan",
     ) if key in flow} if not saved else {}
-    payload = {"message": message, "context": context, "memory": memory,
+    feedback = context.get("agent_feedback", {})
+    agent_context = ({"short_term": {"messages": recent}} if type(boundary) is int else
+                     {key: value for key, value in context.items() if key != "agent_feedback"})
+    payload = {"message": message, "context": agent_context, "memory": memory,
                "active_sources": saved.get("sources", []), "previous_progress": legacy, "tool_results": []}
     loaded, ranges = {}, {}
     allowed = {source["file_id"] for source in saved.get("sources", []) if isinstance(source, dict)
@@ -38,20 +68,28 @@ def run_agent(message, flow, context, llm, knowledge, settings):
     for part in flow.get("instruction_plan", {}).get("parts", []):
         allowed.add(part["source"]["file_id"])
     limit = settings.talk_agent_context_chars
+    failure, knowledge_failed, verified_search = "CallLimit", False, False
     for index in range(settings.talk_agent_max_calls):
         if len(json.dumps(payload, ensure_ascii=False)) > limit:
+            failure = "ContextBudget"
             break
         try:
             action = AgentAction.model_validate(llm.agent_action(payload))
         except (ValidationError, ValueError):
+            failure = "InvalidActionContract"
             payload["tool_results"].append({"error": "InvalidActionContract", "retry": "Return valid AgentAction JSON"})
             continue
+        except (httpx.HTTPError, KeyError, IndexError, TypeError) as error:
+            failure = type(error).__name__
+            break
         event("talk.agent_action", action=action.action, call=index + 1)
         try:
             if action.action == "search_knowledge":
                 if not action.query.strip():
                     raise ValueError("EmptySearchQuery")
-                result = knowledge.search_candidates(action.query)
+                result = reorder_candidates(knowledge.search_candidates(action.query), feedback)
+                verified_search |= not result.get("search_degraded", False)
+                knowledge_failed |= bool(result.get("search_degraded", False))
                 allowed.update(item["file_id"] for item in result["candidates"])
                 payload["tool_results"].append({"tool": action.action, "query": action.query, "result": result})
             elif action.action == "read_instruction":
@@ -69,6 +107,10 @@ def run_agent(message, flow, context, llm, knowledge, settings):
                           "offset": action.offset, "next_offset": end, "complete": end == len(content),
                           "images": [{"number": number, "description": picture.caption}
                                      for number, picture in approved.illustrations.items()] if action.offset == 0 else []}
+                source = result["source"]
+                votes = feedback.get(source_key(source))
+                if votes and action.offset == 0:
+                    result["feedback"] = votes
                 record = {"tool": action.action, "file_id": action.file_id, "result": result}
                 if len(json.dumps(payload, ensure_ascii=False)) + len(json.dumps(record, ensure_ascii=False)) > limit:
                     raise ValueError("DocumentExceedsContextBudget")
@@ -77,8 +119,7 @@ def run_agent(message, flow, context, llm, knowledge, settings):
             elif action.action == "request_support":
                 from app.services.chat.talk_dialogue import _profile_form_request
 
-                history = context.get("short_term", {}).get("messages", [])
-                previous = next((row.get("content", "") for row in reversed(history)
+                previous = next((row.get("content", "") for row in reversed(recent)
                                  if row.get("role") == "assistant" and row.get("content")), "")
                 affirmative = message.casefold().strip(" .!\n") in {"да", "давайте", "согласен", "согласна", "да составьте"}
                 accepted = requests_support_form(message) or direct_intent(message) == "HUMAN" or (
@@ -88,16 +129,23 @@ def run_agent(message, flow, context, llm, knowledge, settings):
                 return _profile_form_request(flow, context)
             else:
                 complete = {key: doc for key, doc in loaded.items() if ranges.get(key) == len(doc.document["content"])}
-                return _reply(action, message, flow, memory, complete, knowledge)
+                if action.kind == "no_knowledge" and knowledge_failed and not verified_search:
+                    raise KnowledgeUnavailable("SearchCouldNotBeVerified")
+                turn = _reply(action, message, flow, memory, complete, knowledge)
+                if action.new_task or type(boundary) is int:
+                    turn.flow["agent"]["start_sequence"] = max(next_sequence, boundary or 0) if action.new_task else boundary
+                return turn
         except (ValueError, KnowledgeUnavailable) as error:
             # Never return provider bodies, document text or credentials as an exception payload.
             code = error.code if isinstance(error, KnowledgeUnavailable) else str(error)
+            knowledge_failed |= isinstance(error, KnowledgeUnavailable)
+            failure = code if code.isascii() and code.isalnum() and len(code) <= 100 else type(error).__name__
             if code == "InstructionChangedBeforeReply":
                 loaded.clear()
                 ranges.clear()
             payload["tool_results"].append({"tool": action.action, "error": code[:100]})
-    event("talk.agent_exhausted", calls=settings.talk_agent_max_calls)
-    return Turn("REPLY", [(UNAVAILABLE, None)], flow=copy.deepcopy(flow))
+    event("talk.agent_exhausted", calls=index + 1, error_code=failure, knowledge_failed=knowledge_failed)
+    return Turn("REPLY", [(UNAVAILABLE if knowledge_failed else MODEL_UNAVAILABLE, None)], flow=copy.deepcopy(flow))
 
 
 def _reply(action, message, flow, memory, complete, knowledge):
@@ -155,7 +203,7 @@ def _reply(action, message, flow, memory, complete, knowledge):
     retained_sources = [doc.document["source"] for doc in used.values()] or previous_sources
     next_flow = {"agent": {"version": 1, "memory": next_memory,
                            "sources": copy.deepcopy(retained_sources)},
-                 "query": next_memory["goal"] or flow.get("query") or message}
+                 "query": next_memory["goal"] or (None if action.new_task else flow.get("query")) or message}
     if retained_sources:
         next_flow["source"] = retained_sources[0]
     turn = Turn("AGENT_RESOLVED" if action.kind == "resolved" else "AGENT_REPLY", blocks,

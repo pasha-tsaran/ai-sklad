@@ -6,11 +6,13 @@ import pytest
 from sqlalchemy import select
 
 from app.core.config import Settings
-from app.models import Delivery, ResolutionMemory
-from app.services.chat.agent_dialogue import PAGE_CHARS, run_agent
-from app.services.chat.talk_dialogue import _resume_turn, _text_turn
+from app.models import Delivery, Feedback, ResolutionMemory
+from app.services.chat.agent_dialogue import MODEL_UNAVAILABLE, PAGE_CHARS, run_agent
+from app.services.chat.talk_dialogue import UNAVAILABLE, _resume_turn, _text_turn
+from app.services.chat.talk_feedback import learned_feedback, reorder_candidates, source_key
 from app.services.llm.openwebui import OpenWebUILLM
 from app.services.llm.support_agent import AgentAction
+from app.services.rag.talk import KnowledgeUnavailable
 from tests.conftest import env as env
 from tests import test_talk_dialogue as legacy
 from tests.test_talk_dialogue import Knowledge, approved, assistants
@@ -97,6 +99,47 @@ def test_changed_configuration_is_visible_to_agent_and_can_choose_other_source()
     assert agent.payloads[0]["message"] == change
     assert "Urovo" in agent.payloads[0]["context"]["short_term"]["messages"][0]["content"]
     assert second.flow["source"] == dual.document["source"]
+
+
+def test_new_topic_drops_old_source_and_keeps_only_new_history_on_followup():
+    doc = approved()
+    clarification = {"action": "reply", "kind": "clarification", "blocks": [{"text": "Какая программа?"}],
+                     "memory": {"goal": "Почта не открывается", "expected_reply": "Название программы"}}
+    old = {"agent": {"memory": {"goal": "Печать"}, "sources": [doc.document["source"]]},
+           "source": doc.document["source"]}
+    messages = [{"sequence": 9, "role": "assistant", "content": "Настройте LabelPrint."}]
+    agent = Agent(read(doc), clarification)
+    agent.classify_task_relation = lambda *_: "new"
+    result = run_agent("Не открывается почта", old, {"short_term": {"messages": messages}},
+                       agent, Sources([doc]), settings())
+    assert agent.payloads[0]["active_sources"] == []
+    assert agent.payloads[0]["context"]["short_term"]["messages"] == []
+    assert agent.payloads[1]["tool_results"][-1]["error"] == "SearchBeforeReadingUnknownSource"
+    assert "source" not in result.flow
+    messages.append({"sequence": 10, "role": "user", "content": "Не открывается почта"})
+    followup = Agent(clarification)
+    followup.classify_task_relation = lambda *_: "current"
+    run_agent("Outlook", result.flow, {"short_term": {"messages": messages}}, followup, Sources(), settings())
+    assert followup.payloads[0]["context"]["short_term"]["messages"] == messages[1:]
+
+
+def test_model_timeout_is_not_reported_as_knowledge_outage():
+    class TimedOutAgent:
+        def agent_action(self, payload):
+            raise httpx.ReadTimeout("private provider detail")
+
+    assert run_agent("печать", {}, {}, TimedOutAgent(), Sources(), settings()).blocks == [(MODEL_UNAVAILABLE, None)]
+
+
+def test_failed_knowledge_search_cannot_be_reported_as_missing_instruction():
+    class UnavailableKnowledge(Sources):
+        def search_candidates(self, query):
+            raise KnowledgeUnavailable("ReadTimeout")
+
+    no_knowledge = {"action": "reply", "kind": "no_knowledge", "blocks": [{"text": "Инструкции нет."}]}
+    turn = run_agent("печать", {}, {}, Agent(search(), no_knowledge), UnavailableKnowledge(),
+                     settings(talk_agent_max_calls=2))
+    assert turn.blocks == [(UNAVAILABLE, None)]
 
 
 @pytest.mark.parametrize("invalid,error", [
@@ -206,6 +249,34 @@ def test_agent_can_start_an_independent_task_without_reusing_old_source(talk):
     assert "source" not in result["flow"]
     assert result["attempts"][0].status == "UNASSESSED"
     assert result["incident"].state == "DIAGNOSING"
+
+
+@pytest.mark.parametrize("rating,helped", [("Ответ понравился", True), ("Не помогло", False)])
+def test_talk_learns_only_from_delivered_answers_for_the_same_question_and_version(talk, rating, helped):
+    doc = approved()
+    source = doc.document["source"]
+    question = "Как настроить Urovo по Bluetooth?"
+    knowledge = Sources([doc])
+    talk.incoming(question)
+    assert talk.process(knowledge, Agent(search(), read(doc), answer(doc)))
+    with talk.env.factory() as session, session.begin():
+        for delivery in session.scalars(select(Delivery)):
+            delivery.status = "SENT"
+            account_id = delivery.account_id
+    talk.incoming(rating, 2)
+    assert talk.process(knowledge, Agent())  # Explicit ratings are handled without the model.
+    with talk.env.factory() as session:
+        assert session.scalar(select(Feedback)).helped is helped
+        assert learned_feedback(session, account_id, "Как настроить Urovo по Wi-Fi?") == {}
+        assert learned_feedback(session, "other-account", question) == {}
+        votes = learned_feedback(session, account_id, question)
+    assert votes == {source_key(source): {"helpful": int(helped), "unhelpful": int(not helped)}}
+    other = {**source, "file_id": "alternative"}
+    candidates = [other, source] if helped else [source, other]
+    ranked = reorder_candidates({"candidates": candidates}, votes)["candidates"]
+    assert ranked[0 if helped else 1]["file_id"] == source["file_id"]
+    changed = {**source, "sha256": "changed"}
+    assert reorder_candidates({"candidates": [changed]}, votes)["candidates"] == [changed]
 
 
 def test_search_candidates_does_not_read_or_call_a_selector():

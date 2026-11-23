@@ -157,6 +157,11 @@ class OpenWebUILLM:
 
         return agent_action(self, payload)
 
+    def classify_task_relation(self, message, memory, recent):
+        from app.services.llm.support_agent import classify_task_relation
+
+        return classify_task_relation(self, message, memory, recent)
+
     def _call(self, schema, task, payload, *, fast_selection=False, max_output_tokens=None):
         output_limit = 4096 if schema is SupportTaskUnderstanding else 1536
         if max_output_tokens is not None and (

@@ -43,6 +43,7 @@ from app.services.chat.support_followup import (
 from app.services.chat.task_state import (
     is_unknown_answer, remember_task_message, starts_new_task, task_evidence_authority, task_query, update_task_state,
 )
+from app.services.chat.talk_feedback import learned_feedback, question_key
 from app.services.rag.openwebui import save_snapshot
 from app.services.rag.query import _terms, normalized_query, printer_kinds, scanner_kinds
 from app.services.rag.talk import (
@@ -2040,6 +2041,17 @@ def _text_turn(message, flow, context, previous_pending, llm, knowledge, setting
     if getattr(settings, "talk_dialogue_mode", "legacy") == "agent" and callable(getattr(llm, "agent_action", None)):
         if intent == "HUMAN":
             return Turn("HUMAN")
+        if flow.get("agent") and flow.get("source") and not explicit_new_task:
+            response = _normalized(message)
+            if response in {"помогло", "сработало", "все работает", "все работает спасибо", "помогло спасибо",
+                            "проблема решена", "вопрос решен"}:
+                return Turn("AGENT_RESOLVED", [("Спасибо за обратную связь. Рад, что помогло.", None)], flow=flow)
+            if response in {"ответ подошел", "ответ понравился", "понравилось", "ответ полезен"} or message.strip() == "👍":
+                return Turn("AGENT_RATED", [("Спасибо, учту эту оценку.", None)])
+            if response in {"не помогло", "не сработало", "не помогло спасибо", "ответ не подходит",
+                            "ответ не подошел", "ответ не понравился", "не понравилось", "проблема осталась",
+                            "не работает", "инструкция не подходит"} or message.strip() == "👎":
+                return Turn("AGENT_NEGATIVE", [("Спасибо, учту. Что именно не получилось или не подошло?", None)])
         from app.services.chat.agent_dialogue import run_agent
 
         return run_agent(message, flow, context, llm, knowledge, settings)
@@ -2241,6 +2253,8 @@ def _claim(factory, settings, account_id):
         start_progress(inbox)
         incident.pending_action, incident.version = "PROCESSING", incident.version + 1
         context = load_context(session, incident, settings)
+        if settings.talk_dialogue_mode == "agent":
+            context["agent_feedback"] = learned_feedback(session, account.id, inbox.content)
         context["channel_profile"] = channel_profile(room, incident.id)
         offer = (room.profile or {}).get(SUPPORT_OFFER_KEY, {})
         if offered_message := offer.get("message_id"):
@@ -2260,6 +2274,15 @@ def _attempt(session, incident):
     return session.scalar(select(SolutionAttempt).where(
         SolutionAttempt.incident_id == incident.id, SolutionAttempt.status == "WAITING_FEEDBACK",
     ))
+
+
+def _record_feedback(session, attempt, helped):
+    feedback = session.scalar(select(Feedback).where(Feedback.attempt_id == attempt.id))
+    if feedback is None:
+        session.add(Feedback(attempt_id=attempt.id, helped=helped, comment=""))
+    else:
+        feedback.helped = helped
+        feedback.created_at = now()
 
 
 def _deliver(session, incident, blocks, source=None, block_sources=None):
@@ -2374,10 +2397,11 @@ def _finish_agent(session, room, incident, turn, pending, claimed, llm, settings
                 evidence={"title": primary.title, "version": primary.version, "chunk_id": primary.chunk_id,
                           "content": primary.content, "steps": primary.steps, "source": primary.source,
                           "talk_source": turn.agent_documents[0].document["source"],
+                          "feedback_question": question_key(claimed["message"]),
                           "agent_sources": [doc.document["source"] for doc in turn.agent_documents]},
             )
             session.add(pending)
-        elif existing.status in {"WAITING_FEEDBACK", "UNASSESSED"}:
+        elif existing.status in {"WAITING_FEEDBACK", "UNASSESSED", "FAILED"}:
             pending = existing
             pending.status = "WAITING_FEEDBACK"
         incident.state, incident.result = "WAITING_FEEDBACK", "ANSWER"
@@ -2387,7 +2411,7 @@ def _finish_agent(session, room, incident, turn, pending, claimed, llm, settings
             incident.problem_type = (goal if goal and goal in incident.description else incident.description)[:100]
     if turn.action == "AGENT_RESOLVED" and pending is not None:
         pending.status = "SUCCEEDED"
-        session.add(Feedback(attempt_id=pending.id, helped=True, comment=""))
+        _record_feedback(session, pending, True)
         incident.state, incident.pending_action, incident.closed_at = "RESOLVED", None, now()
         session.flush()
         remember_resolution(session, incident, settings)
@@ -2430,13 +2454,23 @@ def _finish(factory, turn, claimed, llm, settings):
         pending = _attempt(session, incident)
         if pending and (turn.action == "RETRY_GUIDE" or turn.failed_previous):
             pending.status = "FAILED"
-            session.add(Feedback(attempt_id=pending.id, helped=False, comment=""))
+            _record_feedback(session, pending, False)
             incident.failed_attempts += 1
             if turn.failed_previous:
                 incident.state, incident.result = "DIAGNOSING", None
             session.flush()
             pending = None
-        if turn.action in {"AGENT_REPLY", "AGENT_RESOLVED"}:
+        if turn.action in {"AGENT_RATED", "AGENT_NEGATIVE"}:
+            source = (room.flow or {}).get("source")
+            if pending and pending.evidence.get("talk_source") == source:
+                _record_feedback(session, pending, turn.action == "AGENT_RATED")
+                if turn.action == "AGENT_NEGATIVE":
+                    pending.status = "FAILED"
+                    incident.state, incident.result = "DIAGNOSING", None
+                _deliver(session, incident, turn.blocks)
+            else:
+                _deliver(session, incident, [("Опишите, пожалуйста, с каким вопросом нужна помощь.", None)])
+        elif turn.action in {"AGENT_REPLY", "AGENT_RESOLVED"}:
             _finish_agent(session, room, incident, turn, pending, claimed, llm, settings)
         elif turn.action == "DELIVERY_RESUME":
             if not resume_response(session, room, incident, inbox, turn.resume or {}):
@@ -2505,7 +2539,7 @@ def _finish(factory, turn, claimed, llm, settings):
             else:
                 helped = turn.action in {"SUCCESS", "PARTIAL_SUCCESS"}
                 pending.status = "SUCCEEDED" if helped else "FAILED"
-                session.add(Feedback(attempt_id=pending.id, helped=helped, comment=""))
+                _record_feedback(session, pending, helped)
                 if turn.action == "PARTIAL_SUCCESS":
                     remaining = ", ".join((room.flow or {}).get("missing_goals", []))
                     saved = copy.deepcopy(room.flow)

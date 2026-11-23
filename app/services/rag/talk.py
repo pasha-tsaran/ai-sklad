@@ -595,6 +595,8 @@ class TalkKnowledge:
                 return {"candidates": [{
                     "file_id": key, "title": files[key]["filename"],
                     "description": entries[key].card if key in entries else {},
+                    "knowledge_id": files[key]["knowledge_id"],
+                    "sha256": entries[key].source["sha256"] if key in entries else None,
                 } for key in ranked], "search_degraded": degraded}
         except KnowledgeUnavailable:
             raise
