@@ -12,6 +12,7 @@ from app.core.config import Settings
 from app.models import Delivery, Escalation, Feedback, Incident, Job, Message, MessageAttachment, SolutionAttempt, now
 from app.models.talk import TalkAccount, TalkInbox, TalkRoom
 from app.schemas.contracts import AnalysisResult, DialogueResult
+from app.services.chat.policies import letter_decline_remainder
 from app.services.chat.talk_dialogue import (
     BACK_TO_BOT, CHANGED, CLARIFY_QUESTIONS, ESCALATION_MENU, INTAKE_QUESTIONS,
     RESUME_GUIDE, SUPPORT_OFFER, UNAVAILABLE, process_one,
@@ -813,7 +814,7 @@ def test_operator_offers_safe_choices_and_preserves_waiting_attempt_until_form_s
     talk.process(knowledge, model)
     state = talk.snapshot()
     assert assistants(state)[-1] == (ESCALATION_MENU, None)
-    assert "|" not in assistants(state)[-1][0] and "1 —" in assistants(state)[-1][0] and "2 —" in assistants(state)[-1][0]
+    assert "Оставить заявку" in ESCALATION_MENU and "Без заявки" in ESCALATION_MENU and "2" not in ESCALATION_MENU
     assert state["flow"]["escalation"]["resume"]["flow"] == before["flow"]
     assert state["attempts"][0].status == "WAITING_FEEDBACK" and state["incident"].description == QUESTION
     assert not model.calls and len(knowledge.searches) == 1
@@ -822,8 +823,47 @@ def test_operator_offers_safe_choices_and_preserves_waiting_attempt_until_form_s
         assert session.scalar(select(func.count()).select_from(Job).where(Job.kind == "SEND_MAIL")) == 0
 
 
+@pytest.mark.parametrize(("message", "remainder"), [
+    ("Не хочу оставлять заявку. Расскажи как найти письма большого размера в почте",
+     "Расскажи как найти письма большого размера в почте"),
+    ("Отмените отправку сообщения, пожалуйста!", ""),
+    ("Давай без заявки, где найти настройки?", "где найти настройки?"),
+    ("Не отправляй письмо подскажи как открыть Outlook", "подскажи как открыть Outlook"),
+    ("Отмени заявку и расскажи, как открыть Outlook", "расскажи, как открыть Outlook"),
+    ("Мне не удаётся оставить заявку", None),
+    ("Не хочу заявку", ""),
+    ("Я передумала.\nЧто делать, если гаснет экран?", "Что делать, если гаснет экран?"),
+    ("Пожалуйста, заявку не отправляйте", ""),
+    ("Не надо писать в поддержку", ""),
+    ("Отмени заявку", ""),
+    ("2", None),
+    ("Создавать заявку", None),
+    ("Я не могу отправить письмо", None),
+    ("Не отменяйте заявку", None),
+    ("Как отменить отправку письма в Outlook?", None),
+    ("Не отправляй фото экрана", None),
+    ("Тема: Отмена отправки сообщения", None),
+    ("Нет, компьютер называется WS-001", None),
+])
+def test_letter_decline_requires_a_refusal_and_preserves_the_following_question(message, remainder):
+    assert letter_decline_remainder(message) == remainder
+
+
+def test_two_does_not_cancel_the_letter_or_submit_it(talk):
+    talk.incoming("оператор")
+    talk.process()
+    talk.incoming("2", 2)
+    talk.process()
+    state = talk.snapshot()
+    assert state["flow"]["escalation"]["stage"] == "CHOICE"
+    assert state["incident"].pending_action == "COLLECT_ESCALATION_DETAILS"
+    assert assistants(state)[-1] == (ESCALATION_MENU, None)
+    with talk.env.factory() as session:
+        assert session.scalar(select(Escalation)) is None
+
+
 @pytest.mark.parametrize("message", ["Отмена", "Не хочу отправлять. Помоги ты мне", "продолжить диалог с ботом",
-                                     "2", "Назад"])
+                                     "Отмени заявку", "Не отправляйте письмо", "Я передумала", "Назад"])
 def test_declining_escalation_restores_current_guide_and_paging_without_a_new_attempt_or_mail(talk, message):
     knowledge, model = Knowledge(), NoGeneration()
     talk.incoming(QUESTION)
@@ -929,7 +969,7 @@ def test_legacy_form_without_resume_state_can_exit_and_retry_the_actual_prior_pr
     assert knowledge.searches[-1][0] == QUESTION and state["flow"]["query"] == QUESTION
 
 
-@pytest.mark.parametrize("command", ["Продолжить с ботом", "Продолжить диалог с ботом", "Вернуться к боту", "2", "Отмена"])
+@pytest.mark.parametrize("command", ["Продолжить с ботом", "Продолжить диалог с ботом", "Вернуться к боту", "Отмена"])
 def test_return_to_bot_after_completed_draft_asks_for_a_fresh_question_without_model_or_delivery_claim(talk, command):
     talk.settings.mail_backend, talk.settings.support_email = "mailto", "operator@example.net"
     knowledge = Knowledge()
@@ -959,7 +999,7 @@ def test_return_to_bot_after_completed_draft_asks_for_a_fresh_question_without_m
         assert session.scalar(select(func.count()).select_from(Job).where(Job.kind == "SEND_MAIL")) == 0
 
 
-@pytest.mark.parametrize("command", ["Продолжить с ботом", "Вернуться к боту", "2", "Отмена"])
+@pytest.mark.parametrize("command", ["Продолжить с ботом", "Вернуться к боту", "Отмена"])
 def test_explicit_global_bot_return_preserves_active_guide_and_never_treats_it_as_a_search(talk, command):
     knowledge, model = Knowledge(), NoGeneration()
     talk.incoming(QUESTION)

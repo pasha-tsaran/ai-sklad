@@ -46,6 +46,51 @@ _NEGATED_REQUEST_SUFFIX = re.compile(
 _CONDITIONAL_REQUEST_PREFIX = re.compile(r"\b(?:если|когда|вдруг)\b")
 _QUOTED_TEXT = re.compile(r'«[^»]*»|“[^”]*”|"[^"\n]*"')
 
+_LETTER_OBJECT = r"(?:заявк[ауи]|письм[оа]|обращени[ея]|тикет(?:а)?|сообщени[ея])"
+_LETTER_PROCESS = rf"(?:отправку|оформление|создание)(?:\s+{_LETTER_OBJECT})?"
+_DONT_SEND = r"не\s+(?:отправляй(?:те)?|посылай(?:те)?|оставляй(?:те)?|оформляй(?:те)?|создавай(?:те)?|надо|нужно)"
+_LETTER_VERB = r"(?:оставлять|оставить|оформлять|оформить|отправлять|отправить|создавать|создать|подавать|подать)"
+_LETTER_DECLINE = re.compile(
+    rf"(?:(?:нет|пожалуйста|спасибо)[,\s]+)*(?:(?:я|давай(?:те)?)\s+)?(?:(?:уже|пока|лучше)\s+)?(?:"
+    rf"отмен(?:а|и(?:те)?|ить|яй(?:те)?)(?:,\s*пожалуйста,?)?"
+    rf"(?:\s+(?:{_LETTER_PROCESS}|{_LETTER_OBJECT}|е[её]|его|это))?|"
+    rf"не\s+(?:(?:хочу|буду|будем|надо|нужно|стоит)\s+)?(?:ничего\s+)?{_LETTER_VERB}(?:\s+{_LETTER_OBJECT})?|"
+    rf"не\s+(?:(?:хочу|будем|надо|нужно)\s+)?(?:писать|обращаться)\s+в\s+{_SUPPORT_TARGET}|"
+    rf"не\s+(?:хочу|нужна|нужен|нужно)\s+{_LETTER_OBJECT}|"
+    rf"{_DONT_SEND}(?:\s+(?:ничего|{_LETTER_OBJECT}))?|ничего\s+не\s+отправляй(?:те)?|"
+    rf"{_LETTER_OBJECT}\s+(?:отмен(?:и(?:те)?|ить)|не\s+(?:надо|нужно)\s+{_LETTER_VERB}|"
+    rf"(?:{_LETTER_VERB}\s+)?{_DONT_SEND}|не\s+нуж(?:на|но|ен))|"
+    rf"без\s+(?:заявки|письма|обращения|тикета)|"
+    rf"передумал(?:а|и)?(?:\s+{_LETTER_VERB}(?:\s+{_LETTER_OBJECT})?)?|отбой|не\s+сейчас|нет)"
+    rf"(?:\s+в\s+{_SUPPORT_TARGET})?(?:[,\s]+(?:спасибо|пожалуйста|пока))?",
+    re.IGNORECASE,
+)
+_NEXT_REQUEST = re.compile(
+    r"\s+(?:(?:и|а|но)\s+)?(?=(?:теперь|лучше|расскажи(?:те)?|подскажи(?:те)?|помоги(?:те)?|"
+    r"объясни(?:те)?|как|где|почему|что\s+делать)\b)", re.IGNORECASE,
+)
+
+
+def letter_decline_remainder(message: str) -> str | None:
+    """Only a leading refusal of the pending letter is a command. Keep any next request verbatim."""
+    text = message.strip()
+    match = _LETTER_DECLINE.match(text)
+    if not match:
+        return None
+    tail = text[match.end():]
+    if not tail:
+        return ""
+    separator = re.match(r"\s*[,.;!:\n—–]+\s*", tail) or _NEXT_REQUEST.match(tail)
+    if not separator:
+        return None
+    remainder = tail[separator.end():].strip()
+    if remainder and match.group().casefold() == "нет" and not (
+        "?" in remainder or _NEXT_REQUEST.match(" " + remainder)
+    ):
+        return None
+    return remainder
+
+
 _FAILED_OUTCOME = re.compile(
     r"\b(?:не\s+(?:помогло|сработало|заработало|работает)|"
     r"ничего\s+не\s+изменилось|проблема\s+(?:осталась|сохраняется)|"

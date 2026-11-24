@@ -192,7 +192,7 @@ def test_photo_caption_operator_keeps_its_normal_menu_action_and_notice(talk):
     incoming_photo(talk, "оператор")
     talk.process(knowledge, model)
     replies = assistants(talk.snapshot())
-    assert replies[0] == (PHOTO_NOTICE, None) and "1 —" in replies[1][0]
+    assert replies[0] == (PHOTO_NOTICE, None) and "Оставить заявку" in replies[1][0]
     assert talk.snapshot()["incident"].pending_action == "COLLECT_ESCALATION_DETAILS"
     assert not model.calls and not knowledge.searches
 

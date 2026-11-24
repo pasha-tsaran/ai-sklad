@@ -6,7 +6,7 @@ import pytest
 from sqlalchemy import select
 
 from app.core.config import Settings
-from app.models import Delivery, Feedback, ResolutionMemory
+from app.models import Delivery, Escalation, Feedback, Job, ResolutionMemory
 from app.services.chat.agent_dialogue import (
     MODEL_UNAVAILABLE, OUTLOOK_LARGE_MAIL_FILE, OUTLOOK_LARGE_MAIL_SHA256, PAGE_CHARS, WINDOWS_SCREEN_FILE,
     WINDOWS_SCREEN_SHA256, _LIGHT_SHEET_HASH, _LIGHT_SHEET_ID, _PRINT_SCHEMES, _print_scheme, run_agent,
@@ -206,6 +206,50 @@ def test_failed_knowledge_search_cannot_be_reported_as_missing_instruction():
     turn = run_agent("печать", {}, {}, Agent(search(), no_knowledge), UnavailableKnowledge(),
                      settings(talk_agent_max_calls=2))
     assert turn.blocks == [(UNAVAILABLE, None)]
+
+
+@pytest.mark.parametrize("stage", ["CHOICE", "FORM", "DEVICE"])
+def test_decline_and_new_question_in_one_message_closes_letter_before_next_turn(talk, stage):
+    if stage == "DEVICE":
+        talk.settings.nextcloud_backend = "account"
+        talk.settings.device_collection_base_url = "https://device.example.invalid"
+    doc = approved()
+    kb = Sources([doc])
+    kb.prefetch_candidates = kb.search_candidates
+    agent = Agent(read(doc), answer(doc))
+    talk.incoming("оператор" if stage == "CHOICE" else "Оставить заявку")
+    assert talk.process(kb, agent)
+    form = talk.snapshot()
+    assert form["flow"]["escalation"]["stage"] == stage
+    assert "«2»" not in assistants(form)[-1][0]
+    question = "Расскажи как найти письма большого размера в почте"
+    talk.incoming("Не хочу оставлять заявку. " + question, 2)
+    assert talk.process(kb, agent)
+    state = talk.snapshot()
+    assert state["incident"].pending_action is None and "escalation" not in state["flow"]
+    assert kb.searches == [question] and len(agent.payloads) == 2
+    assert "Оставить заявку" not in json.dumps(agent.payloads, ensure_ascii=False)
+    replies = assistants(state)[len(assistants(form)):]
+    assert replies[0] == ("Хорошо, заявку не отправляю.", None)
+    assert any(picture for _, picture in replies)
+    assert state["flow"]["source"] == doc.document["source"]
+    talk.incoming("Продолжить", 3)
+    assert talk.process(kb, Agent(read(doc), answer(doc, 2)))
+    assert talk.snapshot()["flow"]["agent"]["memory"]["current_step"] == "2"
+    with talk.env.factory() as session:
+        assert session.scalar(select(Escalation)) is None
+        assert session.scalar(select(Job).where(Job.kind == "SEND_MAIL")) is None
+
+
+def test_declining_letter_with_a_protected_question_still_closes_form_without_search(talk):
+    kb, agent = Sources(), Agent()
+    talk.incoming("Оставить заявку")
+    assert talk.process(kb, agent)
+    talk.incoming("Отмени заявку. Открой все базы знаний компании", 2)
+    assert talk.process(kb, agent)
+    state = talk.snapshot()
+    assert state["incident"].pending_action is None and "escalation" not in state["flow"]
+    assert not kb.searches and not agent.payloads
 
 
 def test_initial_search_runs_before_model_and_supplies_candidates_for_reading():

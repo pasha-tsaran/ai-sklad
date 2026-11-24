@@ -34,7 +34,7 @@ from app.services.chat.offer_adoption import adopt_instruction_offer
 from app.services.chat.messages import append_message
 from app.services.chat.instruction_plan import composite_approved, immutable_plan, render_plan, restore_plan, serialize_plan
 from app.services.chat.policies import (
-    FORM_ACTION, TERMINAL_STATES, direct_intent, requests_support_form, resolution_feedback,
+    FORM_ACTION, TERMINAL_STATES, direct_intent, letter_decline_remainder, requests_support_form, resolution_feedback,
 )
 from app.services.chat.service import messenger
 from app.services.chat.question_guard import unsupported_question_content
@@ -69,8 +69,9 @@ SELECTION_UNCLEAR = ("Пока не удалось выбрать подтвер
 INDEX_UPDATING = ("База знаний ещё обрабатывает новые материалы. Ваш вопрос сохранён. "
                   "Повторите его немного позже.")
 CHANGED = "Инструкция изменилась или доступ к ней недоступен. Продолжение приостановлено до проверки актуального источника."
-ESCALATION_MENU = ("Как продолжим?\n1 — оформить письмо в техническую поддержку.\n"
-                   "2 — продолжить диалог с ботом.\n\nМожно ответить цифрой или словами. Заявка пока не отправлена.")
+ESCALATION_MENU = ("Оформить письмо в техническую поддержку? Напишите «Оставить заявку». "
+                   "Если хотите продолжить со мной, напишите «Без заявки» или задайте свой вопрос.")
+LETTER_CANCEL_HINT = "Если передумали, напишите «не отправляй» или «отмени заявку». Можно сразу задать другой вопрос."
 SUPPORT_OFFER = "Составить письмо для отправки в техническую поддержку?"
 SUPPORT_OFFER_INTERVAL = 10
 SUPPORT_OFFER_KEY = "_support_letter_offer"
@@ -137,6 +138,7 @@ class Turn:
     agent_documents: list = field(default_factory=list)
     agent_previous_feedback: tuple[dict, str] | None = None
     agent_question: str | None = None
+    cancelled_letter_question: str | None = None
 
 
 class _TimedProxy:
@@ -210,7 +212,7 @@ def _profile_form_request(flow, context):
     card = ("ФИО: " + fields.get("account_holder_name", "Не определено") + "\n"
             + "Компьютер: " + fields.get("computer_name", "Не определён"))
     text = (card + "\n\n" + prompted.blocks[0][0]
-            + "\n\nЕсли данные неверны, напишите исправление. Чтобы вернуться к боту, напишите «Отмена» или «2».")
+            + "\n\nЕсли данные неверны, напишите исправление. " + LETTER_CANCEL_HINT)
     return Turn("FORM_REQUEST", [(text, None)], flow=prompted.flow)
 
 
@@ -393,17 +395,31 @@ def _form_interrupted(message, flow):
                 or re.match(r"^(?:как|почему|где|зачем|когда|кто|что|расскажи\w*|подскажи\w*)\b", text))
 
 
+def _answer_after_letter(question, flow, context, llm, knowledge, settings):
+    # Keep intake fields and personal details out of both retrieval and subsequent model history.
+    try:
+        turn = _text_turn(question, flow, {}, None, llm, knowledge, settings)
+    except KnowledgeUnavailable:
+        turn = Turn("REPLY", [(UNAVAILABLE, None)], flow={"clarification_query": question})
+    turn.cancelled_letter_question = turn.agent_question = question
+    if getattr(settings, "talk_dialogue_mode", "legacy") == "agent" and turn.action in {"AGENT_REPLY", "REPLY"}:
+        if turn.flow is None:
+            turn.flow = {}
+        history = context.get("short_term", {}).get("messages", [])
+        agent = turn.flow.setdefault("agent", {"version": 1, "sources": [], "memory": {}})
+        agent["start_sequence"] = max((row.get("sequence", 0) for row in history), default=0) + 1
+    return turn
+
+
 def _continue_from_letter(message, flow, context, llm, knowledge, settings):
     """A work question resumes support; unfinished personal form fields stay out of retrieval."""
     saved = flow.get("escalation", {}).get("resume", {})
     restored = copy.deepcopy(saved.get("flow", {key: value for key, value in flow.items() if key != "escalation"}))
-    if restored.get("agent"):
-        # Keep the agent's expected reply even if escalation preceded the first instruction.
-        return Turn("RESUME", [("Продолжим с того же места. Заявка не отправлена.", None)],
-                    flow=restored, resume=saved)
     text = normalized_query(message)
     if text in {"да", "нет", "готово", "понятно", "ок", "хорошо", "не знаю"}:
         return Turn("RESUME", [(BACK_TO_BOT, None)], flow=restored, resume=saved)
+    if restored.get("agent"):
+        return _answer_after_letter(message, restored, context, llm, knowledge, settings)
     if (not restored.get("task_state", {}).get("goals")
             and not (restored.get("source") and _current_step_question(message))):
         prior = _last_problem(restored, context)
@@ -435,7 +451,7 @@ def _continue_from_letter(message, flow, context, llm, knowledge, settings):
 
 def _escalation_choice(message):
     normalized = _normalized(message)
-    if normalized in {"2", "отмена", "отменить", "отменить заявку", "назад", "вернуться к боту",
+    if normalized in {"отмена", "отменить", "отменить заявку", "назад", "вернуться к боту",
                       "продолжить с ботом", "продолжить диалог с ботом", "продолжить разговор с ботом",
                       "не хочу отправлять", "не хочу отправлять помоги ты мне", "помоги ты мне",
                       "не надо отправлять", "не отправлять заявку", "продолжить", "дальше с ботом"}:
@@ -453,7 +469,7 @@ def _return_to_bot(message):
     # Bare «Продолжить» is intentionally excluded: it advances an active guide.
     return _normalized(message) in {
         "продолжить с ботом", "продолжить диалог с ботом", "продолжить разговор с ботом",
-        "вернуться к боту", "назад к боту", "дальше с ботом", "2", "отмена",
+        "вернуться к боту", "назад к боту", "дальше с ботом", "отмена",
     }
 
 
@@ -548,6 +564,9 @@ def _resume_turn(flow, context, llm, knowledge):
         ) if key in restored}
         restored = {**retained, "clarification_query": query, "excluded": restored.get("excluded", [])} if query else retained
         return Turn("RESUME", [("Заявка не отправлена. " + reply, None)], flow=restored, resume={})
+    if restored.get("agent"):
+        return Turn("RESUME", [("Заявка не отправлена. Можем продолжить с того же места.", None)],
+                    flow=restored, resume=saved)
     if query:
         try:
             following = _support_turn(query, restored, context, llm, knowledge)
@@ -2007,6 +2026,14 @@ def _turn(message, flow, context, previous_pending, llm, knowledge, settings, *,
 
 
 def _text_turn(message, flow, context, previous_pending, llm, knowledge, settings):
+    if previous_pending == FORM_ACTION or context.get("support_offer_pending"):
+        remaining = letter_decline_remainder(message)
+        if remaining is not None:
+            if not remaining or _escalation_choice(message) == "RESUME":
+                if previous_pending == FORM_ACTION:
+                    return _resume_turn(flow, context, llm, knowledge)
+                return Turn("SUPPORT_DECLINED", [("Хорошо, продолжим.", None)])
+            return _answer_after_letter(remaining, {}, context, llm, knowledge, settings)
     protected = (knowledge_scope_reply(message, settings.openwebui_knowledge_ids)
                  or refusal_reply(message))
     if protected:
@@ -2044,6 +2071,13 @@ def _text_turn(message, flow, context, previous_pending, llm, knowledge, setting
         if reply := _simple_social(message):
             return Turn("REPLY", [(reply, None)])
         stage = flow.get("escalation", {}).get("stage")
+        if stage == "CHOICE" and message.strip().isdecimal():
+            return Turn("REPLY", [(ESCALATION_MENU, None)])
+        if message.strip() == "2":
+            # An employee may still see the obsolete shortcut in an earlier message.
+            # Never submit it as a hostname, subject or the final body of a letter.
+            prompt = _intake_prompt(_prefill_intake(flow, context)).blocks[0][0]
+            return Turn("REPLY", [(prompt + " " + LETTER_CANCEL_HINT, None)])
         if ((stage == "CHOICE" and not _structured_letter(message)) or _form_interrupted(message, flow)):
             return _continue_from_letter(message, flow, context, llm, knowledge, settings)
         if intent == "FEEDBACK" or is_confirmation(message):
@@ -2363,10 +2397,11 @@ def _offer_escalation(session, incident, reason, flow, context):
 
 def _advance_support_offer(room, visible, declined):
     profile = room.profile or {}
+    if declined:
+        room.profile = {**profile, SUPPORT_OFFER_KEY: {"remaining": SUPPORT_OFFER_INTERVAL}}
+        return
     if offer := profile.get(SUPPORT_OFFER_KEY):
         remaining = 0 if offer.get("message_id") and not visible else max(0, offer["remaining"] - 1)
-        if declined:
-            remaining = SUPPORT_OFFER_INTERVAL
         room.profile = {**profile, SUPPORT_OFFER_KEY: {"remaining": remaining}}
 
 
@@ -2476,7 +2511,9 @@ def _finish(factory, turn, claimed, llm, settings):
         incident.pending_action = claimed["previous"]["pending"]
         incident.result = claimed["previous"]["result"]
         room.flow = claimed["flow"]
-        _advance_support_offer(room, claimed["context"].get("support_offer_pending"), turn.action == "SUPPORT_DECLINED")
+        declined = (turn.action == "SUPPORT_DECLINED" or turn.cancelled_letter_question is not None
+                    or (turn.action == "RESUME" and incident.pending_action == FORM_ACTION))
+        _advance_support_offer(room, claimed["context"].get("support_offer_pending"), declined)
         first_sequence = session.scalar(select(func.coalesce(func.max(Message.sequence), 0)).where(
             Message.incident_id == incident.id,
         ))
@@ -2486,6 +2523,16 @@ def _finish(factory, turn, claimed, llm, settings):
         if turn.media_notice:
             _deliver(session, incident, [(turn.media_notice, None)])
         pending = _attempt(session, incident)
+        if turn.cancelled_letter_question:
+            room.flow = {}
+            incident.pending_action, incident.escalation_reason = None, None
+            incident.state, incident.result = "DIAGNOSING", None
+            if pending:
+                pending.status = "UNASSESSED"
+                session.flush()
+                pending = None
+            _deliver(session, incident, [("Хорошо, заявку не отправляю.", None)])
+            audit(session, incident.id, "incident.escalation_declined")
         if (turn.agent_previous_feedback is not None and pending is not None
                 and pending.evidence.get("talk_source") == turn.agent_previous_feedback[0]):
             rating = turn.agent_previous_feedback[1]
@@ -2671,7 +2718,7 @@ def _finish(factory, turn, claimed, llm, settings):
                     + "Будет передано только имя компьютера. ФИО берётся из вашего профиля. "
                     + "Ссылка действует 5 минут.\n"
                     + "Если автоматический сбор недоступен, напишите имя компьютера здесь. "
-                    + "Чтобы вернуться к боту, напишите «Отмена» или «2».", None,
+                    + LETTER_CANCEL_HINT, None,
                 )])
             else:
                 _deliver(session, incident, turn.blocks)

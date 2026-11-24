@@ -121,6 +121,26 @@ def test_cancel_before_form_does_not_create_any_mail_artifact_or_send_job(talk):
         assert session.scalar(select(MessageAttachment).where(MessageAttachment.content_type == "message/rfc822")) is None
 
 
+def test_natural_refusal_instead_of_final_letter_body_does_not_prepare_a_draft(talk):
+    from tests.test_talk_dialogue import _profile
+
+    _profile(talk)
+    for seq, message in enumerate(["Оставить заявку", "WS-001", "Большие письма"], 1):
+        talk.incoming(message, seq)
+        assert talk.process()
+    assert talk.snapshot()["flow"]["escalation"]["intake_requested_field"] == "additional_info"
+    talk.incoming("2", 4)
+    assert talk.process()
+    assert talk.snapshot()["flow"]["escalation"]["intake_requested_field"] == "additional_info"
+    talk.incoming("Я передумал отправлять письмо", 5)
+    assert talk.process()
+    state = talk.snapshot()
+    assert state["incident"].pending_action is None and "escalation" not in state["flow"]
+    with talk.env.factory() as session:
+        assert session.scalar(select(Escalation)) is None
+        assert session.scalar(select(Job).where(Job.kind == "SEND_MAIL")) is None
+
+
 def test_guided_talk_letter_asks_explicit_topic_then_main_text_without_automatic_report_fallback(talk):
     talk.settings.mail_backend, talk.settings.support_email = "mailto", "operator@example.net"
     for sequence, content in enumerate([
