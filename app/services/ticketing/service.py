@@ -36,7 +36,7 @@ def _letter_text(content):
 def collect_details(session, user_id, incident_id, details, settings):
     incident = get_owned(session, incident_id, user_id, lock=True)
     existing = session.scalar(select(Escalation).where(Escalation.incident_id == incident.id))
-    data = details.model_dump()
+    data = details.model_dump(exclude_none=True)
     if existing:
         if existing.details != data:
             raise HTTPException(409, "Заявка уже сформирована с другими данными")
@@ -60,10 +60,11 @@ def collect_details(session, user_id, incident_id, details, settings):
     created_at = incident.created_at
     if created_at.tzinfo is None:  # SQLite tests
         created_at = created_at.replace(tzinfo=timezone.utc)
+    device_line = f"Устройство: {details.computer_name}\n" if details.computer_name else ""
     body = (
         f"Обращение: {incident.id}\n"
         f"ФИО пользователя рабочей станции: {details.account_holder_name}\n"
-        f"Компьютер: {details.computer_name}\n"
+        f"{device_line}"
         f"Время обращения (UTC): {created_at.isoformat()}\n"
         f"Дополнительно: {details.additional_info}\n\n"
         "Испробованные решения:\n"
@@ -95,7 +96,7 @@ def collect_details(session, user_id, incident_id, details, settings):
         # This mode never queues SMTP or claims the employee pressed Send.
         # The employee's explicit description is the main letter text. The topic
         # belongs only to Subject; an old chat report isn't a substitute for it.
-        footer = f"ФИО: {details.account_holder_name}\nКомпьютер: {details.computer_name}\n"
+        footer = f"ФИО: {details.account_holder_name}\n{device_line}"
         draft = {**escalation.email, "body": (
             (details.additional_info + "\n\n" if details.additional_info else "") + footer
         )}

@@ -53,7 +53,7 @@ from app.services.rag.talk import (
     SourceSelection, TalkKnowledge, _SELECTION_TASK, knowledge_stage, report_failure,
 )
 from app.services.rag.success import SuccessfulTalkKnowledge, cache_key, remember_success
-from app.services.ticketing.intake import _ordered_lines, parse_intake
+from app.services.ticketing.intake import _ordered_lines, parse_intake, skips_device
 from app.services.ticketing.service import collect_details
 from integrations.openwebui.automatic_instruction_images import (
     TIMING_MARKER, _clock, _measure, _milliseconds,
@@ -93,7 +93,8 @@ MEDIA_ERRORS = {
 }
 INTAKE_QUESTIONS = {
     "account_holder_name": "Как вас зовут?",
-    "computer_name": "Как называется ваш рабочий компьютер?",
+    "computer_name": ("Укажите имя устройства, на котором возникла проблема (ПК, ТСД или принтер). "
+                      "Можно написать «Пропустить» или сразу указать тему в строке «Тема: …»."),
     "subject": "Укажите тему письма.",
     "additional_info": "Опишите проблему: что происходит и какая помощь нужна.",
 }
@@ -210,7 +211,7 @@ def _profile_form_request(flow, context):
     fields = updated["escalation"]["intake_fields"]
     prompted = _intake_prompt(updated)
     card = ("ФИО: " + fields.get("account_holder_name", "Не определено") + "\n"
-            + "Компьютер: " + fields.get("computer_name", "Не определён"))
+            + "Устройство: " + fields.get("computer_name", "не указано"))
     text = (card + "\n\n" + prompted.blocks[0][0]
             + "\n\nЕсли данные неверны, напишите исправление. " + LETTER_CANCEL_HINT)
     return Turn("FORM_REQUEST", [(text, None)], flow=prompted.flow)
@@ -252,7 +253,7 @@ def _intake_prompt(flow):
     fields = escalation.get("intake_fields", {})
     missing = escalation.get("intake_requested_field")
     if missing not in INTAKE_QUESTIONS or fields.get(missing):
-        missing = next((key for key in INTAKE_QUESTIONS if not fields.get(key, "").strip()), "additional_info")
+        missing = next((key for key in INTAKE_QUESTIONS if key != "computer_name" and not fields.get(key)), "additional_info")
     updated["escalation"] = {**escalation, "stage": "FORM", "intake_requested_field": missing}
     return Turn("REPLY", [(INTAKE_QUESTIONS[missing], None)], flow=updated)
 
@@ -345,9 +346,7 @@ def _technical_message(message):
 def _free_support_request(message):
     # The CHOICE menu is not the form yet. A fresh work question is a request
     # to keep talking, while explicitly labelled ticket fields stay data.
-    if (re.search(r"(?:^|\n)\s*(?:фио|логин|компьютер|тема|описание)\s*:", message, re.I)
-            or re.search(r"\b(?:меня\s+зовут|мой\s+логин|логин|фио)\b", message, re.I)
-            or _ordered_lines(message) is not None):
+    if _structured_letter(message) or re.search(r"\b(?:меня\s+зовут|мой\s+логин|логин|фио)\b", message, re.I):
         return False
     return _technical_message(message) and bool(re.search(
         r"(?:^|[.!?]\s*)(?:как\b|почему\b|где\b|что\b|помоги\w*\b|подскажи\w*\b)|"
@@ -360,7 +359,7 @@ def _structured_letter(message):
     identity_reply = (not re.match(r"\s*(?:как|почему|где|зачем|когда|кто|что|а\s+если|другой\s+вопрос)\b", message, re.I)
                       and bool(re.search(r"\b(?:меня\s+зовут|(?:мой|рабочий)\s+логин)\b", message, re.I)))
     return (_ordered_lines(message) is not None or bool(re.search(
-        r"(?:^|\n)\s*(?:фио|логин|компьютер|тема|описание)\s*:", message, re.I,
+        r"(?:^|\n)\s*(?:фио|логин|компьютер|пк|устройство|имя устройства|тсд|терминал|принтер|тема|описание)\s*:", message, re.I,
     )) or identity_reply)
 
 
@@ -391,7 +390,11 @@ def _form_interrupted(message, flow):
     if requested in {"subject", "additional_info"}:
         # The employee can deliberately write a question as the subject/body.
         return False
-    return bool(_free_support_request(message) or _positive_connections(message)
+    connection = _positive_connections(message)
+    if requested == "computer_name" and connection:
+        # Wi-Fi / USB can be part of the printed model name on the label.
+        connection = "?" in message or re.search(r"\b(?:по|через|подключ\w*|настро\w*)\b", text)
+    return bool(_free_support_request(message) or connection
                 or re.match(r"^(?:как|почему|где|зачем|когда|кто|что|расскажи\w*|подскажи\w*)\b", text))
 
 
@@ -2026,6 +2029,9 @@ def _turn(message, flow, context, previous_pending, llm, knowledge, settings, *,
 
 
 def _text_turn(message, flow, context, previous_pending, llm, knowledge, settings):
+    if (previous_pending == FORM_ACTION and flow.get("escalation", {}).get("intake_requested_field") == "computer_name"
+            and skips_device(message)):
+        return _intake_turn(message, flow, llm, context)
     if previous_pending == FORM_ACTION or context.get("support_offer_pending"):
         remaining = letter_decline_remainder(message)
         if remaining is not None:
@@ -2706,19 +2712,16 @@ def _finish(factory, turn, claimed, llm, settings):
             flow["escalation"] = {**escalation, "stage": "FORM"}
             room.flow = flow
             if (getattr(settings, "device_collection_base_url", "")
-                    and not escalation.get("intake_fields", {}).get("computer_name")):
+                    and escalation.get("intake_requested_field") == "computer_name"):
                 from app.services.nextcloud.device_collection import issue_collection
 
                 collection_id, link = issue_collection(session, settings, room, incident)
                 room.flow = {**flow, "escalation": {**flow["escalation"], "stage": "DEVICE",
                                                   "collection_id": collection_id}}
                 _deliver(session, incident, [(
-                    "Определите текущий компьютер для письма в поддержку:\n\n"
-                    + "[Определить текущий компьютер](" + link + ")\n\n"
-                    + "Будет передано только имя компьютера. ФИО берётся из вашего профиля. "
-                    + "Ссылка действует 5 минут.\n"
-                    + "Если автоматический сбор недоступен, напишите имя компьютера здесь. "
-                    + LETTER_CANCEL_HINT, None,
+                    INTAKE_QUESTIONS["computer_name"] + "\n\n"
+                    + "Если проблема на этом ПК, можно [подставить имя этого компьютера](" + link + "). "
+                    + "Ссылка действует 5 минут.\n\n" + LETTER_CANCEL_HINT, None,
                 )])
             else:
                 _deliver(session, incident, turn.blocks)

@@ -8,7 +8,8 @@ from app.schemas.contracts import EscalationExtraction
 from app.services.ticketing.intake import MAX_MESSAGE_CHARS, parse_intake
 
 
-REQUIRED = ["account_holder_name", "account_login", "computer_name", "subject"]
+REQUIRED = ["account_holder_name", "account_login", "subject"]
+IDENTITY = ["account_holder_name", "account_login", "computer_name"]
 COMPLETE = {"account_holder_name": "Павел", "account_login": "tsaran", "computer_name": "terminal76-sk",
             "subject": "настроить сканер ШК"}
 
@@ -50,7 +51,7 @@ def test_legacy_labels_and_multiline_description_preserve_the_original_details()
 def test_scattered_labels_accumulate_without_reasking_known_fields_or_calling_a_model():
     first = parse_intake("ФИО: Павел\nЛогин: tsaran", {}, ForbiddenLLM())
     assert first.details is None and first.fields == {key: COMPLETE[key] for key in REQUIRED[:2]}
-    assert first.missing == ["computer_name", "subject"]
+    assert first.missing == ["subject"]
     snapshot = copy.deepcopy(first.fields)
     second = parse_intake("terminal76-sk", first.fields, ForbiddenLLM(), requested_field="computer_name")
     assert first.fields == snapshot
@@ -63,6 +64,20 @@ def test_only_actual_missing_field_can_use_a_short_unlabelled_answer_without_an_
     pending = {key: value for key, value in COMPLETE.items() if key != "computer_name"}
     result = parse_intake("terminal76-sk", pending, ForbiddenLLM())
     assert result.details.computer_name == "terminal76-sk"
+
+
+@pytest.mark.parametrize("device_line", ["Устройство:", "Устройство: Не знаю", "",
+                                         "Имя устройства: Пропустить"])
+def test_template_can_omit_the_device(device_line):
+    message = f"ФИО: Павел\nЛогин: employee\n{device_line}\nТема: Печать\nОписание: Пропали этикетки."
+    result = parse_intake(message, {}, ForbiddenLLM(), require_description=True)
+    assert result.details.computer_name is None and result.missing == []
+
+
+def test_blank_device_line_in_old_positional_template_keeps_topic_and_description_in_their_columns():
+    result = parse_intake("Павел\nemployee\n\nПечать\nПропали этикетки.", {}, ForbiddenLLM(), require_description=True)
+    assert result.details.computer_name is None and result.details.subject == "Печать"
+    assert result.details.additional_info == "Пропали этикетки."
 
 
 def test_bare_name_is_accepted_after_that_exact_field_was_asked():
@@ -108,8 +123,8 @@ def test_cross_field_swaps_are_rejected_even_when_every_candidate_appears_verbat
     llm = FakeLLM({"account_holder_name": "tsaran", "account_login": "terminal76-sk", "computer_name": "tsaran",
                    "subject": "настроить сканер ШК"})
     result = parse_intake(message, {}, llm)
-    assert result.details is None and result.missing == REQUIRED[:3]
-    assert all(field not in result.fields for field in REQUIRED[:3])
+    assert result.details is None and result.missing == REQUIRED[:2]
+    assert all(field not in result.fields for field in IDENTITY)
 
 
 def test_a_login_that_looks_like_a_technical_word_does_not_become_the_subject():
@@ -128,7 +143,7 @@ def test_malformed_or_hallucinated_model_output_never_completes_the_form(result)
     llm = FakeLLM(result)
     actual = parse_intake("Нужно настроить сканер ШК, больше данных пока нет.", {}, llm)
     assert actual.details is None
-    assert all(field not in actual.fields for field in REQUIRED[:3])
+    assert all(field not in actual.fields for field in IDENTITY)
 
 
 def test_model_failure_keeps_valid_pending_values_without_leaking_exception_text():
@@ -136,7 +151,7 @@ def test_model_failure_keeps_valid_pending_values_without_leaking_exception_text
     llm = FakeLLM(error=ValueError("fake-sensitive-response-body"))
     result = parse_intake("На терминале не работает сканер, имя уточню.", pending, llm)
     assert result.fields == pending and result.details is None
-    assert result.missing == ["computer_name", "subject"]
+    assert result.missing == ["subject"]
 
 
 def test_current_explicit_label_can_correct_a_valid_earlier_value():
@@ -186,7 +201,7 @@ def test_input_bound_does_not_send_oversized_data_to_the_model_or_auto_complete_
 
 
 def test_unknown_or_invalid_pending_fields_are_not_sent_as_context():
-    pending = {"account_holder_name": "Павел", "computer_name": "bad host", "unknown": "do not send"}
+    pending = {"account_holder_name": "Павел", "computer_name": "bad\nhost", "unknown": "do not send"}
     llm = FakeLLM({})
     result = parse_intake("Нужно настроить сканер", pending, llm)
     assert result.fields == {"account_holder_name": "Павел"}
@@ -198,7 +213,7 @@ def test_four_prose_words_and_administrative_commands_are_not_a_positional_form(
         llm = FakeLLM({"account_holder_name": message.splitlines()[0], "account_login": message.splitlines()[1],
                        "computer_name": message.splitlines()[2], "subject": message.splitlines()[3]})
         result = parse_intake(message, {}, llm)
-        assert result.details is None and all(field not in result.fields for field in REQUIRED[:3])
+        assert result.details is None and all(field not in result.fields for field in IDENTITY)
 
 
 def test_a_greeting_is_not_accepted_as_a_name_in_an_otherwise_plausible_form():
@@ -212,7 +227,7 @@ def test_partial_identifier_and_case_rewrite_are_not_verbatim_field_values():
     message = "Меня зовут Павел, логин tsaran@example.net, компьютер terminal76-sk. Нужно настроить сканер ШК."
     llm = FakeLLM({**COMPLETE, "account_holder_name": "павел", "account_login": "tsaran", "computer_name": "terminal76"})
     result = parse_intake(message, {}, llm)
-    assert result.details is None and result.missing == REQUIRED[:3]
+    assert result.details is None and result.missing == REQUIRED[:2]
 
 
 def test_talk_requires_description_while_legacy_four_field_parser_contract_stays_compatible():
@@ -224,7 +239,7 @@ def test_talk_requires_description_while_legacy_four_field_parser_contract_stays
 
 
 def test_talk_subject_is_verbatim_and_does_not_auto_complete_or_copy_it_into_description():
-    pending = {key: COMPLETE[key] for key in REQUIRED[:3]}
+    pending = {key: COMPLETE[key] for key in IDENTITY}
     topic = "УМЕНЬШИТЬ громкость проводного сканера ШК"
     result = parse_intake(topic, pending, ForbiddenLLM(), requested_field="subject", require_description=True)
     assert result.details is None and result.fields == {**pending, "subject": topic}
@@ -247,7 +262,7 @@ def test_requested_talk_description_is_the_complete_independent_multiline_body_w
 def test_talk_accepts_labelled_topic_and_description_together_when_both_are_explicit():
     description = "При сканировании код читается.\nНужно убрать громкий звуковой сигнал."
     result = parse_intake("Тема: Громкость сканера\nОписание: " + description,
-                          {key: COMPLETE[key] for key in REQUIRED[:3]}, ForbiddenLLM(), require_description=True)
+                          {key: COMPLETE[key] for key in IDENTITY}, ForbiddenLLM(), require_description=True)
     assert result.details.subject == "Громкость сканера" and result.details.additional_info == description
 
 

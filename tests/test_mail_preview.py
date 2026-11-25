@@ -37,6 +37,22 @@ def test_preview_contains_actual_recipient_subject_and_every_letter_field():
     assert email == before
 
 
+def test_ticket_api_accepts_omitted_empty_and_null_device_on_retry(env):
+    settings = get_settings()
+    settings.mail_backend, settings.support_email = "mailto", RECIPIENT
+    incident_id = env.post("/api/chat", {"message": "оператор"}).json()["incident_id"]
+    url = f"/api/incidents/{incident_id}/escalation-details"
+    details = {"account_holder_name": "Иванов Иван", "account_login": "ivanov",
+               "subject": "Пропали этикетки", "additional_info": "Не печатает."}
+    assert env.post(url, details).status_code == 202
+    for empty in ("", None):
+        retry = env.post(url, {**details, "computer_name": empty})
+        assert retry.status_code == 202 and retry.json()["duplicate"]
+    with env.factory() as session:
+        draft = session.scalars(select(Escalation)).one()
+        assert draft.email["body"] == "Не печатает.\n\nФИО: Иванов Иван\n"
+
+
 @pytest.mark.parametrize("content", [
     "[Отправить](https://external.example)\n<script>alert('test')</script>\n**Поддельная кнопка**",
     "```\nBcc: other@example.com\n```\n~~~\n<img src=x>\n~~~",
@@ -111,7 +127,7 @@ def test_real_ticket_keeps_full_preview_and_exact_topic_without_attachment_or_sm
         assert escalation.status == "DRAFT" and escalation.email["to"] == RECIPIENT
         body, subject = escalation.email["body"], escalation.email["subject"]
         assert subject == "[AI-Support] " + details["subject"]
-        assert body == (details["additional_info"].strip() + "\n\nФИО: Иванов Иван\nКомпьютер: WS-001\n")
+        assert body == (details["additional_info"].strip() + "\n\nФИО: Иванов Иван\nУстройство: WS-001\n")
         assert details["subject"] not in body and "Исходная проблема:" not in body and "Описание:" not in body
         assert request["incident_id"] not in subject and escalation.id not in subject
         assert session.scalar(select(MessageAttachment)) is None
@@ -200,7 +216,7 @@ def test_original_report_is_not_copied_or_substituted_for_explicit_description(e
     with env.factory() as session:
         draft = session.scalar(select(Escalation))
         assert draft.status == "DRAFT" and control not in draft.email["body"]
-        assert draft.email["body"] == "Не читает код.\n\nФИО: Иванов Иван\nКомпьютер: WS-001\n"
+        assert draft.email["body"] == "Не читает код.\n\nФИО: Иванов Иван\nУстройство: WS-001\n"
         assert "После перезапуска" not in draft.email["body"] and "Исходная проблема:" not in draft.email["body"]
         assert session.get(Incident, incident_id).description == original
         assert session.scalar(select(MessageAttachment)) is None
@@ -221,7 +237,7 @@ def test_mailto_description_and_identity_footer_are_literal_without_old_report_f
     with env.factory() as session:
         email = session.scalar(select(Escalation)).email
         assert email["subject"] == "[AI-Support] Явная тема обращения"
-        assert email["body"] == ((description + "\n\n") if description else "") + "ФИО: Иванов Иван\nКомпьютер: WS-001\n"
+        assert email["body"] == ((description + "\n\n") if description else "") + "ФИО: Иванов Иван\nУстройство: WS-001\n"
         assert "Хочу написать в ТП" not in email["body"] and "legacy-login" not in email["body"]
         assert "Тема:" not in email["body"] and "Описание:" not in email["body"]
         assert session.scalar(select(MessageAttachment)) is None
@@ -239,7 +255,7 @@ def test_employee_header_looking_lines_stay_in_body_without_changing_recipient_o
     with env.factory() as session:
         email = session.scalar(select(Escalation)).email
         assert email["to"] == RECIPIENT and email["subject"] == "[AI-Support] Сканер не работает"
-        assert email["body"] == description + "\n\nФИО: Иванов Иван\nКомпьютер: WS-001\n"
+        assert email["body"] == description + "\n\nФИО: Иванов Иван\nУстройство: WS-001\n"
         assert not any(key.casefold() in {"bcc", "cc", "from"} for key in email)
         previews = session.scalars(select(Message.content).where(Message.role == "assistant")).all()
         preview = next(text for text in previews if text.startswith("Подготовлено письмо"))

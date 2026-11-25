@@ -13,12 +13,11 @@ from app.api.dependencies import get_session
 from app.core.config import get_settings
 from app.models import Conversation, Incident, User
 from app.schemas.contracts import ChatRequest, EscalationDetails, FeedbackRequest
-from app.services.chat.policies import FORM_ACTION, TERMINAL_STATES
+from app.services.chat.policies import FORM_ACTION, FORM_HELP, TERMINAL_STATES
 from app.services.chat.service import accept_chat, accept_feedback, idempotent, messenger
 from app.services.ticketing.service import collect_details
 
 router = APIRouter()
-FORM_HELP = "Отправьте одним сообщением:\nФИО: ...\nЛогин: ...\nКомпьютер: ...\nТема: ...\nОписание: ..."
 
 
 def handle_event(session, payload, settings):
@@ -85,6 +84,8 @@ def handle_event(session, payload, settings):
                         "фио": "account_holder_name",
                         "логин": "account_login",
                         "компьютер": "computer_name",
+                        "устройство": "computer_name",
+                        "имя устройства": "computer_name",
                         "тема": "subject",
                         "описание": "additional_info",
                     }

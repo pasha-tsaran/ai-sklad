@@ -1,7 +1,8 @@
 """Nextcloud identity and employee-confirmed device; never an OS identity guess."""
 
-import re
 import unicodedata
+
+from app.schemas.contracts import valid_device_name
 
 
 def _safe(value, limit):
@@ -32,14 +33,14 @@ def channel_profile(room, incident_id):
             result["account_holder_name"] = name
     if saved.get("device_incident_id") == incident_id:
         device = _safe(saved.get("device_name"), 63)
-        if device and re.fullmatch(r"[A-Za-z0-9_.-]+", device) and any(char.isalnum() for char in device):
+        if device and valid_device_name(device):
             result["computer_name"] = device
     return result
 
 
 def remember_computer(room, incident_id, name):
     name = _safe(name, 63)
-    if not name or not re.fullmatch(r"[A-Za-z0-9_.-]+", name) or not any(char.isalnum() for char in name):
+    if not name or not valid_device_name(name):
         return False
     room.profile = {**(room.profile or {}), "device_name": name, "device_incident_id": incident_id,
                     "device_source": "employee_in_current_incident"}

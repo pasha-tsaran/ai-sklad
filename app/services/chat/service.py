@@ -21,7 +21,7 @@ from app.services.chat.audit import audit
 from app.core.config import get_settings
 from app.services.chat.memory import remember_resolution
 from app.services.chat.messages import append_message
-from app.services.chat.policies import FORM_ACTION, FORM_TEXT, MAX_ATTEMPTS, TERMINAL_STATES, direct_intent
+from app.services.chat.policies import FORM_ACTION, FORM_HELP, FORM_TEXT, MAX_ATTEMPTS, TERMINAL_STATES, direct_intent
 from app.services.nextcloud.delivery import RoutedMessenger
 
 messenger = RoutedMessenger()
@@ -99,7 +99,7 @@ def ask_escalation(session, incident, reason):
         messenger.send(
             session,
             incident.id,
-            "Отправьте одним сообщением:\nФИО: ...\nЛогин: ...\nКомпьютер: ...\nТема: ...\nОписание: ...",
+            FORM_HELP,
         )
     audit(session, incident.id, "incident.form_requested", reason=reason)
 

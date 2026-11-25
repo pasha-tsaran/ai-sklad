@@ -35,7 +35,7 @@ def test_unbound_profile_cannot_change_employee_identity_or_device(observed):
     assert "account_holder_name" not in channel_profile(target, "current")
 
 
-@pytest.mark.parametrize("name", ["...", "---", "___", "WS\nOTHER", "WS\x85OTHER", " WS 001 ", "x" * 64])
+@pytest.mark.parametrize("name", ["...", "---", "___", "WS\nOTHER", "WS\x85OTHER", " WS\t001 ", "x" * 64])
 def test_invalid_or_control_containing_device_never_becomes_a_current_workstation(name):
     target = room(device_name="WS-001", device_incident_id="previous")
     before = dict(target.profile)

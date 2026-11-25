@@ -40,7 +40,7 @@ def test_successful_pc_capture_continues_with_topic_then_exact_required_descript
         assert capture_computer(session, talk.settings, token, "terminal76-sk") == {"status": "complete"}
     state = talk.snapshot()
     text = assistants(state)[-1][0]
-    assert "ФИО: Павел Царан" in text and "Компьютер: terminal76-sk" in text
+    assert "ФИО: Павел Царан" in text and "Устройство: terminal76-sk" in text
     assert "Укажите тему письма." in text and "Логин:" not in text
     assert state["flow"]["escalation"]["intake_requested_field"] == "subject"
     talk.incoming("Громкость сканера", 3)
@@ -52,11 +52,11 @@ def test_successful_pc_capture_continues_with_topic_then_exact_required_descript
     with talk.env.factory() as session:
         letter = session.scalar(select(Escalation))
         assert letter.email["subject"] == "[AI-Support] Громкость сканера"
-        assert letter.email["body"] == "Сканер громко пищит.\nПрошу уменьшить громкость.\n\nФИО: Павел Царан\nКомпьютер: terminal76-sk\n"
+        assert letter.email["body"] == "Сканер громко пищит.\nПрошу уменьшить громкость.\n\nФИО: Павел Царан\nУстройство: terminal76-sk\n"
         assert session.scalar(select(DeviceCollection)).consumed_at is not None
 
 
-@pytest.mark.parametrize("message", ["Отмена", "terminal77-sk"])
+@pytest.mark.parametrize("message", ["Отмена", "terminal77-sk", "Пропустить"])
 def test_cancel_or_manual_pc_reply_invalidates_pending_collection_without_overwriting_employee_choice(talk, message):
     token = start_collection(talk)
     talk.incoming(message, 3)
@@ -66,6 +66,8 @@ def test_cancel_or_manual_pc_reply_invalidates_pending_collection_without_overwr
         with pytest.raises(HTTPException):
             capture_computer(session, talk.settings, token, "WRONG-PC")
     assert talk.snapshot()["messages"] == before["messages"]
+    if message == "Пропустить":
+        assert before["flow"]["escalation"]["intake_requested_field"] == "subject"
     with talk.env.factory() as session:
         profile = session.get(TalkRoom, talk.room_id).profile
         assert profile.get("device_name") != "WRONG-PC"

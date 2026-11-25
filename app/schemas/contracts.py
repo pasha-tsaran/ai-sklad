@@ -1,6 +1,6 @@
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt, field_validator
 
 
 class StrictModel(BaseModel):
@@ -18,12 +18,28 @@ class FeedbackRequest(StrictModel):
     comment: str = Field(default="", max_length=2000)
 
 
+def valid_device_name(value: str) -> bool:
+    return (len(value) <= 63 and any(char.isalnum() for char in value)
+            and all(char.isalnum() or char in " _.()-/+#№" for char in value))
+
+
 class EscalationDetails(StrictModel):
     account_holder_name: str = Field(min_length=2, max_length=255)
     account_login: str = Field(min_length=1, max_length=100, pattern=r"^[^\r\n]+$")
-    computer_name: str = Field(min_length=1, max_length=63, pattern=r"^[A-Za-z0-9_.-]+$")
+    computer_name: str | None = Field(default=None, max_length=63)
     subject: str = Field(min_length=3, max_length=200, pattern=r"^[^\r\n]+$")
     additional_info: str = Field(default="", max_length=2000)
+
+    @field_validator("computer_name", mode="before")
+    @classmethod
+    def optional_device_name(cls, value):
+        if isinstance(value, str):
+            value = value.strip(" ")
+            if not value:
+                return None
+            if not valid_device_name(value):
+                raise ValueError("Invalid device name")
+        return value
 
 
 class EscalationExtraction(StrictModel):

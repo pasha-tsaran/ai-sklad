@@ -13,7 +13,7 @@ from app.models import Delivery, Escalation, Job, Message, MessageAttachment
 from app.services.rag.talk import TalkKnowledge
 from app.services.mail.draft import make_mailto
 from app.workers.handlers import run_one
-from tests.test_talk_dialogue import QUESTION, Knowledge, talk as talk
+from tests.test_talk_dialogue import INTAKE_QUESTIONS, QUESTION, Knowledge, NoGeneration, _profile, assistants, talk as talk
 from tests.test_workflow import DETAILS
 
 
@@ -75,7 +75,7 @@ def test_complete_private_form_creates_exact_mail_draft_and_never_queues_smtp(ta
         body = escalation.email["body"]
         for expected in ["Иванов Иван Иванович", "WS-001", extra]:
             assert expected in body
-        assert body == extra + "\n\nФИО: Иванов Иван Иванович\nКомпьютер: WS-001\n"
+        assert body == extra + "\n\nФИО: Иванов Иван Иванович\nУстройство: WS-001\n"
         assert QUESTION not in body and "Исходная проблема:" not in body
         assert "Тема:" not in body and "Описание:" not in body
         assert "Логин:" not in body and "account_login" not in body and "ivanov" not in body
@@ -122,8 +122,6 @@ def test_cancel_before_form_does_not_create_any_mail_artifact_or_send_job(talk):
 
 
 def test_natural_refusal_instead_of_final_letter_body_does_not_prepare_a_draft(talk):
-    from tests.test_talk_dialogue import _profile
-
     _profile(talk)
     for seq, message in enumerate(["Оставить заявку", "WS-001", "Большие письма"], 1):
         talk.incoming(message, seq)
@@ -139,6 +137,46 @@ def test_natural_refusal_instead_of_final_letter_body_does_not_prepare_a_draft(t
     with talk.env.factory() as session:
         assert session.scalar(select(Escalation)) is None
         assert session.scalar(select(Job).where(Job.kind == "SEND_MAIL")) is None
+
+
+@pytest.mark.parametrize(("reply", "device"), [
+    ("Пропустить", None), ("Не знаю, как называется", None), ("нет", None),
+    ("ПК-42", "ПК-42"), ("ТСД Urovo DT40", "ТСД Urovo DT40"),
+    ("Принтер Zebra ZD421", "Принтер Zebra ZD421"),
+    ("Zebra ZD421 Wi-Fi", "Zebra ZD421 Wi-Fi"),
+])
+def test_optional_device_in_talk_letter(talk, reply, device):
+    talk.settings.mail_backend, talk.settings.support_email = "mailto", "operator@example.net"
+    _profile(talk)
+    for seq, message in enumerate(["Оставить заявку", reply, "Не читается этикетка", "Штрихкод смазан."], 1):
+        talk.incoming(message, seq)
+        assert talk.process(Knowledge(), NoGeneration())
+        if seq == 1:
+            assert INTAKE_QUESTIONS["computer_name"] in assistants(talk.snapshot())[-1][0]
+        if seq == 2:
+            assert assistants(talk.snapshot())[-1][0] == INTAKE_QUESTIONS["subject"]
+    with talk.env.factory() as session:
+        draft = session.scalars(select(Escalation)).one()
+        body = "Штрихкод смазан.\n\nФИО: Павел Царан\n"
+        if device:
+            body += f"Устройство: {device}\n"
+        assert draft.status == "DRAFT" and draft.email["body"] == body
+        assert draft.details.get("computer_name") == device
+        assert session.scalar(select(Job).where(Job.kind == "SEND_MAIL")) is None
+    preview = assistants(talk.snapshot())[-1][0]
+    link = re.search(r"\((mailto:[^)]*)\)", preview)
+    assert parse_qs(urlsplit(link[1]).query)["body"][0].replace("\r\n", "\n") == body
+
+
+def test_labelled_topic_skips_optional_device_without_an_extra_turn(talk):
+    _profile(talk)
+    talk.incoming("Оставить заявку")
+    talk.process()
+    talk.incoming("Тема: Печать этикеток\nОписание: Печать останавливается через минуту.", 2)
+    talk.process()
+    with talk.env.factory() as session:
+        draft = session.scalars(select(Escalation)).one()
+        assert "computer_name" not in draft.details and draft.details["subject"] == "Печать этикеток"
 
 
 def test_guided_talk_letter_asks_explicit_topic_then_main_text_without_automatic_report_fallback(talk):
@@ -159,7 +197,7 @@ def test_guided_talk_letter_asks_explicit_topic_then_main_text_without_automatic
         escalation = session.scalar(select(Escalation))
         assert escalation.status == "DRAFT" and escalation.sent_at is None
         assert escalation.email["subject"] == "[AI-Support] Уменьшить громкость сканера"
-        assert escalation.email["body"] == description + "\n\nФИО: Павел Царан\nКомпьютер: WS-001\n"
+        assert escalation.email["body"] == description + "\n\nФИО: Павел Царан\nУстройство: WS-001\n"
         assert "оператор" not in escalation.email["body"] and "Исходная проблема:" not in escalation.email["body"]
         assert "Тема:" not in escalation.email["body"] and "Описание:" not in escalation.email["body"]
         assert session.scalar(select(MessageAttachment)) is None

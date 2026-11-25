@@ -10,8 +10,9 @@ from app.schemas.contracts import EscalationDetails, EscalationExtraction
 
 
 MAX_MESSAGE_CHARS = 8000
-REQUIRED_FIELDS = ("account_holder_name", "account_login", "computer_name", "subject")
-FIELDS = (*REQUIRED_FIELDS, "additional_info")
+REQUIRED_FIELDS = ("account_holder_name", "account_login", "subject")
+IDENTITY_FIELDS = ("account_holder_name", "account_login", "computer_name")
+FIELDS = (*IDENTITY_FIELDS, "subject", "additional_info")  # Order of existing unlabelled forms.
 _BASE = {"account_holder_name": "Иван", "account_login": "user", "computer_name": "PC01",
          "subject": "Проблема", "additional_info": ""}
 _ALIASES = {
@@ -20,6 +21,8 @@ _ALIASES = {
     "логин": "account_login", "логин пользователя": "account_login",
     "компьютер": "computer_name", "имя компьютера": "computer_name", "пк": "computer_name",
     "имя пк": "computer_name", "рабочая станция": "computer_name",
+    "устройство": "computer_name", "имя устройства": "computer_name", "тсд": "computer_name",
+    "принтер": "computer_name", "терминал": "computer_name",
     "тема": "subject", "тема проблемы": "subject", "проблема": "subject",
     "описание": "additional_info", "дополнительно": "additional_info",
     "дополнительное описание": "additional_info", "подробности": "additional_info",
@@ -45,7 +48,7 @@ _EVIDENCE = {
     "account_holder_name": r"(?:меня\s+зовут|мо[её]\s+имя|фио(?:\s+пользователя)?|я)",
     "account_login": r"(?:логин(?:\s+пользователя)?|уч[её]тная\s+запись|username|account_login|"
                      r"(?:вхожу|захожу|авторизуюсь)\s+(?:как|под))",
-    "computer_name": r"(?:компьютер(?:а)?|имя\s+(?:моего\s+)?компьютера|пк|имя\s+пк|"
+    "computer_name": r"(?:устройство|имя\s+устройства|тсд|принтер|компьютер(?:а)?|имя\s+(?:моего\s+)?компьютера|пк|имя\s+пк|"
                      r"рабочая\s+станция|терминал|хост|computer_name|(?:работаю|сижу)\s+на)",
     "subject": r"(?:тема(?:\s+проблемы)?|проблема|subject)",
     "additional_info": r"(?:описание|дополнительно|подробности|additional_info)",
@@ -57,6 +60,14 @@ class IntakeResult:
     details: EscalationDetails | None
     fields: dict[str, str]
     missing: list[str]
+
+
+def skips_device(message):
+    text = " ".join(message.strip().casefold().rstrip(".!").split())
+    return (text in {"-", "—", "нет", "дальше", "далее", "пропустить", "пропусти", "пропускаю", "пропустим",
+                     "пропустить устройство", "без устройства", "без имени", "не хочу указывать", "не указано"}
+            or bool(re.fullmatch(r"(?:я )?не (?:знаю|помню)(?: (?:имя|название)(?: устройства)?|,? как называется)?",
+                                 text)))
 
 
 def _valid(field, value):
@@ -83,6 +94,8 @@ def _valid(field, value):
 
 def _result(fields, invalid=(), *, allow_completion=True, require_description=False):
     missing = [field for field in REQUIRED_FIELDS if field not in fields]
+    if "computer_name" in invalid:
+        missing.append("computer_name")
     if "additional_info" in invalid or require_description and not fields.get("additional_info", "").strip():
         missing.append("additional_info")
     details = None
@@ -121,17 +134,23 @@ def _labels(message):
 
 
 def _ordered_lines(message):
-    lines = [line.strip() for line in message.replace("\r\n", "\n").replace("\r", "\n").split("\n") if line.strip()]
+    lines = [line.strip() for line in message.strip().splitlines()]
+    empty_device = len(lines) in {4, 5} and (not lines[2] or skips_device(lines[2]))
+    if not empty_device:
+        lines = [line for line in lines if line]
     if len(lines) not in {4, 5} or any(":" in line for line in lines[:3]):
         return None
     values = dict(zip(FIELDS, lines))
     if any(_valid(field, values[field]) is None for field in REQUIRED_FIELDS):
         return None
+    if empty_device:
+        del values["computer_name"]
+        return values
     # Ordinary prose split into lines is not an ordered form. Bare lower-case
     # words such as English "to" are not enough evidence of a workstation ID.
     computer = values["computer_name"]
-    if not (any(character.isdigit() for character in computer) or any(c in computer for c in "-_.")
-            or len(computer) >= 2 and computer.isupper()):
+    if not (_valid("computer_name", computer) and (any(character.isdigit() for character in computer)
+            or any(c in computer for c in "-_.") or len(computer) >= 2 and computer.isupper())):
         return None
     return values
 
@@ -161,7 +180,7 @@ def _evidenced(field, value, message):
         if field in {"subject", "additional_info"} and _PROBLEM.search(value):
             if not any(re.search(r"\b" + _EVIDENCE[identity]
                                  + r"\s*(?::|=|—|-)?\s*[«\"']?\s*$", prefix, re.I)
-                       for identity in REQUIRED_FIELDS[:3]):
+                       for identity in IDENTITY_FIELDS):
                 return True
     return False
 
@@ -178,6 +197,9 @@ def parse_intake(message, pending_fields, llm, *, requested_field=None, require_
         result = _result(fields, allow_completion=False, require_description=require_description)
         return result if result.missing else IntakeResult(None, fields, ["additional_info"])
     message = message.strip()
+    if requested_field == "computer_name" and skips_device(message):
+        fields.pop("computer_name", None)
+        return _result(fields, require_description=require_description)
     labeled, invalid, structured = _labels(message)
     # A reply to the description question is the body itself. Keep its complete
     # wording/line breaks; do not ask a model to summarize or infer its topic.
@@ -192,6 +214,9 @@ def parse_intake(message, pending_fields, llm, *, requested_field=None, require_
     ordered = _ordered_lines(message) if not labeled else None
     observed = labeled if labeled else ordered or {}
     for field, raw in observed.items():
+        if field == "computer_name" and field not in invalid and (not raw or skips_device(raw)):
+            fields.pop(field, None)
+            continue
         value = _valid(field, raw)
         if value is None or field in invalid:
             invalid.add(field)
@@ -204,7 +229,14 @@ def parse_intake(message, pending_fields, llm, *, requested_field=None, require_
     missing = [field for field in REQUIRED_FIELDS if field not in fields]
     if require_description and not fields.get("additional_info", "").strip():
         missing.append("additional_info")
-    target = requested_field if requested_field in FIELDS else missing[0] if len(missing) == 1 else None
+    target = requested_field if requested_field in FIELDS else None
+    if target is None:
+        # Older turns without a recorded question can infer a single unambiguous field.
+        unanswered = missing if "computer_name" in fields else [*missing, "computer_name"]
+        if len(unanswered) == 1:
+            candidate = unanswered[0]
+            if candidate != "computer_name" or re.fullmatch(r"[A-Za-z0-9_.-]+", message):
+                target = candidate
     if require_description and target == "subject" and not labeled:
         value = _valid("subject", message)
         if value is not None:
@@ -212,7 +244,9 @@ def parse_intake(message, pending_fields, llm, *, requested_field=None, require_
             return _result(fields, invalid, require_description=True)
         fields.pop("subject", None)
         return _result(fields, [*invalid, "subject"], require_description=True)
-    if target and "\n" not in message and len(message.split()) <= 30 and not labeled:
+    if (target and "\n" not in message and len(message.split()) <= 30 and not labeled
+            and not (target == "computer_name" and (_PROBLEM_START.search(message)
+                     or re.search(r"\b(?:логин|фио|меня\s+зовут)\b", message, re.I)))):
         value = _valid(target, message)
         if value is not None:
             fields[target] = value

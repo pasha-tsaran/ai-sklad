@@ -650,7 +650,7 @@ def test_form_fields_are_validated_before_social_classification(talk, message):
         assert state["incident"].pending_action == "COLLECT_ESCALATION_DETAILS"
         assert state["flow"]["escalation"]["intake_fields"]["subject"] == "Сканер"
     else:
-        assert assistants(state)[-1] == (INTAKE_QUESTIONS["computer_name"], None)
+        assert assistants(state)[-1] == (INTAKE_QUESTIONS["subject"], None)
         assert state["incident"].pending_action == "COLLECT_ESCALATION_DETAILS"
         assert state["flow"]["escalation"]["intake_fields"] == {
             "account_holder_name": "Иванов Иван Иванович", "account_login": "ivanov",
@@ -1120,10 +1120,10 @@ def test_scattered_intake_keeps_collected_fields_and_asks_only_the_next_missing_
         talk.incoming(content, sequence)
         talk.process(knowledge, model)
     state = talk.snapshot()
-    assert assistants(state)[-1] == (INTAKE_QUESTIONS["computer_name"], None)
+    assert assistants(state)[-1] == (INTAKE_QUESTIONS["subject"], None)
     assert state["flow"]["escalation"]["intake_fields"] == {"account_holder_name": "Павел", "account_login": "tsaran"}
-    assert state["flow"]["escalation"]["intake_requested_field"] == "computer_name"
-    talk.incoming("terminal76-sk", 4)
+    assert state["flow"]["escalation"]["intake_requested_field"] == "subject"
+    talk.incoming("Устройство: terminal76-sk", 4)
     talk.process(knowledge, model)
     state = talk.snapshot()
     assert assistants(state)[-1] == (INTAKE_QUESTIONS["subject"], None)
@@ -1251,9 +1251,9 @@ def test_operator_card_uses_trusted_employee_profile_and_asks_only_for_unknown_w
     state = talk.snapshot()
     card = assistants(state)[-1][0]
     assert card.startswith("ФИО: Павел Царан")
-    for text in ["Компьютер: Не определён", INTAKE_QUESTIONS["computer_name"]]:
+    for text in ["Устройство: не указано", INTAKE_QUESTIONS["computer_name"]]:
         assert text in card
-    assert card.count("?") == 1 and "Как вас зовут" not in card
+    assert card.count(INTAKE_QUESTIONS["computer_name"]) == 1 and "Как вас зовут" not in card
     assert "логин" not in card.casefold() and "Данные профиля Nextcloud" not in card
     assert state["flow"]["escalation"]["intake_fields"] == {
         "account_holder_name": "Павел Царан", "account_login": "employee",
@@ -1307,7 +1307,7 @@ def test_workstation_confirmed_in_current_incident_is_shown_without_asking_for_i
         talk.process(knowledge, model)
     state = talk.snapshot()
     card = assistants(state)[-1][0]
-    assert "Компьютер: terminal76-sk" in card and INTAKE_QUESTIONS["subject"] in card
+    assert "Устройство: terminal76-sk" in card and INTAKE_QUESTIONS["subject"] in card
     assert INTAKE_QUESTIONS["computer_name"] not in card
     assert state["flow"]["escalation"]["intake_requested_field"] == "subject"
     assert not model.calls and not knowledge.searches
@@ -1325,7 +1325,7 @@ def test_previous_incident_workstation_is_never_reused_or_offered_when_employee_
         talk.process(knowledge, model)
     state = talk.snapshot()
     card = assistants(state)[-1][0]
-    assert "Компьютер: Не определён" in card and "terminal76-sk" not in card
+    assert "Устройство: не указано" in card and "terminal76-sk" not in card
     assert INTAKE_QUESTIONS["computer_name"] in card and "computer_name" not in state["flow"]["escalation"]["intake_fields"]
     assert not model.calls and not knowledge.searches
     with talk.env.factory() as session:
@@ -1357,7 +1357,7 @@ def test_profile_card_never_uses_server_hostname_or_foreign_display_identity_as_
         talk.process(knowledge, model)
     card = assistants(talk.snapshot())[-1][0]
     assert "Чужой Пользователь" not in card and "Системный Администратор" not in card and "SkladTechBot" not in card
-    assert "логин" not in card.casefold() and "Компьютер: Не определён" in card
+    assert "логин" not in card.casefold() and "Устройство: не указано" in card
     assert not model.calls and not knowledge.searches
 
 
